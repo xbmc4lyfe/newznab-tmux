@@ -13,7 +13,6 @@ use App\Models\User;
 use App\Models\UserActivity;
 use App\Services\RegistrationFailureLogService;
 use App\Services\RegistrationStatusService;
-use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -21,18 +20,6 @@ use Illuminate\View\View;
 
 class AdminRegistrationController extends BasePageController
 {
-    private static ?bool $useWave29RustFfi = null;
-
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useWave29RustFfi = $useRustFfi;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useWave29RustFfi ?? false;
-    }
-
     public function __construct(
         private readonly RegistrationStatusService $registrationStatusService,
         private readonly RegistrationFailureLogService $registrationFailureLogService
@@ -64,13 +51,16 @@ class AdminRegistrationController extends BasePageController
         $periods = RegistrationPeriod::query()
             ->with(['createdByUser', 'updatedByUser'])
             ->get();
-        $partition = self::partitionPeriods($periods->map(fn (RegistrationPeriod $period): array => [
-            'ended' => $period->hasEndedAt($now),
-            'starts_at' => $period->starts_at?->getTimestamp(),
-            'ends_at' => $period->ends_at?->getTimestamp(),
-        ])->all());
-        $currentPeriods = new Collection(array_map(fn (int $offset): RegistrationPeriod => $periods[$offset], $partition['current']));
-        $pastPeriods = new Collection(array_map(fn (int $offset): RegistrationPeriod => $periods[$offset], $partition['past']));
+        [$pastPeriods, $currentPeriods] = $periods->partition(
+            fn (RegistrationPeriod $period): bool => $period->hasEndedAt($now)
+        );
+
+        $currentPeriods = $currentPeriods
+            ->sortBy(fn (RegistrationPeriod $period): int => $period->starts_at?->getTimestamp() ?? PHP_INT_MAX)
+            ->values();
+        $pastPeriods = $pastPeriods
+            ->sortByDesc(fn (RegistrationPeriod $period): int => $period->ends_at?->getTimestamp() ?? 0)
+            ->values();
 
         $history = RegistrationStatusHistory::query()
             ->with(['changedByUser', 'registrationPeriod'])
@@ -83,12 +73,24 @@ class AdminRegistrationController extends BasePageController
             ->latest('created_at')
             ->limit(30)
             ->get()
-            ->filter(fn (UserActivity $activity): bool => self::validActivityMetadata($activity->metadata))
+            ->filter(function (UserActivity $activity): bool {
+                return is_array($activity->metadata)
+                    && isset($activity->metadata['email'], $activity->metadata['ip_address']);
+            })
             ->take(10)
             ->values();
 
         $recentFailedAttempts = collect($this->registrationFailureLogService->recentFailures(10))
-            ->map(fn (array $entry): array => self::enrichFailedAttempt($entry))
+            ->map(function (array $entry): array {
+                $entry['registration_status_label'] = is_numeric($entry['registration_status'])
+                    ? $this->registrationStatusService->statusLabel((int) $entry['registration_status'])
+                    : null;
+                $entry['manual_registration_status_label'] = is_numeric($entry['manual_registration_status'])
+                    ? $this->registrationStatusService->statusLabel((int) $entry['manual_registration_status'])
+                    : null;
+
+                return $entry;
+            })
             ->all();
 
         return view('admin.registrations.index', array_merge($this->viewData, [
@@ -121,7 +123,9 @@ class AdminRegistrationController extends BasePageController
             $request->input('note')
         );
 
-        $message = self::manualStatusMessage($oldStatus, $newStatus);
+        $message = $oldStatus === $newStatus
+            ? 'Registration status note saved without changing the manual mode.'
+            : 'Manual registration status updated successfully.';
 
         return redirect()
             ->route('admin.registrations.index')
@@ -201,116 +205,5 @@ class AdminRegistrationController extends BasePageController
         return redirect()
             ->route('admin.registrations.index')
             ->with('success', 'Scheduled open-registration period deleted successfully.');
-    }
-
-    /**
-     * @param  list<array{ended: bool, starts_at: int|null, ends_at: int|null}>  $periods
-     * @return array{current: list<int>, past: list<int>}
-     */
-    public static function partitionPeriods(array $periods): array
-    {
-        return self::usesRustFfi() ? self::partitionPeriodsNative($periods) : self::partitionPeriodsPhp($periods);
-    }
-
-    /**
-     * @param  list<array{ended: bool, starts_at: int|null, ends_at: int|null}>  $periods
-     * @return array{current: list<int>, past: list<int>}
-     */
-    public static function partitionPeriodsPhp(array $periods): array
-    {
-        $periods = array_values($periods);
-        $current = [];
-        $past = [];
-        foreach ($periods as $offset => $period) {
-            if ($period['ended']) {
-                $past[] = $offset;
-            } else {
-                $current[] = $offset;
-            }
-        }
-        usort($current, fn (int $a, int $b): int => ($periods[$a]['starts_at'] ?? PHP_INT_MAX) <=> ($periods[$b]['starts_at'] ?? PHP_INT_MAX));
-        usort($past, fn (int $a, int $b): int => ($periods[$b]['ends_at'] ?? 0) <=> ($periods[$a]['ends_at'] ?? 0));
-
-        return ['current' => $current, 'past' => $past];
-    }
-
-    /**
-     * @param  list<array{ended: bool, starts_at: int|null, ends_at: int|null}>  $periods
-     * @return array{current: list<int>, past: list<int>}
-     */
-    public static function partitionPeriodsNative(array $periods): array
-    {
-        return GdprRequestController::wave29Native(4, ['periods' => $periods]) ?? self::partitionPeriodsPhp($periods);
-    }
-
-    public static function validActivityMetadata(mixed $metadata): bool
-    {
-        return self::usesRustFfi() ? self::validActivityMetadataNative($metadata) : self::validActivityMetadataPhp($metadata);
-    }
-
-    public static function validActivityMetadataPhp(mixed $metadata): bool
-    {
-        return is_array($metadata) && isset($metadata['email'], $metadata['ip_address']);
-    }
-
-    public static function validActivityMetadataNative(mixed $metadata): bool
-    {
-        $result = GdprRequestController::wave29Native(5, ['metadata' => $metadata]);
-
-        return is_bool($result['valid'] ?? null) ? $result['valid'] : self::validActivityMetadataPhp($metadata);
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $entry
-     * @return array<int|string, mixed>
-     */
-    public static function enrichFailedAttempt(array $entry): array
-    {
-        return self::usesRustFfi() ? self::enrichFailedAttemptNative($entry) : self::enrichFailedAttemptPhp($entry);
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $entry
-     * @return array<int|string, mixed>
-     */
-    public static function enrichFailedAttemptPhp(array $entry): array
-    {
-        foreach (['registration_status', 'manual_registration_status'] as $key) {
-            $entry[$key.'_label'] = is_numeric($entry[$key] ?? null)
-                ? RegistrationStatusService::labelFor((int) $entry[$key])
-                : null;
-        }
-
-        return $entry;
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $entry
-     * @return array<int|string, mixed>
-     */
-    public static function enrichFailedAttemptNative(array $entry): array
-    {
-        $statuses = array_map(fn (string $key): ?int => is_numeric($entry[$key] ?? null) ? (int) $entry[$key] : null, ['registration_status', 'manual_registration_status']);
-
-        return GdprRequestController::wave29Native(6, ['entry' => $entry, 'statuses' => $statuses]) ?? self::enrichFailedAttemptPhp($entry);
-    }
-
-    public static function manualStatusMessage(int $oldStatus, int $newStatus): string
-    {
-        return self::usesRustFfi() ? self::manualStatusMessageNative($oldStatus, $newStatus) : self::manualStatusMessagePhp($oldStatus, $newStatus);
-    }
-
-    public static function manualStatusMessagePhp(int $oldStatus, int $newStatus): string
-    {
-        return $oldStatus === $newStatus
-            ? 'Registration status note saved without changing the manual mode.'
-            : 'Manual registration status updated successfully.';
-    }
-
-    public static function manualStatusMessageNative(int $oldStatus, int $newStatus): string
-    {
-        $result = GdprRequestController::wave29Native(7, ['old_status' => $oldStatus, 'new_status' => $newStatus]);
-
-        return is_string($result['message'] ?? null) ? $result['message'] : self::manualStatusMessagePhp($oldStatus, $newStatus);
     }
 }

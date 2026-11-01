@@ -4,15 +4,12 @@ declare(strict_types=1);
 
 namespace App\Models;
 
-use App\Services\Categorization\CategorizationService;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
 use App\Services\Releases\ReleaseManagementService;
-use App\Support\RustPipelineLibrary;
 use App\Support\SizeUnit;
 use Carbon\CarbonImmutable;
-use FFI;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Database\Eloquent\Model;
@@ -72,18 +69,6 @@ class UsenetGroup extends Model
         'min_size' => 'minsizetoformrelease',
         'backfill_days' => 'backfill_target',
     ];
-
-    public static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi;
-    }
-
-    public static function categorizeFfi(): ?FFI
-    {
-        return CategorizationService::categorizeFfi();
-    }
 
     protected $dateFormat = false;
 
@@ -392,52 +377,11 @@ class UsenetGroup extends Model
      */
     public static function isValidGroup(string $groupName)
     {
-        return self::$useRustFfi
-            ? self::isValidGroupNative($groupName)
-            : self::isValidGroupPhp($groupName);
-    }
-
-    public static function isValidGroupPhp(string $groupName): string|bool
-    {
         if (preg_match('/^([\w\-]+\.)+[\w\-]+$/i', $groupName)) {
-            return (string) preg_replace('/^a\.b\./i', 'alt.binaries.', $groupName, 1);
+            return preg_replace('/^a\.b\./i', 'alt.binaries.', $groupName, 1);
         }
 
         return false;
-    }
-
-    public static function isValidGroupNative(string $groupName): string|bool
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return self::isValidGroupPhp($groupName);
-        }
-
-        $len = \strlen($groupName);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 32), $cap);
-        if ($scratch === null) {
-            return self::isValidGroupPhp($groupName);
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_usenet_group_normalize_valid($groupName, $len, $scratch, $cap);
-        if (\is_int($written) && $written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-            if ($scratch === null) {
-                return self::isValidGroupPhp($groupName);
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_usenet_group_normalize_valid($groupName, $len, $scratch, $cap);
-        }
-        if (! \is_int($written) || $written < 0) {
-            return self::isValidGroupPhp($groupName);
-        }
-        if ($written === 0) {
-            return false;
-        }
-
-        return FFI::string($scratch, $written);
     }
 
     /**
@@ -704,49 +648,7 @@ class UsenetGroup extends Model
             ]
         );
 
-        return self::formatGroupStatusMessage($id, $status);
-    }
-
-    public static function formatGroupStatusMessage(int $id, int $status = 0): string
-    {
-        return self::$useRustFfi
-            ? self::formatGroupStatusMessageNative($id, $status)
-            : self::formatGroupStatusMessagePhp($id, $status);
-    }
-
-    public static function formatGroupStatusMessagePhp(int $id, int $status = 0): string
-    {
         return "Group {$id} has been ".(($status === 0) ? 'deactivated' : 'activated').'.';
-    }
-
-    public static function formatGroupStatusMessageNative(int $id, int $status = 0): string
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return self::formatGroupStatusMessagePhp($id, $status);
-        }
-
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $cap);
-        if ($scratch === null) {
-            return self::formatGroupStatusMessagePhp($id, $status);
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_usenet_group_format_status_message($id, $status, $scratch, $cap);
-        if (\is_int($written) && $written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-            if ($scratch === null) {
-                return self::formatGroupStatusMessagePhp($id, $status);
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_usenet_group_format_status_message($id, $status, $scratch, $cap);
-        }
-        if (! \is_int($written) || $written <= 0) {
-            return self::formatGroupStatusMessagePhp($id, $status);
-        }
-
-        return FFI::string($scratch, $written);
     }
 
     /**

@@ -4,38 +4,16 @@ declare(strict_types=1);
 
 namespace App\Services\Mcp;
 
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\Log;
-use Throwable;
 
 class RepositoryContextCollector
 {
-    private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_mcp_parse_and_redact_rg_output(const char *input, size_t input_len, size_t max_results, char *out_buf, size_t out_cap);
-        int32_t nntmux_mcp_glob_matches(const char *glob, size_t glob_len, const char *path, size_t path_len);
-        ssize_t nntmux_mcp_extract_config_keys(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_mcp_search_terms(const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        C;
-
-    private static ?FFI $ffi = null;
-
-    private static bool $ffiResolved = false;
-
-    private static bool $useRustFfi = true;
-
     public function __construct(
         private readonly ProjectPathGuard $paths,
         private readonly ProcessRunner $processes,
         private readonly SensitiveValueRedactor $redactor,
         private readonly VerificationPlanner $verificationPlanner,
     ) {}
-
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
 
     /**
      * @return array<string, mixed>
@@ -158,21 +136,6 @@ class RepositoryContextCollector
             return [trim($query)];
         }
 
-        if (self::$useRustFfi) {
-            $native = self::searchTermsNative($query);
-            if ($native !== null) {
-                return $native !== [] ? $native : [mb_substr(trim($query), 0, 120)];
-            }
-        }
-
-        return $this->searchTermsPhp($query);
-    }
-
-    /**
-     * @return list<string>
-     */
-    private function searchTermsPhp(string $query): array
-    {
         preg_match_all('/(?:App\\\\[A-Za-z0-9_\\\\]+|app\/[A-Za-z0-9_\/.\-]+\.php|[A-Z][A-Za-z0-9_]+(?:Exception|Service|Controller|Command|Runner|Probe))/', $query, $matches);
         $terms = array_map(
             fn (string $term): string => basename(str_replace('\\', '/', preg_replace('/:\d+$/', '', $term) ?? $term), '.php'),
@@ -180,54 +143,6 @@ class RepositoryContextCollector
         );
 
         return array_slice(array_values(array_unique(array_filter($terms))), 0, 5) ?: [mb_substr(trim($query), 0, 120)];
-    }
-
-    /**
-     * @return list<string>|null
-     */
-    public static function searchTermsNative(string $query): ?array
-    {
-        $len = \strlen($query);
-        if ($len < 5) {
-            return [];
-        }
-
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 64), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_mcp_search_terms($query, $len, $scratch, $cap);
-            if (! \is_int($written) || $written === -1) {
-                return null;
-            }
-            if ($written === 0) {
-                return [];
-            }
-            if ($written < -1) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_mcp_search_terms($query, $len, $scratch, $cap);
-                if (! \is_int($written) || $written <= 0) {
-                    return null;
-                }
-            }
-
-            return explode("\n", FFI::string($scratch, $written));
-        } catch (Throwable) {
-            return null;
-        }
     }
 
     /**
@@ -251,123 +166,24 @@ class RepositoryContextCollector
                 'rg', '--line-number', '--no-heading', '--color=never', '--fixed-strings', '--', $term, ...$roots,
             ], (int) config('nntmux-mcp.timeouts.repository_seconds', 20));
 
-            $remaining = $maximumResults - \count($matches);
-            if ($remaining <= 0) {
-                break;
-            }
-
-            if (self::$useRustFfi) {
-                $parsed = self::parseAndRedactRgOutputNative($result['output'], $remaining);
-                if ($parsed !== null) {
-                    foreach ($parsed as $item) {
-                        $matches[] = $item;
-                    }
-                    if (\count($matches) >= $maximumResults) {
-                        break;
-                    }
-
+            foreach (preg_split('/\R/', $result['output']) ?: [] as $line) {
+                if (preg_match('/^([^:]+):(\d+):(.*)$/', $line, $parts) !== 1) {
                     continue;
                 }
-            }
 
-            foreach ($this->parseAndRedactRgOutputPhp($result['output'], $remaining) as $item) {
-                $matches[] = $item;
-            }
-            if (\count($matches) >= $maximumResults) {
-                break;
+                $matches[] = [
+                    'path' => $parts[1],
+                    'line' => (int) $parts[2],
+                    'excerpt' => $this->redactor->redact(trim($parts[3])),
+                ];
+
+                if (count($matches) >= $maximumResults) {
+                    break 2;
+                }
             }
         }
 
         return $this->uniqueMatches($matches);
-    }
-
-    /**
-     * @return list<array{path: string, line: int, excerpt: string}>
-     */
-    private function parseAndRedactRgOutputPhp(string $output, int $maximumResults): array
-    {
-        if ($output === '' || $maximumResults <= 0) {
-            return [];
-        }
-
-        $matches = [];
-        foreach (preg_split('/\R/', $output) ?: [] as $line) {
-            if (preg_match('/^([^:]+):(\d+):(.*)$/', $line, $parts) !== 1) {
-                continue;
-            }
-
-            $matches[] = [
-                'path' => $parts[1],
-                'line' => (int) $parts[2],
-                'excerpt' => $this->redactor->redact(trim($parts[3])),
-            ];
-
-            if (\count($matches) >= $maximumResults) {
-                break;
-            }
-        }
-
-        return $matches;
-    }
-
-    /**
-     * @return list<array{path: string, line: int, excerpt: string}>|null
-     */
-    public static function parseAndRedactRgOutputNative(string $output, int $maximumResults): ?array
-    {
-        if ($output === '' || $maximumResults <= 0) {
-            return [];
-        }
-
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        $len = \strlen($output);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(512, $len + 256), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_mcp_parse_and_redact_rg_output($output, $len, $maximumResults, $scratch, $cap);
-            if (! \is_int($written) || $written === -1) {
-                return null;
-            }
-            if ($written === 0) {
-                return [];
-            }
-            if ($written < -1) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_mcp_parse_and_redact_rg_output($output, $len, $maximumResults, $scratch, $cap);
-                if (! \is_int($written) || $written <= 0) {
-                    return null;
-                }
-            }
-
-            $matches = [];
-            foreach (explode("\n", FFI::string($scratch, $written)) as $row) {
-                $parts = explode(':', $row, 3);
-                if (\count($parts) === 3) {
-                    $matches[] = [
-                        'path' => $parts[0],
-                        'line' => (int) $parts[1],
-                        'excerpt' => $parts[2],
-                    ];
-                }
-            }
-
-            return $matches;
-        } catch (Throwable) {
-            return null;
-        }
     }
 
     /**
@@ -439,42 +255,10 @@ class RepositoryContextCollector
             return true;
         }
 
-        // Retain native PHP in production: two-string FFI marshaling on short (~35B) paths
-        // yields 1.18x-1.21x mean and 1.17x-1.26x p99 speedup, below the 1.5x adoption bar.
-        return $this->globMatchesPhp($glob, $path);
-    }
-
-    private function globMatchesPhp(string $glob, string $path): bool
-    {
-        if ($glob === '**') {
-            return true;
-        }
-
         $quoted = preg_quote($glob, '#');
         $pattern = str_replace(['\*\*', '\*'], ['.*', '[^/]*'], $quoted);
 
         return preg_match('#^'.$pattern.'$#', $path) === 1;
-    }
-
-    public static function globMatchesNative(string $glob, string $path): ?bool
-    {
-        if ($glob === '**') {
-            return true;
-        }
-
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $res = $ffi->nntmux_mcp_glob_matches($glob, \strlen($glob), $path, \strlen($path));
-
-            return \is_int($res) && $res >= 0 ? ($res === 1) : null;
-        } catch (Throwable) {
-            return null;
-        }
     }
 
     /**
@@ -496,87 +280,11 @@ class RepositoryContextCollector
             }
 
             $contents = (string) file_get_contents(base_path($safePath));
-            if (self::$useRustFfi) {
-                $extracted = self::extractConfigKeysNative($contents);
-                if ($extracted !== null) {
-                    $keys = [...$keys, ...$extracted];
-
-                    continue;
-                }
-            }
-
-            $keys = [...$keys, ...$this->extractConfigKeysPhp($contents)];
+            preg_match_all('/\b(?:config|env)\(\s*["\']([^"\']+)["\']/', $contents, $matches);
+            $keys = [...$keys, ...$matches[1]];
         }
 
         return array_values(array_unique($keys));
-    }
-
-    /**
-     * @return list<string>
-     */
-    private function extractConfigKeysPhp(string $contents): array
-    {
-        preg_match_all('/\b(?:config|env)\(\s*["\']([^"\']+)["\']/', $contents, $matches);
-
-        return $matches[1];
-    }
-
-    /**
-     * @return list<string>|null
-     */
-    public static function extractConfigKeysNative(string $contents): ?array
-    {
-        $len = \strlen($contents);
-        if ($len < 7) {
-            return [];
-        }
-
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, intdiv($len, 4) + 64), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_mcp_extract_config_keys($contents, $len, $scratch, $cap);
-            if (! \is_int($written) || $written === -1 || $written === -2) {
-                return null;
-            }
-            if ($written === 0) {
-                return [];
-            }
-            if ($written < -2) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_mcp_extract_config_keys($contents, $len, $scratch, $cap);
-                if (! \is_int($written) || $written <= 0) {
-                    return null;
-                }
-            }
-
-            return explode("\n", FFI::string($scratch, $written));
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (! self::$ffiResolved) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('mcp_repository_context_collector', self::FFI_CDEF);
-            self::$ffiResolved = true;
-        }
-
-        return self::$ffi;
     }
 
     /**
@@ -639,188 +347,5 @@ class RepositoryContextCollector
         }
 
         return array_values(array_unique($interfaces));
-    }
-
-    // ---- Wave 57.2 batch plan ----------------------------------------------------------------
-
-    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 5.80x/4.74x, uncommon 5.52x/4.56x); see RustMcpPathGuardRepoContextRedactorStatusTmuxCollectorW57ParityTest. */
-    private const bool W57_RUST_FFI_DEFAULT = true;
-
-    private const string W57_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w57_repo_history_plan_batch(const char *outputs, size_t outputs_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Wave 57 routing, binding and output buffer, kept in function-local statics. Operations:
-     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
-     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
-     * least $val words (null without the library).
-     */
-    private static function w57RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w57', self::W57_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w57RustFfiState('ffi');
-                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return [$ffi, $out, $capacity];
-            default:
-                return $enabled;
-        }
-    }
-
-    public static function usesW57RustFfi(): bool
-    {
-        $enabled = self::w57RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W57_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with planHistoryBatch() routed to Rust ($enabled) or PHP, then restores
-     * the previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW57RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w57RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w57RustFfiState('set', $previous);
-        }
-    }
-
-    /** @param  list<int>  $out */
-    private static function w57Digest(array $out): int
-    {
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-
-        return $digest[1];
-    }
-
-    /**
-     * The words the export wrote, or null when it declined (returning anything but $words).
-     *
-     * @return list<int>|null
-     */
-    private static function w57Words(mixed $written, CData $out, int $words): ?array
-    {
-        /** @var array<int, int>|false $values */
-        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
-
-        return \is_array($values) ? array_values($values) : null;
-    }
-
-    /**
-     * Batch plan over `git log --format=%h%x09%s` outputs, parsed as recentHistory() does
-     * (trim, split on `\R`, commit before the first tab, empty commits skipped). Per output:
-     * `flags | min(commits, 0xFFFFFF) << 8 | crc32(entries) << 32`, the entries joined as
-     * `commit\tsubject` by newlines. Flags: 1 a line was skipped, 2 a commit line had no tab, 4
-     * every commit (at least one) is 4-40 lowercase hex digits. The total commits, outputs
-     * without commits, outputs with skipped lines, outputs with untabbed lines, the distinct
-     * commit hashes and the XXH64 digest of all earlier words follow.
-     *
-     * @param  list<string>  $outputs
-     * @return list<int>
-     */
-    public static function planHistoryBatch(array $outputs): array
-    {
-        return self::usesW57RustFfi() ? self::planHistoryBatchNative($outputs) : self::planHistoryBatchPhp($outputs);
-    }
-
-    /**
-     * @param  list<string>  $outputs
-     * @return list<int>
-     */
-    public static function planHistoryBatchPhp(array $outputs): array
-    {
-        $out = $seen = [];
-        $total = $empty = $skipped = $untabbed = 0;
-        foreach ($outputs as $output) {
-            $entries = [];
-            $flags = 0;
-            $hex = true;
-            foreach (preg_split('/\R/', trim((string) $output)) ?: [] as $line) {
-                [$commit, $subject] = array_pad(explode("\t", $line, 2), 2, '');
-                if ($commit === '') {
-                    $flags |= 1;
-
-                    continue;
-                }
-                if (! str_contains($line, "\t")) {
-                    $flags |= 2;
-                }
-                $length = \strlen($commit);
-                $hex = $hex && $length >= 4 && $length <= 40 && strspn($commit, '0123456789abcdef') === $length;
-                $entries[] = $commit."\t".$subject;
-                $seen[$commit] = true;
-            }
-            $commits = \count($entries);
-            $flags |= $hex && $commits > 0 ? 4 : 0;
-            $total += $commits;
-            $empty += $commits === 0 ? 1 : 0;
-            $skipped += $flags & 1;
-            $untabbed += $flags >> 1 & 1;
-            $out[] = $flags | min($commits, 0xFFFFFF) << 8 | crc32(implode("\n", $entries)) << 32;
-        }
-        array_push($out, $total, $empty, $skipped, $untabbed, \count($seen));
-        $out[] = self::w57Digest($out);
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, an output holds a NUL byte or
-     * the column is not a list.
-     *
-     * @param  list<string>  $outputs
-     * @return list<int>
-     */
-    public static function planHistoryBatchNative(array $outputs): array
-    {
-        $count = \count($outputs);
-        $words = $count + 6;
-        /** @var array{FFI, CData, int}|null $state */
-        $state = $count === 0 ? null : self::w57RustFfiState('out', $words);
-        if ($state === null || ! array_is_list($outputs)) {
-            return self::planHistoryBatchPhp($outputs);
-        }
-        $blob = implode("\0", $outputs);
-        [$ffi, $out, $cap] = $state;
-        try {
-            // @phpstan-ignore method.notFound (Declared by W57_FFI_CDEF.)
-            $written = $ffi->nntmux_w57_repo_history_plan_batch($blob, \strlen($blob), $count, $out, $cap);
-        } catch (Throwable) {
-            $written = -1;
-        }
-
-        return self::w57Words($written, $out, $words) ?? self::planHistoryBatchPhp($outputs);
     }
 }

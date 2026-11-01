@@ -16,18 +16,6 @@ use Illuminate\View\View;
 
 class AdminPromotionController extends BasePageController
 {
-    private static ?bool $useWave29RustFfi = null;
-
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useWave29RustFfi = $useRustFfi;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useWave29RustFfi ?? false;
-    }
-
     /**
      * Display a listing of promotions.
      */
@@ -59,7 +47,15 @@ class AdminPromotionController extends BasePageController
      */
     public function store(AdminPromotionRequest $request): RedirectResponse
     {
-        RolePromotion::create(self::promotionAttributes($request->all(), $request->has('is_active')));
+        RolePromotion::create([
+            'name' => $request->input('name'),
+            'description' => $request->input('description'),
+            'applicable_roles' => $request->input('applicable_roles', []),
+            'additional_days' => $request->input('additional_days'),
+            'start_date' => $request->input('start_date'),
+            'end_date' => $request->input('end_date'),
+            'is_active' => $request->has('is_active'),
+        ]);
 
         return redirect()->route('admin.promotions.index')
             ->with('success', 'Promotion created successfully.');
@@ -86,7 +82,15 @@ class AdminPromotionController extends BasePageController
     {
         $promotion = RolePromotion::findOrFail($id);
 
-        $promotion->update(self::promotionAttributes($request->all(), $request->has('is_active')));
+        $promotion->update([
+            'name' => $request->input('name'),
+            'description' => $request->input('description'),
+            'applicable_roles' => $request->input('applicable_roles', []),
+            'additional_days' => $request->input('additional_days'),
+            'start_date' => $request->input('start_date'),
+            'end_date' => $request->input('end_date'),
+            'is_active' => $request->has('is_active'),
+        ]);
 
         return redirect()->route('admin.promotions.index')
             ->with('success', 'Promotion updated successfully.');
@@ -112,7 +116,7 @@ class AdminPromotionController extends BasePageController
         $promotion = RolePromotion::findOrFail($id);
         $promotion->update(['is_active' => ! $promotion->is_active]);
 
-        $status = self::toggleStatusLabel((bool) $promotion->is_active);
+        $status = $promotion->is_active ? 'activated' : 'deactivated';
 
         return redirect()->route('admin.promotions.index')
             ->with('success', "Promotion {$status} successfully.");
@@ -140,10 +144,10 @@ class AdminPromotionController extends BasePageController
             ->get();
 
         // Calculate overall statistics
-        $overallStats = array_merge(self::overallStatistics($promotions->map(fn (RolePromotion $promotion): array => [
-            'is_active' => (bool) $promotion->is_active,
-            'statistics_count' => (int) $promotion->statistics_count,
-        ])->all()), [
+        $overallStats = [
+            'total_promotions' => $promotions->count(),
+            'active_promotions' => $promotions->where('is_active', true)->count(),
+            'total_applications' => $promotions->sum('statistics_count'),
             'unique_users' => RolePromotionStat::query()
                 ->when($startDate, fn ($q) => $q->whereBetween('applied_at', [$startDate, $endDate]))
                 ->distinct('user_id')
@@ -151,7 +155,7 @@ class AdminPromotionController extends BasePageController
             'total_days_added' => RolePromotionStat::query()
                 ->when($startDate, fn ($q) => $q->whereBetween('applied_at', [$startDate, $endDate]))
                 ->sum('days_added'),
-        ]);
+        ];
 
         // Get top promotions by usage
         $topPromotions = $promotions->sortByDesc('statistics_count')->take(5);
@@ -221,88 +225,5 @@ class AdminPromotionController extends BasePageController
             'endDate' => $endDate,
             'selectedPeriod' => $request->input('period', '30days'),
         ]);
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $input
-     * @return array{name: mixed, description: mixed, applicable_roles: mixed, additional_days: mixed, start_date: mixed, end_date: mixed, is_active: bool}
-     */
-    public static function promotionAttributes(array $input, bool $isActive): array
-    {
-        return self::usesRustFfi() ? self::promotionAttributesNative($input, $isActive) : self::promotionAttributesPhp($input, $isActive);
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $input
-     * @return array{name: mixed, description: mixed, applicable_roles: mixed, additional_days: mixed, start_date: mixed, end_date: mixed, is_active: bool}
-     */
-    public static function promotionAttributesPhp(array $input, bool $isActive): array
-    {
-        return [
-            'name' => $input['name'] ?? null,
-            'description' => $input['description'] ?? null,
-            'applicable_roles' => array_key_exists('applicable_roles', $input) ? $input['applicable_roles'] : [],
-            'additional_days' => $input['additional_days'] ?? null,
-            'start_date' => $input['start_date'] ?? null,
-            'end_date' => $input['end_date'] ?? null,
-            'is_active' => $isActive,
-        ];
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $input
-     * @return array{name: mixed, description: mixed, applicable_roles: mixed, additional_days: mixed, start_date: mixed, end_date: mixed, is_active: bool}
-     */
-    public static function promotionAttributesNative(array $input, bool $isActive): array
-    {
-        return GdprRequestController::wave29Native(8, ['input' => $input, 'is_active' => $isActive]) ?? self::promotionAttributesPhp($input, $isActive);
-    }
-
-    public static function toggleStatusLabel(bool $active): string
-    {
-        return self::usesRustFfi() ? self::toggleStatusLabelNative($active) : self::toggleStatusLabelPhp($active);
-    }
-
-    public static function toggleStatusLabelPhp(bool $active): string
-    {
-        return $active ? 'activated' : 'deactivated';
-    }
-
-    public static function toggleStatusLabelNative(bool $active): string
-    {
-        $result = GdprRequestController::wave29Native(9, ['active' => $active]);
-
-        return is_string($result['label'] ?? null) ? $result['label'] : self::toggleStatusLabelPhp($active);
-    }
-
-    /**
-     * @param  list<array{is_active: bool, statistics_count: int}>  $promotions
-     * @return array{total_promotions: int, active_promotions: int, total_applications: int|float}
-     */
-    public static function overallStatistics(array $promotions): array
-    {
-        return self::usesRustFfi() ? self::overallStatisticsNative($promotions) : self::overallStatisticsPhp($promotions);
-    }
-
-    /**
-     * @param  list<array{is_active: bool, statistics_count: int}>  $promotions
-     * @return array{total_promotions: int, active_promotions: int, total_applications: int|float}
-     */
-    public static function overallStatisticsPhp(array $promotions): array
-    {
-        return [
-            'total_promotions' => count($promotions),
-            'active_promotions' => count(array_filter($promotions, fn (array $promotion): bool => $promotion['is_active'])),
-            'total_applications' => array_sum(array_column($promotions, 'statistics_count')),
-        ];
-    }
-
-    /**
-     * @param  list<array{is_active: bool, statistics_count: int}>  $promotions
-     * @return array{total_promotions: int, active_promotions: int, total_applications: int|float}
-     */
-    public static function overallStatisticsNative(array $promotions): array
-    {
-        return GdprRequestController::wave29Native(10, ['promotions' => $promotions]) ?? self::overallStatisticsPhp($promotions);
     }
 }

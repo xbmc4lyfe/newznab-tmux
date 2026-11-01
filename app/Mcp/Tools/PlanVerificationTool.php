@@ -7,7 +7,6 @@ namespace App\Mcp\Tools;
 use App\Mcp\Tools\Concerns\HasVersionedStructuredOutput;
 use App\Services\Mcp\ProjectPathGuard;
 use App\Services\Mcp\VerificationPlanner;
-use App\Support\RustPipelineLibrary;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
@@ -27,19 +26,6 @@ use Laravel\Mcp\Server\Tools\Annotations\IsReadOnly;
 class PlanVerificationTool extends Tool
 {
     use HasVersionedStructuredOutput;
-
-    // Opt-in only until correctness and end-to-end performance gates pass.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('mcp-inspect-prompt', InspectChangeImpactTool::FFI_CDEF) !== null;
-    }
 
     public function schema(JsonSchema $schema): array
     {
@@ -65,7 +51,7 @@ class PlanVerificationTool extends Tool
         $plan = $planner->plan($paths);
         $payload = [
             'schema_version' => (int) config('nntmux-mcp.schema_version', 1),
-            'summary' => self::formatPlanSummary(count($plan['checks'])),
+            'summary' => sprintf('Planned %d verification check(s).', count($plan['checks'])),
             'paths' => $paths,
             'results' => $plan,
             'warnings' => [],
@@ -75,47 +61,11 @@ class PlanVerificationTool extends Tool
         Log::channel('nntmux_mcp')->info('MCP tool completed', [
             'tool' => 'plan-verification',
             'safe_paths' => $paths,
-            'duration_ms' => self::computeDurationMs($startedAt, hrtime(true)),
+            'duration_ms' => (int) ((hrtime(true) - $startedAt) / 1_000_000),
             'status' => 'completed',
             'truncated' => false,
         ]);
 
         return Response::make(Response::text($payload['summary']))->withStructuredContent($payload);
-    }
-
-    public static function formatPlanSummary(int $checkCount): string
-    {
-        return (self::$useRustFfi ? self::formatPlanSummaryNative($checkCount) : null)
-            ?? self::formatPlanSummaryPhp($checkCount);
-    }
-
-    public static function formatPlanSummaryPhp(int $checkCount): string
-    {
-        return sprintf('Planned %d verification check(s).', $checkCount);
-    }
-
-    public static function formatPlanSummaryNative(int $checkCount): ?string
-    {
-        $result = InspectChangeImpactTool::transformNative(4, [$checkCount]);
-
-        return is_string($result) ? $result : null;
-    }
-
-    public static function computeDurationMs(int $startedAtNs, int $nowNs): int
-    {
-        return (self::$useRustFfi ? self::computeDurationMsNative($startedAtNs, $nowNs) : null)
-            ?? self::computeDurationMsPhp($startedAtNs, $nowNs);
-    }
-
-    public static function computeDurationMsPhp(int $startedAtNs, int $nowNs): int
-    {
-        return (int) (($nowNs - $startedAtNs) / 1_000_000);
-    }
-
-    public static function computeDurationMsNative(int $startedAtNs, int $nowNs): ?int
-    {
-        $result = InspectChangeImpactTool::transformNative(5, [$startedAtNs, $nowNs]);
-
-        return is_int($result) ? $result : null;
     }
 }

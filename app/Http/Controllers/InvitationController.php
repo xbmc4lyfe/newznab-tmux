@@ -8,44 +8,14 @@ use App\Models\Invitation;
 use App\Models\User;
 use App\Services\InvitationService;
 use App\Services\RegistrationStatusService;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\View\View;
-use Throwable;
 
 class InvitationController extends BasePageController
 {
-    public const string FFI_CDEF = <<<'CDEF'
-    int32_t nntmux_invitation_available(int64_t total, int64_t active_pending, int64_t *out_available);
-    int32_t nntmux_invitation_row_plan(uint8_t has_used_by, uint8_t has_used_at);
-    int32_t nntmux_invitation_role_index(
-        const char *role,
-        size_t role_len,
-        const char *keys,
-        size_t keys_len,
-        const size_t *key_lens,
-        size_t count
-    );
-    CDEF;
-
-    private const int ROW_SET_USED_BY_USER = 1;
-
-    private const int ROW_SET_USED_AT = 2;
-
-    private const int ROLE_NOT_FOUND = -1;
-
-    /**
-     * Production default stays false until benchmark/parity sign-off; see
-     * tests/Unit/RustProfileSecurityPrivacyInviteControllersParityTest.php.
-     */
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     protected InvitationService $invitationService;
 
     public function __construct(
@@ -94,14 +64,21 @@ class InvitationController extends BasePageController
         // Convert paginated results to array for Blade
         $invitationsArray = [];
         foreach ($invitations as $invitation) {
-            // Add related user data and convert timestamps with Carbon's timestamp property
-            $invitationsArray[] = self::normalizeInvitationRow(
-                $invitation->toArray(),
-                $invitation->usedBy ? $invitation->usedBy->toArray() : null,
-                $invitation->created_at?->timestamp,
-                $invitation->expires_at?->timestamp,
-                $invitation->used_at ? $invitation->used_at->timestamp : null,
-            );
+            $invitationData = $invitation->toArray();
+
+            // Add related user data
+            if ($invitation->usedBy) {
+                $invitationData['used_by_user'] = $invitation->usedBy->toArray();
+            }
+
+            // Convert timestamps - use Carbon's timestamp property instead of strtotime
+            $invitationData['created_at'] = $invitation->created_at?->timestamp;
+            $invitationData['expires_at'] = $invitation->expires_at?->timestamp;
+            if ($invitation->used_at) {
+                $invitationData['used_at'] = $invitation->used_at->timestamp;
+            }
+
+            $invitationsArray[] = $invitationData;
         }
 
         $this->viewData['invite_mode'] = true;
@@ -144,14 +121,14 @@ class InvitationController extends BasePageController
             ->where('expires_at', '>', now())
             ->count();
 
-        $availableInvites = self::availableInvites($user->invites, $activeInvitations);
+        $availableInvites = $user->invites - $activeInvitations;
 
         $this->viewData['invite_mode'] = true;
         $this->viewData['user_roles'] = config('nntmux.user_roles', []);
-        $this->viewData['user_invites_left'] = $availableInvites['available'];
+        $this->viewData['user_invites_left'] = $availableInvites;
         $this->viewData['user_invites_total'] = $user->invites;
         $this->viewData['user_invites_pending'] = $activeInvitations;
-        $this->viewData['can_send_invites'] = $availableInvites['can_send_invites'];
+        $this->viewData['can_send_invites'] = $availableInvites > 0;
 
         return view('invitations.create', $this->viewData);
     }
@@ -211,7 +188,8 @@ class InvitationController extends BasePageController
 
         // Add role name if role is set
         if ($preview && isset($preview['metadata']['role'])) {
-            $preview['role_name'] = self::previewRoleName($preview['metadata']['role'], config('nntmux.user_roles', []));
+            $roles = config('nntmux.user_roles', []);
+            $preview['role_name'] = $roles[$preview['metadata']['role']] ?? 'Default';
         }
 
         $this->viewData['preview'] = $preview;
@@ -314,215 +292,5 @@ class InvitationController extends BasePageController
             'message' => "Cleaned up {$cleanedCount} expired invitations",
             'count' => $cleanedCount,
         ]);
-    }
-
-    /**
-     * Overrides the base page toggle for this controller's helpers; `null` restores the PHP default.
-     */
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi ?? false;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi): void
-    {
-        self::$ffi = $ffi;
-    }
-
-    /**
-     * Available invites (total minus active pending invitations) and whether any remain.
-     *
-     * @return array{available: int|float, can_send_invites: bool}
-     */
-    public static function availableInvites(int $total, int $activePending): array
-    {
-        return self::$useRustFfi
-            ? self::availableInvitesNative($total, $activePending)
-            : self::availableInvitesPhp($total, $activePending);
-    }
-
-    /**
-     * @return array{available: int|float, can_send_invites: bool}
-     */
-    public static function availableInvitesPhp(int $total, int $activePending): array
-    {
-        $available = $total - $activePending;
-
-        return ['available' => $available, 'can_send_invites' => $available > 0];
-    }
-
-    /**
-     * @return array{available: int|float, can_send_invites: bool}
-     */
-    public static function availableInvitesNative(int $total, int $activePending): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::availableInvitesPhp($total, $activePending);
-        }
-
-        try {
-            $out = $ffi->new('int64_t[1]');
-            $canSend = self::callFfi($ffi, 'nntmux_invitation_available', $total, $activePending, $out);
-
-            return match ($canSend) {
-                0, 1 => ['available' => (int) $out[0], 'can_send_invites' => $canSend === 1],
-                // Overflow: PHP promotes the difference to float.
-                default => self::availableInvitesPhp($total, $activePending),
-            };
-        } catch (Throwable) {
-            return self::availableInvitesPhp($total, $activePending);
-        }
-    }
-
-    /**
-     * Blade invitation row: `used_by_user` when the invitee is loaded, Unix timestamps for
-     * `created_at`/`expires_at`, and `used_at` only once used.
-     *
-     * @param  array<string, mixed>  $row
-     * @param  array<string, mixed>|null  $usedByUser
-     * @return array<string, mixed>
-     */
-    public static function normalizeInvitationRow(array $row, ?array $usedByUser, ?int $createdAt, ?int $expiresAt, ?int $usedAt): array
-    {
-        return self::$useRustFfi
-            ? self::normalizeInvitationRowNative($row, $usedByUser, $createdAt, $expiresAt, $usedAt)
-            : self::normalizeInvitationRowPhp($row, $usedByUser, $createdAt, $expiresAt, $usedAt);
-    }
-
-    /**
-     * @param  array<string, mixed>  $row
-     * @param  array<string, mixed>|null  $usedByUser
-     * @return array<string, mixed>
-     */
-    public static function normalizeInvitationRowPhp(array $row, ?array $usedByUser, ?int $createdAt, ?int $expiresAt, ?int $usedAt): array
-    {
-        if ($usedByUser !== null) {
-            $row['used_by_user'] = $usedByUser;
-        }
-        $row['created_at'] = $createdAt;
-        $row['expires_at'] = $expiresAt;
-        if ($usedAt !== null) {
-            $row['used_at'] = $usedAt;
-        }
-
-        return $row;
-    }
-
-    /**
-     * @param  array<string, mixed>  $row
-     * @param  array<string, mixed>|null  $usedByUser
-     * @return array<string, mixed>
-     */
-    public static function normalizeInvitationRowNative(array $row, ?array $usedByUser, ?int $createdAt, ?int $expiresAt, ?int $usedAt): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::normalizeInvitationRowPhp($row, $usedByUser, $createdAt, $expiresAt, $usedAt);
-        }
-
-        try {
-            $plan = self::callFfi($ffi, 'nntmux_invitation_row_plan', $usedByUser !== null ? 1 : 0, $usedAt !== null ? 1 : 0);
-            if (! \is_int($plan) || $plan < 0 || ($plan & ~(self::ROW_SET_USED_BY_USER | self::ROW_SET_USED_AT)) !== 0) {
-                return self::normalizeInvitationRowPhp($row, $usedByUser, $createdAt, $expiresAt, $usedAt);
-            }
-            if (($plan & self::ROW_SET_USED_BY_USER) !== 0) {
-                $row['used_by_user'] = $usedByUser;
-            }
-            $row['created_at'] = $createdAt;
-            $row['expires_at'] = $expiresAt;
-            if (($plan & self::ROW_SET_USED_AT) !== 0) {
-                $row['used_at'] = $usedAt;
-            }
-
-            return $row;
-        } catch (Throwable) {
-            return self::normalizeInvitationRowPhp($row, $usedByUser, $createdAt, $expiresAt, $usedAt);
-        }
-    }
-
-    /**
-     * Invitation preview role name: the configured role for the metadata role key, or `Default`.
-     *
-     * @param  array<array-key, mixed>  $roles
-     */
-    public static function previewRoleName(mixed $role, array $roles): mixed
-    {
-        return self::$useRustFfi
-            ? self::previewRoleNameNative($role, $roles)
-            : self::previewRoleNamePhp($role, $roles);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $roles
-     */
-    public static function previewRoleNamePhp(mixed $role, array $roles): mixed
-    {
-        return $roles[$role] ?? 'Default';
-    }
-
-    /**
-     * Integer and string role keys are matched natively; PHP stores integer-like string keys as
-     * integers, so comparing key strings byte for byte matches PHP array key lookup.
-     *
-     * @param  array<array-key, mixed>  $roles
-     */
-    public static function previewRoleNameNative(mixed $role, array $roles): mixed
-    {
-        $ffi = self::ffi();
-        if ($ffi === null || (! \is_int($role) && ! \is_string($role))) {
-            return self::previewRoleNamePhp($role, $roles);
-        }
-
-        try {
-            $roleKey = (string) $role;
-            $keys = array_map(strval(...), array_keys($roles));
-            $count = \count($keys);
-            $lens = null;
-            if ($count > 0) {
-                $lens = $ffi->new("size_t[{$count}]");
-                foreach ($keys as $index => $key) {
-                    $lens[$index] = \strlen($key);
-                }
-            }
-            $payload = implode('', $keys);
-            $index = self::callFfi($ffi, 'nntmux_invitation_role_index', $roleKey, \strlen($roleKey), $payload, \strlen($payload), $lens, $count);
-            if ($index === self::ROLE_NOT_FOUND) {
-                return 'Default';
-            }
-            if (! \is_int($index) || $index < 0 || $index >= $count) {
-                return self::previewRoleNamePhp($role, $roles);
-            }
-
-            return array_values($roles)[$index] ?? 'Default';
-        } catch (Throwable) {
-            return self::previewRoleNamePhp($role, $roles);
-        }
-    }
-
-    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
-    {
-        return $ffi->$symbol(...$args);
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 }

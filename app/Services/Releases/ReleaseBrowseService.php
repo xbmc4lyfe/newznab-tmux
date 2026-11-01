@@ -9,17 +9,11 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Models\UsenetGroup;
 use App\Services\Configuration\ConfigurationProvider;
-use App\Services\Search\Support\ManticoreSchemaInspector;
 use App\Support\ReleaseSearchIndexDocument;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Database\Eloquent\Collection;
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Throwable;
 
 /**
  * Service for browsing and ordering releases on the frontend.
@@ -41,52 +35,6 @@ class ReleaseBrowseService
     public const PASSWD_NONE = 0; // No password.
 
     public const PASSWD_RAR = 1; // Definitely passworded.
-
-    /**
-     * Rust stays opt-in for the Wave 43.5 summary: the FFI round trip misses the 1.5x gate; see
-     * tests/Unit/RustManticoreSchemaReleaseBrowseDuplicateGroupMgmtW43ParityTest.php.
-     */
-    public const bool W43_RELEASE_BROWSE_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useW43RustFfi = null;
-
-    // Every candidate missed at least one 1.5x workload gate; see the parity benchmark.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    /** Shared search-domain byte transform; null means unavailable or declined. */
-    public static function searchSqlTransformNative(int $mode, string $input): ?string
-    {
-        $ffi = RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_search_outbox_browse_sql(uint32_t mode, const char *input, size_t input_len, char *output, size_t output_cap);');
-        if ($ffi === null) {
-            return null;
-        }
-        $cap = 0;
-        $out = RustPipelineLibrary::obtainScratch($ffi, max(64, strlen($input) + 128), $cap);
-        if ($out === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $n = $ffi->nntmux_search_outbox_browse_sql($mode, $input, strlen($input), $out, $cap);
-            if (is_int($n) && $n < -2) {
-                $out = RustPipelineLibrary::obtainScratch($ffi, -$n, $cap);
-                if ($out === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $n = $ffi->nntmux_search_outbox_browse_sql($mode, $input, strlen($input), $out, $cap);
-            }
-
-            return is_int($n) && $n >= 0 ? FFI::string($out, $n) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
 
     public function __construct() {}
 
@@ -645,30 +593,6 @@ class ReleaseBrowseService
      */
     public function getBrowseOrder(array|string $orderBy): array
     {
-        // Scalar FFI candidates remain opt-in until both workload gates pass.
-        return self::$useRustFfi ? $this->getBrowseOrderNative($orderBy) : $this->getBrowseOrderPhp($orderBy);
-    }
-
-    /**
-     * @param  array<string, mixed>|string  $orderBy
-     * @return array{0: string, 1: string}
-     */
-    public function getBrowseOrderNative(array|string $orderBy): array
-    {
-        if (is_array($orderBy)) {
-            return $this->getBrowseOrderPhp($orderBy);
-        }
-        $result = self::searchSqlTransformNative(4, $orderBy);
-
-        return $result === null ? $this->getBrowseOrderPhp($orderBy) : explode("\0", $result, 2);
-    }
-
-    /**
-     * @param  array<string, mixed>|string  $orderBy
-     * @return array{0: string, 1: string}
-     */
-    public function getBrowseOrderPhp(array|string $orderBy): array
-    {
         $orderArr = explode('_', ($orderBy === '' ? 'posted_desc' : $orderBy));
         $orderField = match ($orderArr[0]) {
             'cat' => 'categories_id',
@@ -682,81 +606,6 @@ class ReleaseBrowseService
         };
 
         return [$orderField, isset($orderArr[1]) && preg_match('/^(asc|desc)$/i', $orderArr[1]) ? $orderArr[1] : 'desc'];
-    }
-
-    /** Pass null to restore {@see W43_RELEASE_BROWSE_RUST_FFI_DEFAULT}. */
-    public static function useW43RustFfi(?bool $enable = true): void
-    {
-        self::$useW43RustFfi = $enable;
-    }
-
-    public static function usesW43RustFfi(): bool
-    {
-        return self::$useW43RustFfi ?? self::W43_RELEASE_BROWSE_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Summarizes browse orders as {@see getBrowseOrderPhp()} resolves them: one count per resolved
-     * column, the resolved direction (`asc`/`desc`, any case), `explicit_direction` for orders whose
-     * direction segment was honoured, `index_sortable` for columns the search index can sort and
-     * `distinct_orders` for distinct column/direction pairs. Non-string orders are invalid.
-     *
-     * @param  array<array-key, mixed>  $orderBys
-     * @return array{orders: int, invalid: int, categories_id: int, searchname: int, size: int, totalpart: int, grabs: int, comments: int, adddate: int, postdate: int, asc: int, desc: int, explicit_direction: int, index_sortable: int, distinct_orders: int}
-     */
-    public function summarizeBrowseOrderBatch(array $orderBys): array
-    {
-        return self::usesW43RustFfi() ? $this->summarizeBrowseOrderBatchNative($orderBys) : $this->summarizeBrowseOrderBatchPhp($orderBys);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $orderBys
-     * @return array{orders: int, invalid: int, categories_id: int, searchname: int, size: int, totalpart: int, grabs: int, comments: int, adddate: int, postdate: int, asc: int, desc: int, explicit_direction: int, index_sortable: int, distinct_orders: int}
-     */
-    public function summarizeBrowseOrderBatchPhp(array $orderBys): array
-    {
-        $summary = ['orders' => \count($orderBys), 'invalid' => 0, 'categories_id' => 0, 'searchname' => 0, 'size' => 0, 'totalpart' => 0, 'grabs' => 0, 'comments' => 0, 'adddate' => 0, 'postdate' => 0, 'asc' => 0, 'desc' => 0, 'explicit_direction' => 0, 'index_sortable' => 0, 'distinct_orders' => 0];
-        $distinct = [];
-        foreach ($orderBys as $orderBy) {
-            if (! \is_string($orderBy)) {
-                $summary['invalid']++;
-
-                continue;
-            }
-            [$field, $direction] = $this->getBrowseOrderPhp($orderBy);
-            $segments = explode('_', $orderBy === '' ? 'posted_desc' : $orderBy);
-            $summary[$field]++;
-            $summary[strncasecmp($direction, 'a', 1) === 0 ? 'asc' : 'desc']++;
-            $summary['explicit_direction'] += (int) (isset($segments[1]) && preg_match('/^(asc|desc)$/i', $segments[1]) === 1);
-            $summary['index_sortable'] += (int) ($this->browseOrderToIndexSortField($field) !== null);
-            $distinct[$field."\0".$direction] = true;
-        }
-        $summary['distinct_orders'] = \count($distinct);
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $orderBys
-     * @return array{orders: int, invalid: int, categories_id: int, searchname: int, size: int, totalpart: int, grabs: int, comments: int, adddate: int, postdate: int, asc: int, desc: int, explicit_direction: int, index_sortable: int, distinct_orders: int}
-     */
-    public function summarizeBrowseOrderBatchNative(array $orderBys): array
-    {
-        $parts = [];
-        foreach ($orderBys as $orderBy) {
-            if (\is_string($orderBy)) {
-                array_push($parts, '1', $orderBy);
-            } else {
-                $parts[] = '0';
-            }
-        }
-        $fields = ManticoreSchemaInspector::evaluateW43Native(2, $parts);
-        if ($fields === null || \count($fields) !== 15) {
-            return $this->summarizeBrowseOrderBatchPhp($orderBys);
-        }
-        $keys = ['orders', 'invalid', 'categories_id', 'searchname', 'size', 'totalpart', 'grabs', 'comments', 'adddate', 'postdate', 'asc', 'desc', 'explicit_direction', 'index_sortable', 'distinct_orders'];
-
-        return array_combine($keys, array_map(intval(...), $fields));
     }
 
     /**
@@ -856,33 +705,6 @@ class ReleaseBrowseService
      */
     public function uSQL(Collection|array $userQuery, string $type): string // @phpstan-ignore missingType.generics
     {
-        return self::$useRustFfi ? $this->uSQLNative($userQuery, $type) : $this->uSQLPhp($userQuery, $type);
-    }
-
-    /** @param Collection<int, Model>|array<array-key, object> $userQuery */
-    public function uSQLNative(Collection|array $userQuery, string $type): string
-    {
-        $field = static fn (string $value): string => pack('V', strlen($value)).$value;
-        $input = $field($type);
-        foreach ($userQuery as $query) {
-            $input .= $field(sprintf('%d', $query->$type));
-            if (empty($query->categories)) {
-                $input .= $field('0').$field('');
-            } else {
-                $categories = $query->categories;
-                $cats = explode('|', $categories);
-                $input .= count($cats) > 1
-                    ? $field('2').$field($categories)
-                    : $field('1').$field(sprintf('%d', $cats[0]));
-            }
-        }
-
-        return self::searchSqlTransformNative(6, $input) ?? $this->uSQLPhp($userQuery, $type);
-    }
-
-    /** @param Collection<int, Model>|array<array-key, object> $userQuery */
-    public function uSQLPhp(Collection|array $userQuery, string $type): string
-    {
         $sql = '(1=2 ';
         foreach ($userQuery as $query) {
             $sql .= sprintf('OR (r.%s = %d', $type, $query->$type);
@@ -967,72 +789,14 @@ class ReleaseBrowseService
         return Search::searchReleasesByExternalId($externalIds, $limit);
     }
 
-    public function rewritePagerCountQuery(string $query, bool $fallback = false): ?string
-    {
-        return self::$useRustFfi ? $this->rewritePagerCountQueryNative($query, $fallback) : $this->rewritePagerCountQueryPhp($query, $fallback);
-    }
-
-    public function rewritePagerCountQueryNative(string $query, bool $fallback = false): ?string
-    {
-        return self::searchSqlTransformNative($fallback ? 8 : 7, $query) ?? $this->rewritePagerCountQueryPhp($query, $fallback);
-    }
-
-    public function rewritePagerCountQueryPhp(string $query, bool $fallback = false): ?string
-    {
-        if ($fallback) {
-            if (! preg_match('/FROM\s+releases\s+r\s+(.+?)(?:ORDER\s+BY|LIMIT|$)/is', $query, $matches)) {
-                return null;
-            }
-            $conditions = preg_replace('/(?:LEFT\s+|INNER\s+)?(?:OUTER\s+)?JOIN\s+.+?(?=WHERE|LEFT|INNER|JOIN|$)/is', '', $matches[1]);
-
-            return sprintf('SELECT COUNT(*) as count FROM releases r %s', trim($conditions));
-        }
-        if (preg_match('/SELECT\s+COUNT\s*\(/is', $query)) {
-            return $query;
-        }
-        // For regular SELECT queries, optimize for counting
-        $countQuery = $query;
-
-        // Remove ORDER BY clause (not needed for COUNT)
-        $countQuery = preg_replace('/ORDER\s+BY\s+[^)]+$/is', '', $countQuery);
-
-        // Remove GROUP BY if it's only grouping by r.id
-        $countQuery = preg_replace('/GROUP\s+BY\s+r\.id\s*$/is', '', $countQuery);
-
-        // Check if query has DISTINCT in SELECT
-        $hasDistinct = preg_match('/SELECT\s+DISTINCT/is', $countQuery);
-
-        // Replace SELECT clause with COUNT
-        if ($hasDistinct || preg_match('/GROUP\s+BY/is', $countQuery)) {
-            // For queries with DISTINCT or GROUP BY, count distinct r.id
-            $countQuery = preg_replace(
-                '/SELECT\s+.+?\s+FROM/is',
-                'SELECT COUNT(DISTINCT r.id) as count FROM',
-                $countQuery
-            );
-        } else {
-            // For simple queries, use COUNT(*)
-            $countQuery = preg_replace(
-                '/SELECT\s+.+?\s+FROM/is',
-                'SELECT COUNT(*) as count FROM',
-                $countQuery
-            );
-        }
-
-        // Remove LIMIT/OFFSET from the count query
-        $countQuery = preg_replace('/LIMIT\s+\d+(\s+OFFSET\s+\d+)?$/is', '', $countQuery);
-
-        return $countQuery;
-    }
-
     /**
      * Get the count of releases for pager.
      *
      * @param  string  $query  The query to get the count from.
      */
-    private function getPagerCount(string $query, ?int $maxResults = null): int
+    private function getPagerCount(string $query): int
     {
-        $maxResults ??= (int) config('nntmux.max_pager_results');
+        $maxResults = (int) config('nntmux.max_pager_results');
         $cacheExpiry = config('nntmux.cache_expiry_short');
 
         // Generate cache key from original query
@@ -1077,7 +841,37 @@ class ReleaseBrowseService
             }
         }
 
-        $countQuery = $this->rewritePagerCountQuery($query);
+        // For regular SELECT queries, optimize for counting
+        $countQuery = $query;
+
+        // Remove ORDER BY clause (not needed for COUNT)
+        $countQuery = preg_replace('/ORDER\s+BY\s+[^)]+$/is', '', $countQuery);
+
+        // Remove GROUP BY if it's only grouping by r.id
+        $countQuery = preg_replace('/GROUP\s+BY\s+r\.id\s*$/is', '', $countQuery);
+
+        // Check if query has DISTINCT in SELECT
+        $hasDistinct = preg_match('/SELECT\s+DISTINCT/is', $countQuery);
+
+        // Replace SELECT clause with COUNT
+        if ($hasDistinct || preg_match('/GROUP\s+BY/is', $countQuery)) {
+            // For queries with DISTINCT or GROUP BY, count distinct r.id
+            $countQuery = preg_replace(
+                '/SELECT\s+.+?\s+FROM/is',
+                'SELECT COUNT(DISTINCT r.id) as count FROM',
+                $countQuery
+            );
+        } else {
+            // For simple queries, use COUNT(*)
+            $countQuery = preg_replace(
+                '/SELECT\s+.+?\s+FROM/is',
+                'SELECT COUNT(*) as count FROM',
+                $countQuery
+            );
+        }
+
+        // Remove LIMIT/OFFSET from the count query
+        $countQuery = preg_replace('/LIMIT\s+\d+(\s+OFFSET\s+\d+)?$/is', '', $countQuery);
 
         try {
             // Execute the count query
@@ -1097,8 +891,13 @@ class ReleaseBrowseService
             // If optimization fails, try a simpler approach
             try {
                 // Extract the core table and WHERE conditions
-                $fallbackQuery = $this->rewritePagerCountQuery($query, true);
-                if ($fallbackQuery !== null) {
+                if (preg_match('/FROM\s+releases\s+r\s+(.+?)(?:ORDER\s+BY|LIMIT|$)/is', $query, $matches)) {
+                    $conditions = $matches[1];
+                    // Remove JOINs but keep WHERE
+                    $conditions = preg_replace('/(?:LEFT\s+|INNER\s+)?(?:OUTER\s+)?JOIN\s+.+?(?=WHERE|LEFT|INNER|JOIN|$)/is', '', $conditions);
+
+                    $fallbackQuery = sprintf('SELECT COUNT(*) as count FROM releases r %s', trim($conditions));
+
                     $result = DB::select($fallbackQuery);
                     $count = isset($result[0]) ? (int) $result[0]->count : 0;
 
@@ -1120,196 +919,6 @@ class ReleaseBrowseService
             }
 
             return 0;
-        }
-    }
-
-    /** Wave 55.3 paired benchmarks decide this default; see RustReleaseImageBrowseDuplicateGroupManagementW55ParityTest. */
-    private const bool W55_RUST_FFI_DEFAULT = true;
-
-    public const string W55_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w553_release_browse_order_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /** getBrowseOrderPhp() order segments: 1 categories_id, 2 searchname, 3 size, 4 totalpart, 5 grabs, 6 comments, 7 adddate (others 0, postdate). */
-    private const array W55_BROWSE_FIELDS = ['cat' => 1, 'name' => 2, 'size' => 3, 'files' => 4, 'stats' => 5, 'comments' => 6, 'added' => 7];
-
-    public static function usesW55RustFfi(): bool
-    {
-        $override = self::w55RustFfiState();
-
-        return \is_bool($override) ? $override : self::W55_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with the Wave 55 Rust path forced on or off, then restores the previous setting.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w55RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w55RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Wave 55.3 browse order plans as getBrowseOrderPhp() resolves them. Per order `field | 16 explicit
-     * direction | 32 asc | 64 index-sortable field`, with `field` 0 postdate, 1 categories_id,
-     * 2 searchname, 3 size, 4 totalpart, 5 grabs, 6 comments and 7 adddate; then the eight field counts,
-     * the explicit and asc counts and the number of distinct field/direction pairs.
-     *
-     * @param  array<array-key, string>  $orderBys
-     * @return list<int>
-     */
-    public static function w55BrowseOrderPlanBatch(array $orderBys): array
-    {
-        return self::usesW55RustFfi() ? self::w55BrowseOrderPlanBatchNative($orderBys) : self::w55BrowseOrderPlanBatchPhp($orderBys);
-    }
-
-    /**
-     * @param  array<array-key, string>  $orderBys
-     * @return list<int>
-     */
-    public static function w55BrowseOrderPlanBatchNative(array $orderBys): array
-    {
-        return self::w55Invoke($orderBys, \count($orderBys) + 11) ?? self::w55BrowseOrderPlanBatchPhp($orderBys);
-    }
-
-    /**
-     * @param  array<array-key, string>  $orderBys
-     * @return list<int>
-     */
-    public static function w55BrowseOrderPlanBatchPhp(array $orderBys): array
-    {
-        $out = [];
-        $fields = [0, 0, 0, 0, 0, 0, 0, 0];
-        $explicitTotal = 0;
-        $ascTotal = 0;
-        $pairs = [];
-        foreach ($orderBys as $orderBy) {
-            $orderBy = (string) $orderBy;
-            $segments = explode('_', $orderBy === '' ? 'posted_desc' : $orderBy, 3);
-            $field = self::W55_BROWSE_FIELDS[$segments[0]] ?? 0;
-            $explicit = isset($segments[1]) && preg_match('/^(asc|desc)$/i', $segments[1]) === 1;
-            $asc = $explicit && strncasecmp($segments[1], 'a', 1) === 0;
-            $fields[$field]++;
-            $explicitTotal += (int) $explicit;
-            $ascTotal += (int) $asc;
-            $pairs[$field * 2 + (int) $asc] = true;
-            $out[] = $field | ($explicit ? 16 : 0) | ($asc ? 32 : 0) | ($field !== 2 ? 64 : 0);
-        }
-        array_push($out, ...$fields);
-        array_push($out, $explicitTotal, $ascTotal, \count($pairs));
-
-        return $out;
-    }
-
-    /**
-     * Wave 55 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
-     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
-     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
-     */
-    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var bool|null $override */
-        static $override = null;
-        /** @var FFI|false|null $ffi */
-        static $ffi = null;
-        /** @var CData|null $out */
-        static $out = null;
-        /** @var int $outCap */
-        static $outCap = 0;
-        /** @var CData|null $lens */
-        static $lens = null;
-        /** @var int $lensCap */
-        static $lensCap = 0;
-
-        if ($op === 'set') {
-            $previous = $override;
-            $override = \is_bool($val) ? $val : null;
-
-            return $previous;
-        }
-        if ($op === 'ffi') {
-            $ffi ??= RustPipelineLibrary::resolveDomain('release_w55', self::W55_FFI_CDEF) ?? false;
-
-            return $ffi === false ? null : $ffi;
-        }
-        if ($op === 'out') {
-            $words = \is_int($val) ? $val : 0;
-            if ($out === null || $outCap < $words) {
-                $handle = self::w55RustFfiState('ffi');
-                if (! $handle instanceof FFI) {
-                    return null;
-                }
-                $outCap = max(1024, $words * 2);
-                $out = $handle->new('int64_t['.$outCap.']');
-            }
-
-            return $out;
-        }
-        if ($op === 'lens') {
-            $words = \is_int($val) ? $val : 0;
-            if ($lens === null || $lensCap < $words) {
-                $handle = self::w55RustFfiState('ffi');
-                if (! $handle instanceof FFI) {
-                    return null;
-                }
-                $lensCap = max(256, $words * 2);
-                $lens = $handle->new('int64_t['.$lensCap.']');
-            }
-
-            return $lens;
-        }
-
-        return $override;
-    }
-
-    /**
-     * Calls the Wave 55.3 export with the NUL-joined $items, or with the items concatenated plus an
-     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
-     * declines or it writes other than $words words, so the caller falls back to PHP.
-     *
-     * @param  array<array-key, mixed>  $items
-     * @return list<int>|null
-     */
-    private static function w55Invoke(array $items, int $words): ?array
-    {
-        try {
-            $ffi = self::w55RustFfiState('ffi');
-            $out = self::w55RustFfiState('out', $words);
-            if (! $ffi instanceof FFI || ! $out instanceof CData) {
-                return null;
-            }
-            $count = \count($items);
-            $blob = implode("\0", $items);
-            $lens = null;
-            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
-                $blob = implode('', $items);
-                $column = self::w55RustFfiState('lens', $count);
-                if (! $column instanceof CData) {
-                    return null;
-                }
-                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
-                $lens = FFI::addr($column[0]);
-            }
-            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
-            $written = $ffi->nntmux_w553_release_browse_order_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
-            if ($written !== $words) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $words * 8));
-
-            /** @var list<int>|null */
-            return $values === false ? null : array_values($values);
-        } catch (Throwable) {
-            return null;
         }
     }
 }

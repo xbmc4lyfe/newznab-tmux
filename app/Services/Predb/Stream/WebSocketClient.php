@@ -4,10 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services\Predb\Stream;
 
-use App\Support\IrcChannelList;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use RuntimeException;
 
 /**
@@ -18,19 +14,6 @@ use RuntimeException;
  */
 class WebSocketClient
 {
-    private const NATIVE_CDEF = <<<'C'
-        ssize_t nntmux_ws_encode_frame(uint8_t opcode, const char *payload, size_t payload_len, const char *mask, size_t mask_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_ws_decode_frame(const char *bytes, size_t bytes_len, uint32_t *meta_out, char *out_buf, size_t out_cap);
-        C;
-
-    private static FFI|false|null $native = null;
-
-    private static ?CData $nativeBuffer = null;
-
-    private static int $nativeCapacity = 0;
-
-    private static ?CData $nativeMeta = null;
-
     private const OP_CONTINUATION = 0x0;
 
     private const OP_TEXT = 0x1;
@@ -206,19 +189,6 @@ class WebSocketClient
     public static function encodeFrame(int $opcode, string $payload, ?string $mask = null): string
     {
         $mask ??= random_bytes(4);
-        // FFI overhead loses on short messages; preserve legacy non-four-byte masks.
-        if (strlen($payload) >= 4096 && strlen($mask) === 4 && $opcode >= 0 && $opcode <= 255) {
-            $frame = self::encodeFrameNative($opcode, $payload, $mask);
-            if ($frame !== null) {
-                return $frame;
-            }
-        }
-
-        return self::encodeFramePhp($opcode, $payload, $mask);
-    }
-
-    private static function encodeFramePhp(int $opcode, string $payload, string $mask): string
-    {
         $length = strlen($payload);
         $header = chr(0x80 | $opcode);
 
@@ -239,25 +209,6 @@ class WebSocketClient
      * @return array{0: bool, 1: int, 2: string, 3: int}|null [fin, opcode, payload, bytes consumed], or null if incomplete.
      */
     public static function decodeFrame(string $bytes): ?array
-    {
-        // Unmasked server frames need only PHP's substring; avoid an FFI copy.
-        if (strlen($bytes) >= 4096 && (ord($bytes[1]) & 0x80) !== 0) {
-            $lengthCode = ord($bytes[1]) & 0x7F;
-            // Route by this frame's payload, not a buffer of coalesced tiny frames.
-            if (($lengthCode === 126 && ord($bytes[2]) >= 0x10)
-                || ($lengthCode === 127 && substr_compare($bytes, "\0\0\0\0\0\0\x10\0", 2, 8) >= 0)) {
-                $frame = self::decodeFrameNative($bytes);
-                if ($frame !== false) {
-                    return $frame;
-                }
-            }
-        }
-
-        return self::decodeFramePhp($bytes);
-    }
-
-    /** @return array{bool, int, string, int}|null */
-    private static function decodeFramePhp(string $bytes): ?array
     {
         if (strlen($bytes) < 2) {
             return null;
@@ -308,67 +259,6 @@ class WebSocketClient
         }
 
         return [($first & 0x80) !== 0, $first & 0x0F, $payload, $offset + $length];
-    }
-
-    private static function nativeLibrary(): ?FFI
-    {
-        if (self::$native === null) {
-            self::$native = RustPipelineLibrary::resolveDomain('ws_frames', self::NATIVE_CDEF) ?? false;
-        }
-
-        return self::$native === false ? null : self::$native;
-    }
-
-    private static function nativeBuffer(FFI $ffi, int $needed): CData
-    {
-        if (self::$nativeBuffer === null || self::$nativeCapacity < $needed) {
-            self::$nativeCapacity = max(4096, $needed);
-            self::$nativeBuffer = $ffi->new('char['.self::$nativeCapacity.']');
-        }
-
-        return self::$nativeBuffer;
-    }
-
-    private static function encodeFrameNative(int $opcode, string $payload, string $mask): ?string
-    {
-        $ffi = self::nativeLibrary();
-        if ($ffi === null) {
-            return null;
-        }
-        $buffer = self::nativeBuffer($ffi, strlen($payload) + 14);
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_ws_encode_frame($opcode, $payload, strlen($payload), $mask, strlen($mask), $buffer, self::$nativeCapacity);
-
-        return is_int($written) && $written >= 0 ? FFI::string($buffer, $written) : null;
-    }
-
-    /** @return array{bool, int, string, int}|false|null */
-    private static function decodeFrameNative(string $bytes): array|false|null
-    {
-        $ffi = self::nativeLibrary();
-        if ($ffi === null) {
-            return false;
-        }
-        // A bounded scratch buffer is enough even when bytes contains many frames.
-        $buffer = self::nativeBuffer($ffi, min(strlen($bytes), self::MAX_FRAME_BYTES));
-        $meta = self::$nativeMeta ??= $ffi->new('uint32_t[5]');
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_ws_decode_frame($bytes, strlen($bytes), $meta, $buffer, self::$nativeCapacity);
-        if ($written === -1) {
-            return null;
-        }
-        if ($written === -2) {
-            throw new RuntimeException('WebSocket frame length has the reserved high bit set.');
-        }
-        if ($written === -3) {
-            $length = ((int) $meta[4] << 32) | (int) $meta[3];
-            throw new RuntimeException("WebSocket frame of {$length} bytes exceeds the limit.");
-        }
-        if (! is_int($written) || $written < 0) {
-            return false;
-        }
-
-        return [(bool) $meta[0], (int) $meta[1], $written === 0 ? '' : FFI::string($buffer, $written), (int) $meta[2]];
     }
 
     /**
@@ -440,102 +330,5 @@ class WebSocketClient
             $this->close();
             throw new RuntimeException('WebSocket write failed.');
         }
-    }
-
-    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all five runs (min 1.67x; see the W45 parity test). */
-    public const bool W451_RUST_FFI_DEFAULT = true;
-
-    public const string W451_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w451_websocket_frame_batch(const char *input, size_t len, char *out, size_t cap);
-        C;
-
-    private const array W451_SUMMARY_KEYS = ['total_frames', 'empty_frame_count', 'incomplete_count', 'complete_count', 'final_count', 'masked_count', 'data_count', 'control_count', 'reserved_opcode_count', 'rejected_count'];
-
-    private static ?bool $w451UseRustFfi = null;
-
-    private static FFI|false|null $w451Ffi = null;
-
-    /** Null restores the benchmark default. */
-    public static function useW451RustFfi(?bool $enable = true): void
-    {
-        self::$w451UseRustFfi = $enable;
-    }
-
-    public static function usesW451RustFfi(): bool
-    {
-        return self::$w451UseRustFfi ?? self::W451_RUST_FFI_DEFAULT;
-    }
-
-    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
-    public static function resetW451RustFfi(): void
-    {
-        self::$w451UseRustFfi = null;
-        self::$w451Ffi = null;
-    }
-
-    /**
-     * Summarizes buffers with decodeFramePhp(): incomplete first frames, complete ones (final, masked,
-     * data, control or reserved opcode), and frames it rejects (a reserved length bit or over the limit).
-     * Entries come from strings, integers, or the first non-null frame, bytes array field; other values
-     * (including objects) count as empty entries.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeFrameBatch(array $rows): array
-    {
-        return self::usesW451RustFfi() ? self::summarizeFrameBatchNative($rows) : self::summarizeFrameBatchPhp($rows);
-    }
-
-    /**
-     * Rust summary; falls back to PHP when the library or input frame is unusable.
-     *
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeFrameBatchNative(array $rows): array
-    {
-        $values = IrcChannelList::w451Invoke(self::$w451Ffi, self::W451_FFI_CDEF, 'nntmux_w451_websocket_frame_batch', $rows, ['frame', 'bytes'], \count(self::W451_SUMMARY_KEYS));
-
-        return $values === null ? self::summarizeFrameBatchPhp($rows) : array_combine(self::W451_SUMMARY_KEYS, $values);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $rows
-     * @return array<string, int>
-     */
-    public static function summarizeFrameBatchPhp(array $rows): array
-    {
-        $summary = array_fill_keys(self::W451_SUMMARY_KEYS, 0);
-        foreach (IrcChannelList::w451Entries($rows, ['frame', 'bytes']) as $entry) {
-            $summary['total_frames']++;
-            if ($entry === '') {
-                $summary['empty_frame_count']++;
-
-                continue;
-            }
-            try {
-                $frame = self::decodeFramePhp($entry);
-            } catch (RuntimeException) {
-                $summary['rejected_count']++;
-
-                continue;
-            }
-            if ($frame === null) {
-                $summary['incomplete_count']++;
-
-                continue;
-            }
-            $summary['complete_count']++;
-            $summary['final_count'] += (int) $frame[0];
-            $summary['masked_count'] += (int) ((ord($entry[1]) & 0x80) !== 0);
-            $summary[match ($frame[1]) {
-                self::OP_CONTINUATION, self::OP_TEXT, self::OP_BINARY => 'data_count',
-                self::OP_CLOSE, self::OP_PING, self::OP_PONG => 'control_count',
-                default => 'reserved_opcode_count',
-            }]++;
-        }
-
-        return $summary;
     }
 }

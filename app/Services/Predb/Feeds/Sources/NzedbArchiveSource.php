@@ -7,8 +7,6 @@ namespace App\Services\Predb\Feeds\Sources;
 use App\Services\Predb\Feeds\Contracts\CompleteCatalogueSource;
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Support\PredbSearchDocument;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
@@ -21,40 +19,6 @@ use RuntimeException;
  */
 final class NzedbArchiveSource extends BoundedHttpFeedSource implements CompleteCatalogueSource
 {
-    private const NATIVE_CDEF = <<<'C'
-        ssize_t nntmux_predb_nzedb_parse_csv(const char *csv, size_t csv_len, size_t max_records, char *out_buf, size_t out_cap);
-        C;
-
-    private const NATIVE_ERRORS = [
-        '1' => 'NZEDB_ARCHIVE export exceeds its record limit.',
-        '2' => 'NZEDB_ARCHIVE returned a truncated or non-twelve-field CSV record.',
-        '3' => 'NZEDB_ARCHIVE returned an invalid MySQL OUTFILE field.',
-        '4' => 'NZEDB_ARCHIVE returned a truncated field escape.',
-        '5' => 'NZEDB_ARCHIVE returned an invalid or truncated field escape.',
-        '6' => 'NZEDB_ARCHIVE returned an unterminated CSV field.',
-    ];
-
-    private const NATIVE_REJECTIONS = [
-        '1' => 'empty_title',
-        '2' => 'outer_title_whitespace',
-        '3' => 'overlength_title',
-        '4' => 'control_title',
-    ];
-
-    /**
-     * Wave 45.2 production default for summarizeTitleBatch() is Rust: the paired benchmark in
-     * tests/Unit/RustPredbFeedsNzedbPredatabaseRssSceneArchiveSasW45ParityTest.php measures 3.85-4.27x mean and
-     * 3.24-4.36x p99 on common pages and 6.45-7.45x mean and 4.97-7.12x p99 on uncommon exports. PHP stays the
-     * fallback when the library is unavailable or an accepted title is not ASCII.
-     */
-    public const bool W452_RUST_FFI_DEFAULT = true;
-
-    private static ?bool $w452RustFfiOverride = null;
-
-    private static FFI|false|null $w452RustFfiHandle = null;
-
-    private static FFI|false|null $native = null;
-
     /** @var list<PredbFeedEntry>|null */
     private ?array $entries = null;
 
@@ -71,7 +35,6 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         int $maximumBodyBytes = 1048576,
         private readonly int $maximumCsvBytes = 8388608,
         private readonly int $maximumRecords = 5000,
-        private readonly bool $useNative = true,
     ) {
         if ($maximumBodyBytes < 1 || $maximumBodyBytes > 8388608
             || $maximumCsvBytes < 1 || $maximumCsvBytes > 8388608
@@ -154,14 +117,8 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
     public function parseCsv(string $csv): array
     {
         $this->resetCatalogue();
-        if ($csv === '' || strlen($csv) > $this->maximumCsvBytes || str_contains($csv, "\0")) {
-            throw new RuntimeException('NZEDB_ARCHIVE returned an invalid or oversized CSV export.');
-        }
-        $native = $this->useNative ? $this->nativeRecords($csv) : null;
-        if ($native !== null) {
-            return $this->entriesFromNative($native);
-        }
-        if (! mb_check_encoding($csv, 'UTF-8')) {
+        if ($csv === '' || strlen($csv) > $this->maximumCsvBytes
+            || ! mb_check_encoding($csv, 'UTF-8') || str_contains($csv, "\0")) {
             throw new RuntimeException('NZEDB_ARCHIVE returned an invalid or oversized CSV export.');
         }
         $offset = 0;
@@ -183,7 +140,7 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
                 $offset += 2;
             }
             $title = $fields[0];
-            $reason = self::titleRejection($title);
+            $reason = $this->titleRejection($title);
             if ($reason !== null) {
                 $rejections[$reason] = ($rejections[$reason] ?? 0) + 1;
 
@@ -203,17 +160,6 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
             }
             $entries[] = new PredbFeedEntry(title: $title, source: 'nzedb-pre-dumps', category: $category);
         }
-
-        return $this->finishCatalogue($entries, $rejections, $records);
-    }
-
-    /**
-     * @param  list<PredbFeedEntry>  $entries
-     * @param  array<string, int>  $rejections
-     * @return list<PredbFeedEntry>
-     */
-    private function finishCatalogue(array $entries, array $rejections, int $records): array
-    {
         $this->acceptedCount = count($entries);
         $this->rejections = $rejections;
         if ($rejections !== []) {
@@ -226,71 +172,6 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         }
 
         return $entries;
-    }
-
-    /**
-     * Rust record reader output, or null when PHP must parse the export (library missing, or the
-     * export is not valid UTF-8 so PHP raises its own error).
-     */
-    private function nativeRecords(string $csv): ?string
-    {
-        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_feeds', self::NATIVE_CDEF) ?? false;
-        if ($ffi === false) {
-            return null;
-        }
-        $length = strlen($csv);
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 64, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_predb_nzedb_parse_csv($csv, $length, $this->maximumRecords, $scratch, $capacity);
-        if (is_int($written) && $written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_predb_nzedb_parse_csv($csv, $length, $this->maximumRecords, $scratch, $capacity);
-        }
-
-        return is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
-    }
-
-    /** @return list<PredbFeedEntry> */
-    private function entriesFromNative(string $output): array
-    {
-        if ($output[0] === 'E') {
-            throw new RuntimeException(self::NATIVE_ERRORS[$output[1] ?? ''] ?? 'NZEDB_ARCHIVE returned an invalid or oversized CSV export.');
-        }
-        $lines = explode("\n", $output);
-        $records = (int) substr($lines[0], 1);
-        $entries = [];
-        $identities = [];
-        $rejections = [];
-        for ($index = 1; $index <= $records; $index++) {
-            $line = $lines[$index];
-            if ($line[0] === 'R') {
-                $reason = self::NATIVE_REJECTIONS[$line[1]];
-                $rejections[$reason] = ($rejections[$reason] ?? 0) + 1;
-
-                continue;
-            }
-            $separator = strpos($line, "\x1f", 1);
-            $title = substr($line, 1, $separator - 1);
-            $identity = PredbSearchDocument::exactValue($title);
-            if (isset($identities[$identity])) {
-                $rejections['duplicate_title'] = ($rejections['duplicate_title'] ?? 0) + 1;
-
-                continue;
-            }
-            $identities[$identity] = true;
-            $category = substr($line, $separator + 1);
-            $entries[] = new PredbFeedEntry(title: $title, source: 'nzedb-pre-dumps', category: $category === '' ? null : $category);
-        }
-
-        return $this->finishCatalogue($entries, $rejections, $records);
     }
 
     private function readField(string $csv, int &$offset): ?string
@@ -327,7 +208,7 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         throw new RuntimeException('NZEDB_ARCHIVE returned an unterminated CSV field.');
     }
 
-    private static function titleRejection(?string $title): ?string
+    private function titleRejection(?string $title): ?string
     {
         if ($title === null || trim($title) === '') {
             return 'empty_title';
@@ -350,98 +231,5 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         $this->entries = null;
         $this->acceptedCount = 0;
         $this->rejections = [];
-    }
-
-    /** Force the Wave 45.2 helper onto Rust (true) or PHP (false); null restores W452_RUST_FFI_DEFAULT. */
-    public static function useW452RustFfi(?bool $enable = true): void
-    {
-        self::$w452RustFfiOverride = $enable;
-    }
-
-    public static function usesW452RustFfi(): bool
-    {
-        return self::$w452RustFfiOverride ?? self::W452_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW452RustFfi(): void
-    {
-        self::$w452RustFfiOverride = null;
-        self::$w452RustFfiHandle = null;
-    }
-
-    /**
-     * Summarize literal titles as parseCsv() admits them: non-strings count as empty (a null field), invalid UTF-8 as
-     * invalid_utf8, then titleRejection() and PredbSearchDocument::exactValue() duplicates; the rest are accepted.
-     *
-     * @param  array<array-key, mixed>  $titles
-     * @return array{total: int, accepted: int, empty_title: int, invalid_utf8: int, outer_title_whitespace: int, overlength_title: int, control_title: int, duplicate_title: int}
-     */
-    public static function summarizeTitleBatch(array $titles): array
-    {
-        return (self::usesW452RustFfi() ? self::summarizeTitleBatchNative($titles) : null)
-            ?? self::summarizeTitleBatchPhp($titles);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $titles
-     * @return array{total: int, accepted: int, empty_title: int, invalid_utf8: int, outer_title_whitespace: int, overlength_title: int, control_title: int, duplicate_title: int}
-     */
-    public static function summarizeTitleBatchPhp(array $titles): array
-    {
-        $summary = ['total' => \count($titles), 'accepted' => 0, 'empty_title' => 0, 'invalid_utf8' => 0, 'outer_title_whitespace' => 0,
-            'overlength_title' => 0, 'control_title' => 0, 'duplicate_title' => 0];
-        $identities = [];
-        foreach ($titles as $title) {
-            if (! \is_string($title)) {
-                $reason = 'empty_title';
-            } elseif (! mb_check_encoding($title, 'UTF-8')) {
-                $reason = 'invalid_utf8';
-            } else {
-                $reason = self::titleRejection($title);
-                if ($reason === null) {
-                    $identity = PredbSearchDocument::exactValue($title);
-                    if (! isset($identities[$identity])) {
-                        $identities[$identity] = true;
-                        $summary['accepted']++;
-
-                        continue;
-                    }
-                    $reason = 'duplicate_title';
-                }
-            }
-            $summary[$reason]++;
-        }
-
-        return $summary;
-    }
-
-    /**
-     * Null when the library is missing or an accepted title is not ASCII (Unicode case folding stays in PHP).
-     *
-     * @param  array<array-key, mixed>  $titles
-     * @return array{total: int, accepted: int, empty_title: int, invalid_utf8: int, outer_title_whitespace: int, overlength_title: int, control_title: int, duplicate_title: int}|null
-     */
-    public static function summarizeTitleBatchNative(array $titles): ?array
-    {
-        $packed = PredatabaseSource::packW452Items($titles);
-        $values = $packed === null ? null : PredatabaseSource::callW452Native(self::w452RustFfi(), 0 | $packed[2], 0, $packed[0], $packed[1], 8);
-        if ($values === null) {
-            return null;
-        }
-        [$total, $accepted, $empty, $invalid, $outer, $overlength, $control, $duplicate] = $values;
-        if ($total !== \count($titles) || min($values) < 0
-            || $accepted + $empty + $invalid + $outer + $overlength + $control + $duplicate !== $total || ($duplicate > 0 && $accepted === 0)) {
-            return null;
-        }
-
-        return ['total' => $total, 'accepted' => $accepted, 'empty_title' => $empty, 'invalid_utf8' => $invalid, 'outer_title_whitespace' => $outer,
-            'overlength_title' => $overlength, 'control_title' => $control, 'duplicate_title' => $duplicate];
-    }
-
-    private static function w452RustFfi(): ?FFI
-    {
-        self::$w452RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredatabaseSource::W452_FFI_DOMAIN, PredatabaseSource::W452_FFI_CDEF) ?? false;
-
-        return self::$w452RustFfiHandle === false ? null : self::$w452RustFfiHandle;
     }
 }

@@ -4,85 +4,13 @@ declare(strict_types=1);
 
 namespace App\Support;
 
-use FFI;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Process;
-use Throwable;
 
 class UpdatePerformanceHelper
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_maintenance_verification(const char *input, size_t len, uint32_t mode, char *out, size_t cap);
-        C;
-
-    // Single-call candidates remain opt-in until both performance gates pass.
-    private static bool $useRustFfi = false;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) !== null;
-    }
-
-    private static function transformNative(int $mode, string $input): string|false|null
-    {
-        if (! self::$useRustFfi || strlen($input) > 1_048_576) {
-            return null;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            $cap = 0;
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) * 4 + 256), $cap);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_maintenance_verification($input, strlen($input), $mode, $scratch, $cap);
-            if ($written === -3) {
-                return false;
-            }
-            if (! is_int($written) || $written < 0 || $written > $cap) {
-                return null;
-            }
-
-            return $written === 0 ? '' : FFI::string($scratch, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @return list<string>|null */
-    private static function decodeFrames(string $output): ?array
-    {
-        $values = [];
-        $offset = 0;
-        $size = strlen($output);
-        while ($offset < $size) {
-            if ($size - $offset < 4) {
-                return null;
-            }
-            $header = unpack('Vlength', substr($output, $offset, 4));
-            $length = $header['length'];
-            $offset += 4;
-            if ($length > $size - $offset) {
-                return null;
-            }
-            $values[] = substr($output, $offset, $length);
-            $offset += $length;
-        }
-
-        return $values;
-    }
-
     /**
      * Check if a file has changed since last update
      */
@@ -195,7 +123,7 @@ class UpdatePerformanceHelper
 
         // Check system memory usage
         $memInfo = self::getSystemMemoryInfo();
-        if ($memInfo && $memInfo['usage_percent'] > 80) {
+        if ($memInfo && $memInfo['usage_percent'] > 80) { // @phpstan-ignore offsetAccess.notFound
             $recommendations[] = sprintf(
                 'High system memory usage: %.1f%% (%.1fGB of %.1fGB used)',
                 $memInfo['usage_percent'],
@@ -237,9 +165,9 @@ class UpdatePerformanceHelper
     /**
      * Get system memory information
      *
-     * @return array{total: int|float, available: int|float, used: int|float, usage_percent: float|int}|null
+     * @return list<string>
      */
-    private static function getSystemMemoryInfo(): ?array
+    private static function getSystemMemoryInfo(): ?array // @phpstan-ignore return.unusedType
     {
         if (PHP_OS_FAMILY === 'Windows') {
             return null; // Windows memory check would require different approach
@@ -250,23 +178,11 @@ class UpdatePerformanceHelper
             return null;
         }
 
-        return self::parseMemoryInfo($memInfo) ?: null;
-    }
-
-    /** @return array{total: int|float, available: int|float, used: int|float, usage_percent: float|int}|false */
-    public static function parseMemoryInfo(string $memInfo): array|false
-    {
-        return (self::$useRustFfi ? self::parseMemoryInfoNative($memInfo) : null) ?? self::parseMemoryInfoPhp($memInfo);
-    }
-
-    /** @return array{total: int|float, available: int|float, used: int|float, usage_percent: float|int}|false */
-    public static function parseMemoryInfoPhp(string $memInfo): array|false
-    {
         preg_match('/MemTotal:\s+(\d+)/', $memInfo, $totalMatch);
         preg_match('/MemAvailable:\s+(\d+)/', $memInfo, $availableMatch);
 
         if (! isset($totalMatch[1]) || ! isset($availableMatch[1])) {
-            return false;
+            return null;
         }
 
         $total = (int) $totalMatch[1] * 1024; // Convert from KB to bytes
@@ -283,13 +199,10 @@ class UpdatePerformanceHelper
 
     /**
      * Parse memory limit string to bytes
+     *
+     * @return array{total: int, available: int, used: int, usage_percent: (float|int)}
      */
-    public static function parseMemoryLimit(string $limit): int
-    {
-        return (self::$useRustFfi ? self::parseMemoryLimitNative($limit) : null) ?? self::parseMemoryLimitPhp($limit);
-    }
-
-    public static function parseMemoryLimitPhp(string $limit): int
+    private static function parseMemoryLimit(string $limit): int
     {
         $limit = trim($limit);
         if ($limit === '-1') {
@@ -325,33 +238,5 @@ class UpdatePerformanceHelper
             'disk_free' => disk_free_space(base_path()),
             'load_average' => function_exists('sys_getloadavg') ? sys_getloadavg() : null,
         ];
-    }
-
-    /** @return array{total: int|float, available: int|float, used: int|float, usage_percent: float|int}|false|null */
-    public static function parseMemoryInfoNative(string $memInfo): array|false|null
-    {
-        if ((int) ini_get('pcre.backtrack_limit') < strlen($memInfo) + 16) {
-            return null;
-        }
-        $output = self::transformNative(10, $memInfo);
-        if (! is_string($output)) {
-            return $output;
-        }
-        $parts = self::decodeFrames($output);
-        if ($parts === null || count($parts) !== 2) {
-            return null;
-        }
-        $total = (int) $parts[0] * 1024;
-        $available = (int) $parts[1] * 1024;
-        $used = $total - $available;
-
-        return ['total' => $total, 'available' => $available, 'used' => $used, 'usage_percent' => ($used / $total) * 100];
-    }
-
-    public static function parseMemoryLimitNative(string $limit): ?int
-    {
-        $output = self::transformNative(11, $limit);
-
-        return is_string($output) ? (int) $output : null;
     }
 }

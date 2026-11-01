@@ -5,17 +5,12 @@ declare(strict_types=1);
 namespace App\Http\Requests;
 
 use App\Services\Releases\ReleaseBrowseService;
-use App\Support\RustPipelineLibrary;
 use App\Support\SizeUnit;
 use Carbon\CarbonImmutable;
 use Illuminate\Foundation\Http\FormRequest;
-use Throwable;
 
 class SearchReleaseListRequest extends FormRequest
 {
-    /** Rust helpers are opt-in; none beat PHP by 1.5x in the paired benchmark. */
-    private const array RANGE_FIELDS = ['minsize' => ['size', 'min'], 'maxsize' => ['size', 'max'], 'minfiles' => ['totalpart', 'min'], 'maxfiles' => ['totalpart', 'max'], 'mingrabs' => ['grabs', 'min'], 'maxgrabs' => ['grabs', 'max'], 'mincomments' => ['comments', 'min'], 'maxcomments' => ['comments', 'max']];
-
     public function authorize(): bool
     {
         return true;
@@ -23,7 +18,12 @@ class SearchReleaseListRequest extends FormRequest
 
     protected function prepareForValidation(): void
     {
-        $this->merge(self::trimmedInputs($this->all(), $this->exists('poster')));
+        $preserveExactPoster = $this->exists('poster');
+        foreach ($this->all() as $field => $value) {
+            if ($field !== 'poster' && ! ($field === 'searchadvposter' && $preserveExactPoster) && is_string($value)) {
+                $this->merge([$field => trim($value) === '' ? null : trim($value)]);
+            }
+        }
         foreach (['search' => 'searchadvr', 't' => 'searchadvcat', 'group' => 'searchadvgroups', 'minage' => 'searchadvdaysnew', 'maxage' => 'searchadvdaysold'] as $field => $alias) {
             if (! $this->has($field) && $this->has($alias)) {
                 $value = $this->input($alias);
@@ -101,223 +101,27 @@ class SearchReleaseListRequest extends FormRequest
     }
 
     /** @return list<int> */
-    public function categoryIds(bool $useRustFfi = false): array
+    public function categoryIds(): array
     {
-        return self::categoryIdsFrom($this->validated('t'), $useRustFfi);
-    }
+        $value = $this->validated('t');
 
-    /** @return list<int> */
-    public static function categoryIdsFrom(mixed $value, bool $useRustFfi = false): array
-    {
-        return ($useRustFfi ? self::categoryIdsNative($value) : null) ?? self::categoryIdsPhp($value);
-    }
-
-    /** @return list<int> */
-    public static function categoryIdsPhp(mixed $value): array
-    {
         return is_string($value) && $value !== '' && $value !== '0' && $value !== '-1'
             ? array_values(array_unique(array_map('intval', explode(',', $value))))
             : [-1];
     }
 
-    /** @return list<int>|null */
-    public static function categoryIdsNative(mixed $value): ?array
-    {
-        if (! is_string($value)) {
-            return null;
-        }
-        static $ffi, $buffer, $capacity = 0;
-        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_search_list_category_ids(const char *input, size_t len, int64_t *out, size_t cap);') ?? false;
-        if ($ffi === false) {
-            return null;
-        }
-        try {
-            $needed = substr_count($value, ',') + 1;
-            if ($capacity < $needed) {
-                $capacity = max(64, $needed * 2);
-                $buffer = $ffi->new("int64_t[{$capacity}]");
-            }
-            $count = $ffi->nntmux_search_list_category_ids($value, strlen($value), $buffer, $capacity);
-            if (! is_int($count) || $count < 1 || $count > $capacity) {
-                return null;
-            }
-            $ids = [];
-            for ($i = 0; $i < $count; $i++) {
-                $ids[] = (int) $buffer[$i];
-            }
-
-            return $ids;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Request strings trimmed to null when blank; `poster` (and `searchadvposter` when
-     * `poster` is present) keep their exact value.
-     *
-     * @param  array<array-key, mixed>  $input
-     * @return array<array-key, string|null>
-     */
-    public static function trimmedInputs(array $input, bool $preserveExactPoster, bool $useRustFfi = false): array
-    {
-        return ($useRustFfi ? self::trimmedInputsNative($input, $preserveExactPoster) : null) ?? self::trimmedInputsPhp($input, $preserveExactPoster);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $input
-     * @return array<array-key, string|null>
-     */
-    public static function trimmedInputsPhp(array $input, bool $preserveExactPoster): array
-    {
-        $trimmed = [];
-        foreach ($input as $field => $value) {
-            if ($field !== 'poster' && ! ($field === 'searchadvposter' && $preserveExactPoster) && is_string($value)) {
-                $trimmed[$field] = trim($value) === '' ? null : trim($value);
-            }
-        }
-
-        return $trimmed;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $input
-     * @return array<array-key, string|null>|null
-     */
-    public static function trimmedInputsNative(array $input, bool $preserveExactPoster): ?array
-    {
-        $fields = [];
-        foreach ($input as $field => $value) {
-            if ($field !== 'poster' && ! ($field === 'searchadvposter' && $preserveExactPoster) && is_string($value)) {
-                $fields[$field] = $value;
-            }
-        }
-        $count = count($fields);
-        if ($count === 0) {
-            return [];
-        }
-        static $ffi, $lengths, $spans, $capacity = 0;
-        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'int32_t nntmux_search_list_trim_spans(const char *input, size_t len, const int64_t *lens, size_t count, int64_t *out);') ?? false;
-        if ($ffi === false) {
-            return null;
-        }
-        try {
-            if ($capacity < $count) {
-                $capacity = max(64, $count * 2);
-                $lengths = $ffi->new("int64_t[{$capacity}]");
-                $spans = $ffi->new('int64_t['.($capacity * 2).']');
-            }
-            $i = 0;
-            foreach ($fields as $value) {
-                $lengths[$i++] = strlen($value);
-            }
-            $joined = implode('', $fields);
-            if ($ffi->nntmux_search_list_trim_spans($joined, strlen($joined), $lengths, $count, $spans) !== 0) {
-                return null;
-            }
-            $trimmed = [];
-            $i = 0;
-            foreach ($fields as $field => $value) {
-                $length = (int) $spans[2 * $i + 1];
-                $trimmed[$field] = $length < 0 ? null : substr($joined, (int) $spans[2 * $i], $length);
-                $i++;
-            }
-
-            return $trimmed;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * Size (MB to bytes), file, grab and comment bounds keyed by index column.
-     *
-     * @param  array<string, mixed>  $values  validated `min*`/`max*` inputs
-     * @return array<string, array<string, int>>
-     */
-    public static function numericRanges(array $values, bool $useRustFfi = false): array
-    {
-        return ($useRustFfi ? self::numericRangesNative($values) : null) ?? self::numericRangesPhp($values);
-    }
-
-    /**
-     * @param  array<string, mixed>  $values
-     * @return array<string, array<string, int>>
-     */
-    public static function numericRangesPhp(array $values): array
+    /** @return array<string, array<string, int>> */
+    public function ranges(): array
     {
         $ranges = [];
         foreach (['size' => 'size', 'files' => 'totalpart', 'grabs' => 'grabs', 'comments' => 'comments'] as $field => $column) {
             foreach (['min', 'max'] as $bound) {
-                $value = $values[$bound.$field] ?? null;
+                $value = $this->validated($bound.$field);
                 if ($value !== null && $value !== '') {
                     $ranges[$column][$bound] = $field === 'size' ? SizeUnit::toBytes($value, 'MB') : (int) $value;
                 }
             }
         }
-
-        return $ranges;
-    }
-
-    /**
-     * Native conversion of plain decimal/integer strings; null defers to PHP.
-     *
-     * @param  array<string, mixed>  $values
-     * @return array<string, array<string, int>>|null
-     */
-    public static function numericRangesNative(array $values): ?array
-    {
-        $packed = '';
-        $flags = 0;
-        $bit = 0;
-        foreach (self::RANGE_FIELDS as $key => $_) {
-            $value = $values[$key] ?? null;
-            if ($value !== null && $value !== '') {
-                if (! is_string($value) || str_contains($value, "\0")) {
-                    return null;
-                }
-                $flags |= 1 << $bit;
-                $packed .= $value;
-            }
-            $packed .= "\0";
-            $bit++;
-        }
-        if ($flags === 0) {
-            return [];
-        }
-        static $ffi, $out;
-        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'int32_t nntmux_search_list_ranges(const char *input, size_t len, uint32_t flags, int64_t *out);') ?? false;
-        if ($ffi === false) {
-            return null;
-        }
-        try {
-            $out ??= $ffi->new('int64_t[8]');
-            if ($ffi->nntmux_search_list_ranges($packed, strlen($packed), $flags, $out) !== 0) {
-                return null;
-            }
-            $ranges = [];
-            $bit = 0;
-            foreach (self::RANGE_FIELDS as [$column, $bound]) {
-                if ($flags & (1 << $bit)) {
-                    $ranges[$column][$bound] = (int) $out[$bit];
-                }
-                $bit++;
-            }
-
-            return $ranges;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @return array<string, array<string, int>> */
-    public function ranges(bool $useRustFfi = false): array
-    {
-        $values = [];
-        foreach (array_keys(self::RANGE_FIELDS) as $key) {
-            $values[$key] = $this->validated($key);
-        }
-        $ranges = self::numericRanges($values, $useRustFfi);
         foreach (['from' => 'min', 'to' => 'max'] as $field => $bound) {
             $value = $this->validated('added_'.$field);
             if (is_string($value) && $value !== '') {

@@ -9,30 +9,17 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Throwable;
 
 /**
  * Class RSS -- contains specific functions for RSS.
  */
 class RSS extends ApiController
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_rss_filter_fragments(int64_t videos_id, int64_t anidb_id, int64_t air_date, int32_t cat_search_empty, int64_t limit, int64_t offset, int64_t tv_root, int64_t tv_other, char *out, size_t out_cap);
-        C;
-
-    private static FFI|false|null $rssFfi = null;
-
-    private static ?bool $useRustFfi = null;
-
-    private static bool $adoptFilterFragmentsFfi = false;
-
     /**
      * @throws \Exception
      */
@@ -50,6 +37,7 @@ class RSS extends ApiController
     {
         $catSearch = $cartSearch = '';
         $isCartFeed = false;
+        $catLimit = 'AND r.categories_id BETWEEN '.Category::TV_ROOT.' AND '.Category::TV_OTHER;
         if (\count($cat)) {
             if ((int) $cat[0] === -2) {
                 $isCartFeed = true;
@@ -61,7 +49,6 @@ class RSS extends ApiController
                 $catSearch = Category::getCategorySearch($cat);
             }
         }
-        [$videosFilter, $aniDbFilter, $airDateFilter, $limitClause] = self::filterFragments($videosId, $aniDbID, $airDate, $catSearch === '', $limit, $offset);
         $sql =
             sprintf(
                 "SELECT r.searchname, r.guid, r.postdate, r.categories_id, r.size, r.totalpart, r.fromname, r.passwordstatus, r.grabs, r.comments, r.adddate, r.videos_id, r.tv_episodes_id,
@@ -93,10 +80,10 @@ class RSS extends ApiController
                 $cartSearch,
                 $this->releaseBrowseService->showPasswordsForRss(),
                 $catSearch,
-                $videosFilter,
-                $aniDbFilter,
-                $airDateFilter,
-                $limitClause
+                ($videosId > 0 ? sprintf('AND r.videos_id = %d %s', $videosId, ($catSearch === '' ? $catLimit : '')) : ''),
+                ($aniDbID > 0 ? sprintf('AND r.anidbid = %d %s', $aniDbID, ($catSearch === '' ? $catLimit : '')) : ''),
+                ($airDate > -1 ? sprintf('AND tve.firstaired >= DATE_SUB(CURDATE(), INTERVAL %d DAY)', $airDate) : ''),
+                $limit === -1 ? '' : ' LIMIT '.$limit.' OFFSET '.$offset
             );
 
         if ($isCartFeed) {
@@ -116,7 +103,7 @@ class RSS extends ApiController
                 Cache::put($idxCacheKey, $fromIndex, $expiresAt);
 
                 return $fromIndex;
-            } catch (Throwable $e) {
+            } catch (\Throwable $e) {
                 if (config('app.debug')) {
                     Log::debug('RSS: search index path failed, falling back to SQL', [
                         'message' => $e->getMessage(),
@@ -402,104 +389,6 @@ class RSS extends ApiController
 
             return Release::fromQuery($sql);
         });
-    }
-
-    public static function setUseRustFfi(?bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::$adoptFilterFragmentsFfi;
-    }
-
-    public static function rssFfi(): ?FFI
-    {
-        return self::resolveRssFfi();
-    }
-
-    /**
-     * Video, AniDB, air-date and LIMIT/OFFSET fragments for {@see getRss()}.
-     *
-     * @return array{string, string, string, string}
-     */
-    public static function filterFragments(mixed $videosId, mixed $aniDbID, int $airDate, bool $catSearchEmpty, int $limit, int $offset): array
-    {
-        if (self::$useRustFfi ?? self::$adoptFilterFragmentsFfi) {
-            $supported = false;
-            $native = self::filterFragmentsNative($videosId, $aniDbID, $airDate, $catSearchEmpty, $limit, $offset, $supported);
-            if ($supported && $native !== null) {
-                return $native;
-            }
-        }
-
-        return self::filterFragmentsPhp($videosId, $aniDbID, $airDate, $catSearchEmpty, $limit, $offset);
-    }
-
-    /**
-     * Integer video and AniDB ids only; other types defer to {@see filterFragmentsPhp()}.
-     *
-     * @param-out bool $supported
-     *
-     * @return array{string, string, string, string}|null
-     */
-    public static function filterFragmentsNative(mixed $videosId, mixed $aniDbID, int $airDate, bool $catSearchEmpty, int $limit, int $offset, bool &$supported = false): ?array
-    {
-        $supported = false;
-        if (self::$useRustFfi === false || ! \is_int($videosId) || ! \is_int($aniDbID)) {
-            return null;
-        }
-        $ffi = self::resolveRssFfi();
-        if ($ffi === null) {
-            return null;
-        }
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 512, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_rss_filter_fragments($videosId, $aniDbID, $airDate, $catSearchEmpty ? 1 : 0, $limit, $offset, Category::TV_ROOT, Category::TV_OTHER, $scratch, $capacity);
-        } catch (Throwable) {
-            return null;
-        }
-        if (! \is_int($written) || $written < 3) {
-            return null;
-        }
-        $parts = explode("\0", FFI::string($scratch, $written));
-        if (\count($parts) !== 4) {
-            return null;
-        }
-        $supported = true;
-
-        return [$parts[0], $parts[1], $parts[2], $parts[3]];
-    }
-
-    /**
-     * @return array{string, string, string, string}
-     */
-    public static function filterFragmentsPhp(mixed $videosId, mixed $aniDbID, int $airDate, bool $catSearchEmpty, int $limit, int $offset): array
-    {
-        $catLimit = 'AND r.categories_id BETWEEN '.Category::TV_ROOT.' AND '.Category::TV_OTHER;
-
-        return [
-            ($videosId > 0 ? sprintf('AND r.videos_id = %d %s', $videosId, ($catSearchEmpty ? $catLimit : '')) : ''),
-            ($aniDbID > 0 ? sprintf('AND r.anidbid = %d %s', $aniDbID, ($catSearchEmpty ? $catLimit : '')) : ''),
-            ($airDate > -1 ? sprintf('AND tve.firstaired >= DATE_SUB(CURDATE(), INTERVAL %d DAY)', $airDate) : ''),
-            $limit === -1 ? '' : ' LIMIT '.$limit.' OFFSET '.$offset,
-        ];
-    }
-
-    private static function resolveRssFfi(): ?FFI
-    {
-        if (self::$rssFfi === null) {
-            self::$rssFfi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$rssFfi === false ? null : self::$rssFfi;
     }
 
     private function buildVersionedCacheKey(string $sql): string

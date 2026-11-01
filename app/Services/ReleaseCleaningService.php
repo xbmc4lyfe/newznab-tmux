@@ -8,8 +8,6 @@ use App\Models\Predb;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\NzbSplitUnwrapper;
 use App\Support\PredbSearchDocument;
-use App\Support\RustPipelineLibrary;
-use FFI\CData;
 
 /**
  * Cleans names for releases/imports/namefixer.
@@ -204,23 +202,6 @@ class ReleaseCleaningService
      */
     public function teevee(): array
     {
-        $supported = false;
-        $ffiClean = RustPipelineLibrary::releaseGenericClean($this->subject, 3, supported: $supported);
-        if ($supported && $ffiClean !== null) {
-            return [
-                'cleansubject' => $ffiClean,
-                'properlynamed' => false,
-            ];
-        }
-
-        return $this->teeveePhp();
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    public function teeveePhp(): array
-    {
         // [140022]-[04] - [01/40] - "140022-04.nfo" yEnc
         if (preg_match('/\[\d+\]-\[.+\] - \[\d+\/\d+\] - "\d+\-.+" yEnc/', $this->subject)) {
             return [
@@ -230,8 +211,8 @@ class ReleaseCleaningService
             ];
         }
 
-        return $this->counterFileSubjectNamePhp() ?? [
-            'cleansubject' => $this->releaseCleanerHelperPhp($this->subject),
+        return $this->counterFileSubjectName() ?? [
+            'cleansubject' => $this->releaseCleanerHelper($this->subject),
             'properlynamed' => false,
         ];
     }
@@ -240,56 +221,6 @@ class ReleaseCleaningService
      * @return array<string, mixed>|string
      */
     public function generic_town()
-    {
-        // Paired caller benchmarks failed the 1.5x mean/p99 gate; retain PCRE.
-        // The Rust candidate remains available via genericTownNative() for parity.
-        return $this->genericTownPhp();
-    }
-
-    /**
-     * Rust candidate; null means unavailable/declined, not the unmatched array result.
-     *
-     * @return array{cleansubject: string, properlynamed: false}|string|null
-     */
-    public function genericTownNative(): array|string|null
-    {
-        $extensions = CollectionsCleaningService::REGEX_FILE_EXTENSIONS;
-        if ($this->e0 !== $extensions
-            || $this->e1 !== $extensions.CollectionsCleaningService::REGEX_END
-            || $this->e2 !== $extensions.CollectionsCleaningService::REGEX_SUBJECT_SIZE.CollectionsCleaningService::REGEX_END
-            || ini_get('pcre.backtrack_limit') !== '1000000'
-            || ini_get('pcre.recursion_limit') !== '100000'
-        ) {
-            return null;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('release_town', 'ssize_t nntmux_release_generic_town(const char *subject, size_t subject_len, char *out_buf, size_t out_cap);');
-        if ($ffi === null) {
-            return null;
-        }
-        $capacity = 0;
-        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($this->subject)), $capacity);
-        if ($buffer === null) {
-            return null;
-        }
-        // The output is a capture of the input, so it cannot outgrow this buffer.
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_release_generic_town($this->subject, strlen($this->subject), $buffer, $capacity);
-        if ($written === -3) {
-            return ['cleansubject' => $this->releaseCleanerHelper($this->subject), 'properlynamed' => false];
-        }
-        if (! is_int($written) || $written < 0 || $written > $capacity) {
-            return null;
-        }
-
-        return $written === 0 ? '' : \FFI::string($buffer, $written);
-    }
-
-    /**
-     * Original ordered PCRE implementation, also used when the candidate declines.
-     *
-     * @return array<string, mixed>|string
-     */
-    public function genericTownPhp()
     {
         // <TOWN><www.town.ag > <download all our files with>>> www.ssl-news.info <<< > [05/87] - "Deep.Black.Ass.5.XXX.1080p.WEBRip.x264-TBP.part03.rar" - 7,87 GB yEnc
         // <TOWN><www.town.ag > <partner of www.ssl-news.info > [02/24] - "Dragons.Den.UK.S11E02.HDTV.x264-ANGELiC.nfo" - 288,96 MB yEnc
@@ -492,24 +423,7 @@ class ReleaseCleaningService
      */
     public function generic(): array
     {
-        $supported = false;
-        $ffiClean = RustPipelineLibrary::releaseGenericClean($this->subject, 2, supported: $supported);
-        if ($supported && $ffiClean !== null) {
-            return [
-                'cleansubject' => $ffiClean,
-                'properlynamed' => false,
-            ];
-        }
-
-        return $this->genericPhp();
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    public function genericPhp(): array
-    {
-        $fromFile = $this->counterFileSubjectNamePhp();
+        $fromFile = $this->counterFileSubjectName();
         if ($fromFile !== null) {
             return $fromFile;
         }
@@ -528,7 +442,7 @@ class ReleaseCleaningService
         }
 
         return [
-            'cleansubject' => $this->releaseCleanerHelperPhp($this->subject),
+            'cleansubject' => $this->releaseCleanerHelper($this->subject),
             'properlynamed' => false,
         ];
     }
@@ -538,20 +452,9 @@ class ReleaseCleaningService
      */
     public function releaseNameFromFile(string $file): ?string
     {
-        $supported = false;
-        $ffiResult = RustPipelineLibrary::releaseNameFromFile($file, supported: $supported);
-        if ($supported) {
-            return $ffiResult;
-        }
-
-        return $this->releaseNameFromFilePhp($file);
-    }
-
-    public function releaseNameFromFilePhp(string $file): ?string
-    {
         $fileNameCleaner = new FileNameCleaner;
         // Not fixerCleaner(): it drops every non-ASCII character, and these names may be accented.
-        $name = $fileNameCleaner->stripKnownFileSuffixesPhp($fileNameCleaner->extractFilenameFromPath($file), true);
+        $name = $fileNameCleaner->stripFileSuffixes($fileNameCleaner->extractFilenameFromPath($file));
         $name = preg_replace('/[.\-_](sample|proof|thumbs?)$/i', '', $name) ?? $name;
         $name = trim(preg_replace('/\s\s+/u', ' ', $name) ?? $name, " .-_\t");
 
@@ -560,7 +463,7 @@ class ReleaseCleaningService
         // year, quality or episode tag makes the name plausible.
         $withoutDottedSuffix = preg_replace('/\.([^.\-]+)$/', ' $1', $name) ?? $name;
 
-        return $fileNameCleaner->isPlausibleReleaseTitlePhp($withoutDottedSuffix) ? $name : null;
+        return $fileNameCleaner->isPlausibleReleaseTitle($withoutDottedSuffix) ? $name : null;
     }
 
     /**
@@ -570,21 +473,7 @@ class ReleaseCleaningService
      *
      * @return array{cleansubject: string, properlynamed: false}|null
      */
-    public function counterFileSubjectName(): ?array
-    {
-        $supported = false;
-        $fromFile = RustPipelineLibrary::releaseGenericClean($this->subject, 1, supported: $supported);
-        if ($supported) {
-            return $fromFile === null ? null : ['cleansubject' => $fromFile, 'properlynamed' => false];
-        }
-
-        return $this->counterFileSubjectNamePhp();
-    }
-
-    /**
-     * @return array{cleansubject: string, properlynamed: false}|null
-     */
-    public function counterFileSubjectNamePhp(): ?array
+    private function counterFileSubjectName(): ?array
     {
         // `lRap` is `yEnc` in ROT13: the whole subject is scrambled, so its file name is too.
         if (preg_match(self::COUNTER_FILE_SUBJECT, $this->subject, $hit) !== 1) {
@@ -594,23 +483,12 @@ class ReleaseCleaningService
         if (preg_match('/\blRap\b/i', substr($this->subject, \strlen($hit[0]))) === 1) {
             return null;
         }
-        $fromFile = $this->releaseNameFromFilePhp($hit['file']);
+        $fromFile = $this->releaseNameFromFile($hit['file']);
 
         return $fromFile === null ? null : ['cleansubject' => $fromFile, 'properlynamed' => false];
     }
 
     public function releaseCleanerHelper(string $subject): string
-    {
-        $supported = false;
-        $ffiResult = RustPipelineLibrary::releaseGenericClean($subject, 0, supported: $supported);
-        if ($supported && $ffiResult !== null) {
-            return $ffiResult;
-        }
-
-        return $this->releaseCleanerHelperPhp($subject);
-    }
-
-    public function releaseCleanerHelperPhp(string $subject): string
     {
         $cleanerName = preg_replace('/(\- )?yEnc$/', '', $subject);
 
@@ -624,12 +502,7 @@ class ReleaseCleaningService
      */
     public function fixerCleaner(string $name)
     {
-        return RustPipelineLibrary::releaseFixerClean($name) ?? $this->fixerCleanerPhp($name);
-    }
-
-    public function fixerCleanerPhp(string $name): string
-    {
-        $cleanerName = $this->nzbSplitUnwrapper->unwrapPhp($name) ?? $name;
+        $cleanerName = $this->nzbSplitUnwrapper->unwrap($name) ?? $name;
 
         // Remove sample/proof/thumbs markers from the end
         $cleanerName = preg_replace('/[.\-_](sample|proof|thumbs?)$/i', '', $cleanerName);
@@ -651,250 +524,6 @@ class ReleaseCleaningService
         $cleanerName = preg_replace('/\s\s+/', ' ', $cleanerName);
 
         // Remove invalid characters
-        return trim(mb_convert_encoding((string) preg_replace('/[^(\x20-\x7F)]*/', '', $cleanerName), 'UTF-8', mb_list_encodings()));
-    }
-
-    /**
-     * PHP stays the default for summarizeCleanerPassTelemetry(): the paired benchmark in
-     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php does not clear 1.5x.
-     */
-    public const bool W401_RUST_FFI_DEFAULT = false;
-
-    private const array W401_TELEMETRY_KEYS = ['pairs', 'invalid_pairs', 'changed', 'unchanged', 'empty_output', 'bytes_stripped'];
-
-    private static ?bool $w401UseRustFfi = null;
-
-    private static \FFI|false|null $w401Ffi = null;
-
-    /**
-     * Summarizes a subject-cleaning pass from `['before' => subject, 'after' => cleaned]` pairs: byte-identical results are
-     * unchanged, others changed; a result that trim()s to '' is empty output, and every pair adds the bytes the cleaner
-     * removed (never negative). Pairs that are not arrays or lack a string `before`/`after` are invalid.
-     *
-     * @param  array<array-key, mixed>  $beforeAfterPairs
-     * @return array<string, int>
-     */
-    public static function summarizeCleanerPassTelemetry(array $beforeAfterPairs): array
-    {
-        return (self::usesW401RustFfi() ? self::summarizeCleanerPassTelemetryNative($beforeAfterPairs) : null)
-            ?? self::summarizeCleanerPassTelemetryPhp($beforeAfterPairs);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $pairs
-     * @return array<string, int>
-     */
-    private static function summarizeCleanerPassTelemetryPhp(array $pairs): array
-    {
-        $summary = array_fill_keys(self::W401_TELEMETRY_KEYS, 0);
-        $summary['pairs'] = count($pairs);
-        foreach ($pairs as $pair) {
-            $before = is_array($pair) ? ($pair['before'] ?? null) : null;
-            $after = is_array($pair) ? ($pair['after'] ?? null) : null;
-            if (! is_string($before) || ! is_string($after)) {
-                $summary['invalid_pairs']++;
-
-                continue;
-            }
-            $summary[$before === $after ? 'unchanged' : 'changed']++;
-            if (trim($after) === '') {
-                $summary['empty_output']++;
-            }
-            $summary['bytes_stripped'] += max(0, strlen($before) - strlen($after));
-        }
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $pairs
-     * @return array<string, int>|null
-     */
-    private static function summarizeCleanerPassTelemetryNative(array $pairs): ?array
-    {
-        $words = [count($pairs)];
-        $blob = [];
-        foreach ($pairs as $pair) {
-            if (is_array($pair)) {
-                CollectionCleanupService::w401PackRow($words, $blob, [$pair['before'] ?? null, $pair['after'] ?? null]);
-            } else {
-                $words[] = 0;
-            }
-        }
-        $values = CollectionCleanupService::w401Invoke(self::$w401Ffi, 2, $words, $blob);
-
-        return $values !== null && count($values) === count(self::W401_TELEMETRY_KEYS) ? array_combine(self::W401_TELEMETRY_KEYS, $values) : null;
-    }
-
-    public static function useW401RustFfi(?bool $enabled): void
-    {
-        self::$w401UseRustFfi = $enabled;
-    }
-
-    public static function usesW401RustFfi(): bool
-    {
-        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW401RustFfi(): void
-    {
-        self::$w401UseRustFfi = null;
-        self::$w401Ffi = null;
-    }
-
-    /**
-     * Enabled: the paired benchmark in the W55 parity test measures 6.547x common mean, 5.694x common
-     * p99, 7.237x uncommon mean and 5.248x uncommon p99 (per-metric minimum of four runs), above
-     * the 1.5x rule.
-     */
-    private const bool W55_RUST_FFI_DEFAULT = true;
-
-    private const string W55_FFI_CDEF = 'ssize_t nntmux_w551_release_cleaning_mask_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);';
-
-    public static function usesW55RustFfi(): bool
-    {
-        $enabled = self::w55RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 55 batch routed to Rust or PHP, then restores the routing. */
-    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w55RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w55RustFfiState('set', $previous);
-        }
-    }
-
-    public const int W55_CLEAN_COUNTER_FILE = 1;
-
-    public const int W55_CLEAN_SCRAMBLED = 2;
-
-    public const int W55_CLEAN_YENC_TAIL = 4;
-
-    public const int W55_CLEAN_MULTI_SPACE = 8;
-
-    public const int W55_CLEAN_NON_PRINTABLE = 16;
-
-    public const int W55_CLEAN_NAME_PREFIX = 32;
-
-    public const int W55_CLEAN_MARKER_SUFFIX = 64;
-
-    /**
-     * One `W55_CLEAN_*` mask per subject, flagging the cleaning paths that apply to it: a
-     * COUNTER_FILE_SUBJECT match (and a ROT13 `lRap` marker after it, as counterFileSubjectNamePhp()
-     * checks), releaseCleanerHelperPhp()'s `yEnc` tail and whitespace runs, and fixerCleanerPhp()'s
-     * non-printable bytes, `Release Name`/`sample-` prefix and sample/proof/thumbs suffix.
-     *
-     * @param  array<array-key, string>  $subjects
-     * @return list<int>
-     */
-    public static function subjectCleaningMasks(array $subjects): array
-    {
-        return self::usesW55RustFfi() ? self::subjectCleaningMasksNative($subjects) : self::subjectCleaningMasksPhp($subjects);
-    }
-
-    /**
-     * @param  array<array-key, string>  $subjects
-     * @return list<int>
-     */
-    public static function subjectCleaningMasksPhp(array $subjects): array
-    {
-        $masks = [];
-        foreach ($subjects as $subject) {
-            $mask = 0;
-            if (preg_match(self::COUNTER_FILE_SUBJECT, $subject, $hit) === 1) {
-                $mask |= self::W55_CLEAN_COUNTER_FILE;
-                if (preg_match('/\blRap\b/i', substr($subject, \strlen($hit[0]))) === 1) {
-                    $mask |= self::W55_CLEAN_SCRAMBLED;
-                }
-            }
-            if (preg_match('/(\- )?yEnc$/', $subject) === 1) {
-                $mask |= self::W55_CLEAN_YENC_TAIL;
-            }
-            if (preg_match('/\s\s+/', $subject) === 1) {
-                $mask |= self::W55_CLEAN_MULTI_SPACE;
-            }
-            if (preg_match('/[^(\x20-\x7F)]/', $subject) === 1) {
-                $mask |= self::W55_CLEAN_NON_PRINTABLE;
-            }
-            if (preg_match('/^(Release Name|sample[-_])/i', $subject) === 1) {
-                $mask |= self::W55_CLEAN_NAME_PREFIX;
-            }
-            if (preg_match('/[.\-_](sample|proof|thumbs?)$/i', $subject) === 1) {
-                $mask |= self::W55_CLEAN_MARKER_SUFFIX;
-            }
-            $masks[] = $mask;
-        }
-
-        return $masks;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
-     * holding a NUL byte).
-     *
-     * @param  array<array-key, string>  $subjects
-     * @return list<int>
-     */
-    public static function subjectCleaningMasksNative(array $subjects): array
-    {
-        $count = \count($subjects);
-        /** @var array{0: \FFI, 1: CData, 2: int}|null $buffer */
-        $buffer = $count === 0 ? null : self::w55RustFfiState('out', $count);
-        if ($buffer === null) {
-            return self::subjectCleaningMasksPhp($subjects);
-        }
-        [$ffi, $out, $cap] = $buffer;
-        $joined = implode("\0", $subjects);
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w551_release_cleaning_mask_batch($joined, \strlen($joined), $count, $out, $cap);
-        } catch (\Throwable) {
-            $written = -1;
-        }
-        $codes = $written === $count ? unpack('P*', \FFI::string($out, $count * 8)) : false;
-        if (! \is_array($codes)) {
-            return self::subjectCleaningMasksPhp($subjects);
-        }
-
-        /** @var list<int> */
-        return array_values($codes);
-    }
-
-    /**
-     * Wave 55 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
-     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
-     */
-    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'out':
-                $ffi ??= RustPipelineLibrary::resolveDomain('release_cleaning_w55', self::W55_FFI_CDEF) ?? false;
-                if (! $ffi instanceof \FFI || ! \is_int($val) || $val < 1) {
-                    return null;
-                }
-                if (! $out instanceof CData || $outCap < $val) {
-                    $outCap = max(512, $val * 2);
-                    $out = $ffi->new("int64_t[{$outCap}]");
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled;
-        }
+        return trim(mb_convert_encoding(preg_replace('/[^(\x20-\x7F)]*/', '', $cleanerName), 'UTF-8', mb_list_encodings()));
     }
 }

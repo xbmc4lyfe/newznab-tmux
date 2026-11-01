@@ -6,9 +6,6 @@ namespace App\Services\Tmux;
 
 use App\Enums\CollectionFileCheckStatus;
 use App\Services\Configuration\ConfigurationProvider;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -25,20 +22,6 @@ use Illuminate\Support\Facades\DB;
  */
 final class CollectionDowntimeCompensator implements CollectionReconciliationBarrier
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_downtime_format_at(int64_t timestamp, int64_t utc_offset_seconds, char *out_buf, size_t out_cap);
-        int32_t nntmux_downtime_parse_civil_datetime(const char *input_ptr, size_t input_len, int64_t *out_civil_epoch);
-        int64_t nntmux_downtime_largest_offset_change(const int64_t *offsets_ptr, size_t count);
-        int32_t nntmux_downtime_crosses_offset_change(ssize_t transition_count);
-        int32_t nntmux_downtime_select_timestamp_not_after(int64_t first, int64_t not_after, const int64_t *candidates_ptr, size_t count, int64_t *out_timestamp);
-        int32_t nntmux_downtime_verify_marker_dir(const char *temp_dir_ptr, size_t temp_dir_len, const char *real_dir_ptr, size_t real_dir_len);
-        int32_t nntmux_downtime_verify_marker_write(size_t expected_len, ssize_t written_bytes, uint32_t flushed, uint32_t synced);
-        C;
-
-    public static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     /**
      * Restarts shorter than this (deploys, crash recovery) need no compensation.
      */
@@ -69,22 +52,6 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
      * the Cache::flush() that the updater runs while tmux is stopped.
      */
     private readonly string $markerPath;
-
-    public static function setUseRustFfi(bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi;
-    }
-
-    public static function categorizeFfi(): ?FFI
-    {
-        if (self::$ffi !== null) {
-            return self::$ffi === false ? null : self::$ffi;
-        }
-
-        self::$ffi = RustPipelineLibrary::resolveDomain('categorize', self::FFI_CDEF) ?? false;
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
 
     public function __construct(?string $markerPath = null)
     {
@@ -297,16 +264,9 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
      * A wall-clock value from a repeated fall-back hour names two instants; take the
      * later one unless it is after $notAfter (the restart: no row was added after it).
      */
-    public function timestampNotAfter(string $dateTime, int $notAfter): int
+    private function timestampNotAfter(string $dateTime, int $notAfter): int
     {
-        return self::$useRustFfi
-            ? $this->timestampNotAfterNative($dateTime, $notAfter)
-            : $this->timestampNotAfterPhp($dateTime, $notAfter);
-    }
-
-    public function timestampNotAfterPhp(string $dateTime, int $notAfter): int
-    {
-        $first = $this->timestampPhp($dateTime);
+        $first = $this->timestamp($dateTime);
         $value = substr($dateTime, 0, 19);
         $zone = new \DateTimeZone(date_default_timezone_get());
         $candidates = [$first];
@@ -327,67 +287,11 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
         return $beforeRestart === [] ? $first : max($beforeRestart);
     }
 
-    public function timestampNotAfterNative(string $dateTime, int $notAfter): int
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->timestampNotAfterPhp($dateTime, $notAfter);
-        }
-
-        $first = $this->timestampNative($dateTime);
-        $value = substr($dateTime, 0, 19);
-        $zone = new \DateTimeZone(date_default_timezone_get());
-        $candidates = [$first];
-        $transitions = $zone->getTransitions($first - 7 * 86400, $first + 7 * 86400) ?: [];
-        for ($i = 1, $count = \count($transitions); $i < $count; $i++) {
-            $fold = $transitions[$i - 1]['offset'] - $transitions[$i]['offset'];
-            if ($fold <= 0) {
-                continue;
-            }
-            foreach ([$first - $fold, $first + $fold] as $candidate) {
-                if ((new \DateTimeImmutable('@'.$candidate))->setTimezone($zone)->format('Y-m-d H:i:s') === $value) {
-                    $candidates[] = $candidate;
-                }
-            }
-        }
-
-        $candCount = \count($candidates);
-        $cCands = $ffi->new("int64_t[{$candCount}]");
-        $outTs = $ffi->new('int64_t[1]');
-        for ($i = 0; $i < $candCount; $i++) {
-            $cCands[$i] = $candidates[$i];
-        }
-
-        // @phpstan-ignore method.notFound
-        $rc = $ffi->nntmux_downtime_select_timestamp_not_after(
-            $first,
-            $notAfter,
-            $cCands,
-            $candCount,
-            $outTs
-        );
-        if (! \is_int($rc) || $rc !== 1) {
-            return $this->timestampNotAfterPhp($dateTime, $notAfter);
-        }
-
-        /** @var int $resolved */
-        $resolved = $outTs[0];
-
-        return $resolved;
-    }
-
     /**
      * The largest backward UTC-offset change (a fall-back, which repeats wall-clock
      * times), in seconds, in the span. Spring-forward changes repeat nothing.
      */
-    public function largestOffsetChange(int ...$timestamps): int
-    {
-        return self::$useRustFfi
-            ? $this->largestOffsetChangeNative(...$timestamps)
-            : $this->largestOffsetChangePhp(...$timestamps);
-    }
-
-    public function largestOffsetChangePhp(int ...$timestamps): int
+    private function largestOffsetChange(int ...$timestamps): int
     {
         $zone = new \DateTimeZone(date_default_timezone_get());
         $offsets = array_column($zone->getTransitions(min($timestamps), max($timestamps)) ?: [], 'offset');
@@ -399,74 +303,16 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
         return $largest;
     }
 
-    public function largestOffsetChangeNative(int ...$timestamps): int
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->largestOffsetChangePhp(...$timestamps);
-        }
-
-        $zone = new \DateTimeZone(date_default_timezone_get());
-        $offsets = array_column($zone->getTransitions(min($timestamps), max($timestamps)) ?: [], 'offset');
-        $count = \count($offsets);
-        if ($count < 2) {
-            // @phpstan-ignore method.notFound
-            $res = $ffi->nntmux_downtime_largest_offset_change(null, 0);
-
-            return \is_int($res) && $res >= 0 ? $res : $this->largestOffsetChangePhp(...$timestamps);
-        }
-
-        $cOffsets = $ffi->new("int64_t[{$count}]");
-        for ($i = 0; $i < $count; $i++) {
-            $cOffsets[$i] = (int) $offsets[$i];
-        }
-
-        // @phpstan-ignore method.notFound
-        $res = $ffi->nntmux_downtime_largest_offset_change($cOffsets, $count);
-        if (! \is_int($res) || $res < 0) {
-            return $this->largestOffsetChangePhp(...$timestamps);
-        }
-
-        return $res;
-    }
-
     /**
      * Whether the application timezone changes its UTC offset anywhere in the span.
      */
-    public function crossesOffsetChange(int ...$timestamps): bool
-    {
-        return self::$useRustFfi
-            ? $this->crossesOffsetChangeNative(...$timestamps)
-            : $this->crossesOffsetChangePhp(...$timestamps);
-    }
-
-    public function crossesOffsetChangePhp(int ...$timestamps): bool
+    private function crossesOffsetChange(int ...$timestamps): bool
     {
         $zone = new \DateTimeZone(date_default_timezone_get());
         $transitions = $zone->getTransitions(min($timestamps), max($timestamps));
 
         // The first entry describes the offset at the start; any more are changes.
         return \is_array($transitions) && \count($transitions) > 1;
-    }
-
-    public function crossesOffsetChangeNative(int ...$timestamps): bool
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->crossesOffsetChangePhp(...$timestamps);
-        }
-
-        $zone = new \DateTimeZone(date_default_timezone_get());
-        $transitions = $zone->getTransitions(min($timestamps), max($timestamps));
-        $transitionCount = \is_array($transitions) ? \count($transitions) : -1;
-
-        // @phpstan-ignore method.notFound
-        $res = $ffi->nntmux_downtime_crosses_offset_change($transitionCount);
-        if (! \is_int($res) || $res < 0) {
-            return $this->crossesOffsetChangePhp(...$timestamps);
-        }
-
-        return $res === 1;
     }
 
     /**
@@ -490,86 +336,14 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
      * Datetime columns hold application-timezone wall-clock values, so convert both ways
      * in that timezone.
      */
-    public function at(int $timestamp): string
-    {
-        return self::$useRustFfi
-            ? $this->atNative($timestamp)
-            : $this->atPhp($timestamp);
-    }
-
-    public function atPhp(int $timestamp): string
+    private function at(int $timestamp): string
     {
         return Carbon::createFromTimestamp($timestamp, date_default_timezone_get())->format('Y-m-d H:i:s');
     }
 
-    public function atNative(int $timestamp): string
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->atPhp($timestamp);
-        }
-
-        $tzName = date_default_timezone_get();
-        $offset = ($tzName === 'UTC' || $tzName === 'Etc/UTC')
-            ? 0
-            : (new \DateTimeZone($tzName))->getOffset(new \DateTimeImmutable('@'.$timestamp));
-
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 32, $cap);
-        if ($scratch === null) {
-            return $this->atPhp($timestamp);
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_downtime_format_at($timestamp, $offset, $scratch, $cap);
-        if (! \is_int($written) || $written !== 19) {
-            return $this->atPhp($timestamp);
-        }
-
-        return FFI::string($scratch, 19);
-    }
-
-    public function timestamp(string $dateTime): int
-    {
-        return self::$useRustFfi
-            ? $this->timestampNative($dateTime)
-            : $this->timestampPhp($dateTime);
-    }
-
-    public function timestampPhp(string $dateTime): int
+    private function timestamp(string $dateTime): int
     {
         return Carbon::createFromFormat('Y-m-d H:i:s', substr($dateTime, 0, 19), date_default_timezone_get())->getTimestamp();
-    }
-
-    public function timestampNative(string $dateTime): int
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->timestampPhp($dateTime);
-        }
-
-        $outCivil = $ffi->new('int64_t[1]');
-
-        // @phpstan-ignore method.notFound
-        $rc = $ffi->nntmux_downtime_parse_civil_datetime($dateTime, \strlen($dateTime), $outCivil);
-        if (! \is_int($rc) || $rc !== 1) {
-            return $this->timestampPhp($dateTime);
-        }
-
-        /** @var int $civilEpoch */
-        $civilEpoch = $outCivil[0];
-        $tzName = date_default_timezone_get();
-        if ($tzName === 'UTC' || $tzName === 'Etc/UTC') {
-            return $civilEpoch;
-        }
-
-        $zone = new \DateTimeZone($tzName);
-        $transitions = $zone->getTransitions($civilEpoch - 86400, $civilEpoch + 86400);
-        if (\is_array($transitions) && \count($transitions) === 1) {
-            return $civilEpoch - (int) $transitions[0]['offset'];
-        }
-
-        return $this->timestampPhp($dateTime);
     }
 
     /**
@@ -792,14 +566,7 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
     /**
      * Prepare a complete file before either publication or rollback changes the marker.
      */
-    public function prepareMarker(string $value): string
-    {
-        return self::$useRustFfi
-            ? $this->prepareMarkerNative($value)
-            : $this->prepareMarkerPhp($value);
-    }
-
-    public function prepareMarkerPhp(string $value): string
+    private function prepareMarker(string $value): string
     {
         $directory = \dirname($this->markerPath);
         $temporary = tempnam($directory, 'activity-');
@@ -826,288 +593,6 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
         } catch (\Throwable $exception) {
             unlink($temporary);
             throw $exception;
-        }
-    }
-
-    public function prepareMarkerNative(string $value): string
-    {
-        $ffi = self::categorizeFfi();
-        if ($ffi === null) {
-            return $this->prepareMarkerPhp($value);
-        }
-
-        $directory = \dirname($this->markerPath);
-        $temporary = tempnam($directory, 'activity-');
-        if ($temporary === false) {
-            throw new \RuntimeException("Unable to write {$this->markerPath}.");
-        }
-        try {
-            $tempDir = \dirname($temporary);
-            $realDir = realpath($directory);
-            $realDirStr = $realDir === false ? '' : $realDir;
-
-            // @phpstan-ignore method.notFound
-            $dirOk = $ffi->nntmux_downtime_verify_marker_dir(
-                $tempDir,
-                \strlen($tempDir),
-                $realDirStr,
-                \strlen($realDirStr)
-            );
-            if ($dirOk !== 1) {
-                throw new \RuntimeException("Unable to write {$this->markerPath} in its directory.");
-            }
-
-            $stream = fopen($temporary, 'wb');
-            if ($stream === false) {
-                throw new \RuntimeException("Unable to write {$this->markerPath}.");
-            }
-            try {
-                $expectedLen = \strlen($value);
-                $written = fwrite($stream, $value);
-                $writtenBytes = $written === false ? -1 : $written;
-                $flushed = ($writtenBytes === $expectedLen) && fflush($stream);
-                $synced = $flushed && fsync($stream);
-
-                // @phpstan-ignore method.notFound
-                $writeOk = $ffi->nntmux_downtime_verify_marker_write(
-                    $expectedLen,
-                    $writtenBytes,
-                    $flushed ? 1 : 0,
-                    $synced ? 1 : 0
-                );
-                if ($writeOk !== 1) {
-                    throw new \RuntimeException("Unable to write {$this->markerPath}.");
-                }
-            } finally {
-                fclose($stream);
-            }
-
-            return $temporary;
-        } catch (\Throwable $exception) {
-            unlink($temporary);
-            throw $exception;
-        }
-    }
-
-    // ========================================================================
-    // WAVE 58.3 BATCH HELPER
-    // ========================================================================
-
-    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 4.72x, p99 4.25x; uncommon mean 2.53x, p99 2.85x); see RustPostProcessReleasesRunnerDowntimeCompensatorTmuxCommandW58ParityTest. */
-    public const bool W58_RUST_FFI_DEFAULT = true;
-
-    public const string W58_DOWNTIME_COMPENSATOR_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w58_downtime_compensator_plan_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /** Trailer words after the per-item words of w58DowntimePlanBatch(). */
-    public const int W58_DOWNTIME_TRAILER = 8;
-
-    /** Largest collectionDelayHours that w58DowntimePlanBatch() extends by. */
-    public const int W58_MAX_DELAY_HOURS = 168;
-
-    public static function usesW58RustFfi(): bool
-    {
-        $override = self::w58RustFfiState();
-
-        return \is_bool($override) ? $override : self::W58_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with the Wave 58 Rust path forced on or off, then restores the previous setting.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w58RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w58RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Wave 58.3 downtime compensation plans for `lastActive,now,delayHours` items (each field 1-10 ASCII
-     * digits, exactly three fields). Two words per item: `class | windows << 3 | delay << 20` and the timeout
-     * extension in seconds. Class: 0 malformed, 1 clock skew (now before lastActive), 2 a gap shorter than
-     * MIN_DOWNTIME_SECONDS, 3 compensate and 4 compensate past MAX_WINDOWS; compensating plans hold
-     * ceil(gap / WINDOW_SECONDS) windows (capped at MAX_WINDOWS) and extend by delay * 3600 + gap, with delay
-     * the hours capped at W58_MAX_DELAY_HOURS (0 for malformed items). Then the five class counts, the total
-     * extension, the max gap (at least 0) and the total windows.
-     *
-     * @param  array<array-key, string>  $items
-     * @return list<int>
-     */
-    public static function w58DowntimePlanBatch(array $items): array
-    {
-        return self::usesW58RustFfi() ? self::w58DowntimePlanBatchNative($items) : self::w58DowntimePlanBatchPhp($items);
-    }
-
-    /**
-     * @param  array<array-key, string>  $items
-     * @return list<int>
-     */
-    public static function w58DowntimePlanBatchNative(array $items): array
-    {
-        return self::w58Invoke($items, 2 * \count($items) + self::W58_DOWNTIME_TRAILER) ?? self::w58DowntimePlanBatchPhp($items);
-    }
-
-    /**
-     * @param  array<array-key, string>  $items
-     * @return list<int>
-     */
-    public static function w58DowntimePlanBatchPhp(array $items): array
-    {
-        $out = [];
-        $classes = [0, 0, 0, 0, 0];
-        $totalExtension = 0;
-        $maxGap = 0;
-        $totalWindows = 0;
-        foreach ($items as $item) {
-            $fields = explode(',', (string) $item);
-            $class = 0;
-            $windows = 0;
-            $delay = 0;
-            $extension = 0;
-            if (\count($fields) === 3 && self::w58Digits($fields[0]) && self::w58Digits($fields[1]) && self::w58Digits($fields[2])) {
-                $gap = (int) $fields[1] - (int) $fields[0];
-                $delay = min((int) $fields[2], self::W58_MAX_DELAY_HOURS);
-                $maxGap = max($maxGap, $gap);
-                if ($gap < 0) {
-                    $class = 1;
-                } elseif ($gap < self::MIN_DOWNTIME_SECONDS) {
-                    $class = 2;
-                } else {
-                    $windows = intdiv($gap + self::WINDOW_SECONDS - 1, self::WINDOW_SECONDS);
-                    $class = $windows > self::MAX_WINDOWS ? 4 : 3;
-                    $windows = min($windows, self::MAX_WINDOWS);
-                    $extension = $delay * 3600 + $gap;
-                }
-            }
-            $classes[$class]++;
-            $totalExtension += $extension;
-            $totalWindows += $windows;
-            array_push($out, $class | $windows << 3 | $delay << 20, $extension);
-        }
-        array_push($out, ...$classes);
-        array_push($out, $totalExtension, $maxGap, $totalWindows);
-
-        return $out;
-    }
-
-    /** One to ten ASCII digits. */
-    private static function w58Digits(string $value): bool
-    {
-        $length = \strlen($value);
-
-        return $length >= 1 && $length <= 10 && strspn($value, '0123456789') === $length;
-    }
-
-    /**
-     * Wave 58 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
-     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
-     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
-     */
-    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var bool|null $override */
-        static $override = null;
-        /** @var FFI|false|null $ffi */
-        static $ffi = null;
-        /** @var CData|null $out */
-        static $out = null;
-        /** @var int $outCap */
-        static $outCap = 0;
-        /** @var CData|null $lens */
-        static $lens = null;
-        /** @var int $lensCap */
-        static $lensCap = 0;
-
-        if ($op === 'set') {
-            $previous = $override;
-            $override = \is_bool($val) ? $val : null;
-
-            return $previous;
-        }
-        if ($op === 'ffi') {
-            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w58', self::W58_DOWNTIME_COMPENSATOR_FFI_CDEF) ?? false;
-
-            return $ffi === false ? null : $ffi;
-        }
-        if ($op === 'out') {
-            $words = \is_int($val) ? $val : 0;
-            if ($out === null || $outCap < $words) {
-                $handle = self::w58RustFfiState('ffi');
-                if (! $handle instanceof FFI) {
-                    return null;
-                }
-                $outCap = max(1024, $words * 2);
-                $out = $handle->new('int64_t['.$outCap.']');
-            }
-
-            return $out;
-        }
-        if ($op === 'lens') {
-            $words = \is_int($val) ? $val : 0;
-            if ($lens === null || $lensCap < $words) {
-                $handle = self::w58RustFfiState('ffi');
-                if (! $handle instanceof FFI) {
-                    return null;
-                }
-                $lensCap = max(256, $words * 2);
-                $lens = $handle->new('int64_t['.$lensCap.']');
-            }
-
-            return $lens;
-        }
-
-        return $override;
-    }
-
-    /**
-     * Calls the Wave 58.3 export with the NUL-joined $items, or with the items concatenated plus an
-     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
-     * declines or it writes other than $words words, so the caller falls back to PHP.
-     *
-     * @param  array<array-key, mixed>  $items
-     * @return list<int>|null
-     */
-    private static function w58Invoke(array $items, int $words): ?array
-    {
-        try {
-            $ffi = self::w58RustFfiState('ffi');
-            $out = self::w58RustFfiState('out', $words);
-            if (! $ffi instanceof FFI || ! $out instanceof CData) {
-                return null;
-            }
-            $count = \count($items);
-            $blob = implode("\0", $items);
-            $lens = null;
-            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
-                $blob = implode('', $items);
-                $column = self::w58RustFfiState('lens', $count);
-                if (! $column instanceof CData) {
-                    return null;
-                }
-                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
-                $lens = FFI::addr($column[0]);
-            }
-            // @phpstan-ignore method.notFound (Declared by W58_DOWNTIME_COMPENSATOR_FFI_CDEF.)
-            $written = $ffi->nntmux_w58_downtime_compensator_plan_batch($blob, \strlen($blob), $lens, $count, $out, $words);
-            if ($written !== $words) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $words * 8));
-
-            /** @var list<int>|null */
-            return $values === false ? null : array_values($values);
-        } catch (\Throwable) {
-            return null;
         }
     }
 }

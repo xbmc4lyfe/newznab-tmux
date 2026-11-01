@@ -132,10 +132,6 @@ class SeasonPackDetectorTest extends TestCase
         );
         $this->assertNull(SeasonPackDetector::seasonNameFromEpisode('Show.S01E01.Pilot-GRP'));
         $this->assertNull(SeasonPackDetector::seasonNameFromEpisode('Movie.2020.1080p.BluRay-GRP'));
-        $this->assertSame(
-            SeasonPackDetector::seasonNameFromEpisodePhp('_.S01E01.1080p.WEB-DL-GRP.mkv'),
-            SeasonPackDetector::seasonNameFromEpisode('_.S01E01.1080p.WEB-DL-GRP.mkv'),
-        );
     }
 
     #[Test]
@@ -188,9 +184,7 @@ class SeasonPackDetectorTest extends TestCase
             'Show.S01E01.1080p.WEB.x264.Complete.Season-GRP.mkv',
         ] as $ambiguous) {
             $this->assertNull(SeasonPackDetector::episodeIdentity($ambiguous), $ambiguous);
-            $this->assertNull(SeasonPackDetector::episodeIdentityPhp($ambiguous), $ambiguous);
             $this->assertTrue(SeasonPackDetector::hasNonSingleEpisodeEvidence([$ambiguous]), $ambiguous);
-            $this->assertTrue(SeasonPackDetector::hasNonSingleEpisodeEvidencePhp([$ambiguous]), $ambiguous);
         }
     }
 }

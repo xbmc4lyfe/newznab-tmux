@@ -13,8 +13,6 @@ use App\Rules\ValidEmailDomain;
 use App\Services\RegistrationStatusService;
 use App\Support\Auth\RegistersUsers;
 use App\Support\PermissionSyncHelper;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Redirector;
@@ -43,456 +41,12 @@ class RegisterController extends Controller
 
     use RegistersUsers;
 
-    private const FFI_CDEF = <<<'CDEF'
-ssize_t nntmux_register_extract_invite_code_nul(
-    uint8_t has_invitecode,
-    const char *invitecode_ptr,
-    size_t invitecode_len,
-    uint8_t has_token,
-    const char *token_ptr,
-    size_t token_len,
-    uint8_t has_invitation,
-    const char *invitation_ptr,
-    size_t invitation_len,
-    uint8_t *out_buf,
-    size_t out_cap
-);
-int32_t nntmux_register_emails_match(
-    const char *first_ptr,
-    size_t first_len,
-    const char *second_ptr,
-    size_t second_len,
-    int32_t *out_matches
-);
-ssize_t nntmux_register_evaluate_form_state_nul(
-    uint8_t is_open,
-    uint8_t is_invite_only,
-    uint8_t scheduled_override_active,
-    const char *status_msg_ptr,
-    size_t status_msg_len,
-    const char *invite_code_ptr,
-    size_t invite_code_len,
-    uint8_t invitation_token_valid,
-    uint8_t has_invitation_email,
-    const char *invitation_email_ptr,
-    size_t invitation_email_len,
-    const char *initial_error_ptr,
-    size_t initial_error_len,
-    int32_t initial_show_register,
-    int32_t *out_show_register,
-    uint8_t *out_buf,
-    size_t out_cap
-);
-CDEF;
-
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     /**
      * Where to redirect users after registration.
      */
     protected string $redirectTo = '/';
 
     private string $inviteCodeQuery = '';
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = false;
-        self::$ffi = null;
-    }
-
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = (bool) $useRustFfi;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi = null): void
-    {
-        self::$ffi = $ffi;
-    }
-
-    /**
-     * @return array{invite_code: string, invite_code_query: string, matched_param: string}
-     */
-    public static function resolveInviteCode(
-        ?string $invitecode,
-        ?string $token = null,
-        ?string $invitation = null
-    ): array {
-        if (self::$useRustFfi) {
-            return self::extractInviteCodeNative($invitecode, $token, $invitation);
-        }
-
-        return self::extractInviteCodePhp($invitecode, $token, $invitation);
-    }
-
-    /**
-     * @return array{invite_code: string, invite_code_query: string, matched_param: string}
-     */
-    public static function extractInviteCodePhp(
-        ?string $invitecode,
-        ?string $token = null,
-        ?string $invitation = null
-    ): array {
-        $candidates = [
-            'invitecode' => $invitecode,
-            'token' => $token,
-            'invitation' => $invitation,
-        ];
-
-        foreach ($candidates as $parameter => $value) {
-            if ($value !== null && trim($value) !== '') {
-                return [
-                    'invite_code' => $value,
-                    'invite_code_query' => '&'.$parameter.'='.$value,
-                    'matched_param' => $parameter,
-                ];
-            }
-        }
-
-        return [
-            'invite_code' => '',
-            'invite_code_query' => '',
-            'matched_param' => '',
-        ];
-    }
-
-    /**
-     * @return array{invite_code: string, invite_code_query: string, matched_param: string}
-     */
-    public static function extractInviteCodeNative(
-        ?string $invitecode,
-        ?string $token = null,
-        ?string $invitation = null
-    ): array {
-        $ffi = self::additionalFfi();
-        if (! $ffi instanceof FFI) {
-            return self::extractInviteCodePhp($invitecode, $token, $invitation);
-        }
-
-        try {
-            $invCodeStr = $invitecode ?? '';
-            $tokStr = $token ?? '';
-            $invStr = $invitation ?? '';
-            $cap = max(128, (strlen($invCodeStr) + strlen($tokStr) + strlen($invStr)) * 2 + 64);
-            $outBuf = $ffi->new("uint8_t[{$cap}]");
-
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_register_extract_invite_code_nul(
-                $invitecode !== null ? 1 : 0,
-                $invCodeStr,
-                strlen($invCodeStr),
-                $token !== null ? 1 : 0,
-                $tokStr,
-                strlen($tokStr),
-                $invitation !== null ? 1 : 0,
-                $invStr,
-                strlen($invStr),
-                $outBuf,
-                $cap
-            );
-            if (! is_int($written) || $written <= 0) {
-                return self::extractInviteCodePhp($invitecode, $token, $invitation);
-            }
-
-            $parts = explode("\0", FFI::string($outBuf, $written));
-            if (count($parts) < 3) {
-                return self::extractInviteCodePhp($invitecode, $token, $invitation);
-            }
-
-            return [
-                'invite_code' => $parts[0],
-                'invite_code_query' => $parts[1],
-                'matched_param' => $parts[2],
-            ];
-        } catch (Throwable) {
-            return self::extractInviteCodePhp($invitecode, $token, $invitation);
-        }
-    }
-
-    public static function emailsMatch(string $firstEmail, string $secondEmail): bool
-    {
-        if (self::$useRustFfi) {
-            return self::emailsMatchNative($firstEmail, $secondEmail);
-        }
-
-        return self::emailsMatchPhp($firstEmail, $secondEmail);
-    }
-
-    public static function emailsMatchPhp(string $firstEmail, string $secondEmail): bool
-    {
-        return strcasecmp(trim($firstEmail), trim($secondEmail)) === 0;
-    }
-
-    public static function emailsMatchNative(string $firstEmail, string $secondEmail): bool
-    {
-        $ffi = self::additionalFfi();
-        if (! $ffi instanceof FFI) {
-            return self::emailsMatchPhp($firstEmail, $secondEmail);
-        }
-
-        try {
-            $outMatches = $ffi->new('int32_t[1]');
-
-            // @phpstan-ignore method.notFound
-            $rc = $ffi->nntmux_register_emails_match(
-                $firstEmail,
-                strlen($firstEmail),
-                $secondEmail,
-                strlen($secondEmail),
-                $outMatches
-            );
-            $matched = $outMatches[0];
-            if ($rc !== 1 || ! is_int($matched)) {
-                return self::emailsMatchPhp($firstEmail, $secondEmail);
-            }
-
-            return $matched === 1;
-        } catch (Throwable) {
-            return self::emailsMatchPhp($firstEmail, $secondEmail);
-        }
-    }
-
-    /**
-     * @return array{
-     *     showregister: int,
-     *     error: string,
-     *     notice: string,
-     *     email: string
-     * }
-     */
-    public static function evaluateRegistrationFormState(
-        bool $isOpen,
-        bool $isInviteOnly,
-        bool $scheduledOverrideActive,
-        string $statusMessage,
-        string $inviteCode,
-        bool $invitationTokenValid,
-        ?string $invitationEmail = null,
-        string $initialError = '',
-        int $initialShowRegister = 0
-    ): array {
-        if (self::$useRustFfi) {
-            return self::evaluateRegistrationFormStateNative(
-                $isOpen,
-                $isInviteOnly,
-                $scheduledOverrideActive,
-                $statusMessage,
-                $inviteCode,
-                $invitationTokenValid,
-                $invitationEmail,
-                $initialError,
-                $initialShowRegister
-            );
-        }
-
-        return self::evaluateRegistrationFormStatePhp(
-            $isOpen,
-            $isInviteOnly,
-            $scheduledOverrideActive,
-            $statusMessage,
-            $inviteCode,
-            $invitationTokenValid,
-            $invitationEmail,
-            $initialError,
-            $initialShowRegister
-        );
-    }
-
-    /**
-     * @return array{
-     *     showregister: int,
-     *     error: string,
-     *     notice: string,
-     *     email: string
-     * }
-     */
-    public static function evaluateRegistrationFormStatePhp(
-        bool $isOpen,
-        bool $isInviteOnly,
-        bool $scheduledOverrideActive,
-        string $statusMessage,
-        string $inviteCode,
-        bool $invitationTokenValid,
-        ?string $invitationEmail = null,
-        string $initialError = '',
-        int $initialShowRegister = 0
-    ): array {
-        $showRegister = $initialShowRegister;
-        $error = $initialError;
-        $notice = '';
-        $emailFromInvite = '';
-
-        if ($isOpen) {
-            $showRegister = 1;
-
-            if (! empty($inviteCode)) {
-                if ($invitationTokenValid && ! empty($invitationEmail)) {
-                    $emailFromInvite = $invitationEmail;
-                } elseif (! $invitationTokenValid) {
-                    $notice = 'Registration is currently open, so you can register without a valid invitation.';
-                }
-            }
-
-            if ($scheduledOverrideActive) {
-                $notice = $statusMessage;
-            }
-        } elseif ($isInviteOnly) {
-            if (! empty($inviteCode) && $invitationTokenValid) {
-                $showRegister = 1;
-
-                if (! empty($invitationEmail)) {
-                    $emailFromInvite = $invitationEmail;
-                }
-            } elseif (! empty($inviteCode)) {
-                $error = 'Invalid or expired invitation token!';
-                $showRegister = 0;
-            } else {
-                $error = $statusMessage;
-                $showRegister = 0;
-            }
-        } else {
-            $error = $statusMessage;
-            $showRegister = 0;
-        }
-
-        return [
-            'showregister' => $showRegister,
-            'error' => $error,
-            'notice' => $notice,
-            'email' => $emailFromInvite,
-        ];
-    }
-
-    /**
-     * @return array{
-     *     showregister: int,
-     *     error: string,
-     *     notice: string,
-     *     email: string
-     * }
-     */
-    public static function evaluateRegistrationFormStateNative(
-        bool $isOpen,
-        bool $isInviteOnly,
-        bool $scheduledOverrideActive,
-        string $statusMessage,
-        string $inviteCode,
-        bool $invitationTokenValid,
-        ?string $invitationEmail = null,
-        string $initialError = '',
-        int $initialShowRegister = 0
-    ): array {
-        $ffi = self::additionalFfi();
-        if (! $ffi instanceof FFI) {
-            return self::evaluateRegistrationFormStatePhp(
-                $isOpen,
-                $isInviteOnly,
-                $scheduledOverrideActive,
-                $statusMessage,
-                $inviteCode,
-                $invitationTokenValid,
-                $invitationEmail,
-                $initialError,
-                $initialShowRegister
-            );
-        }
-
-        try {
-            $invEmailStr = $invitationEmail ?? '';
-            $cap = max(
-                256,
-                strlen($statusMessage) + strlen($invEmailStr) + strlen($initialError) + 160
-            );
-            $outShowRegister = $ffi->new('int32_t[1]');
-            $outBuf = $ffi->new("uint8_t[{$cap}]");
-
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_register_evaluate_form_state_nul(
-                $isOpen ? 1 : 0,
-                $isInviteOnly ? 1 : 0,
-                $scheduledOverrideActive ? 1 : 0,
-                $statusMessage,
-                strlen($statusMessage),
-                $inviteCode,
-                strlen($inviteCode),
-                $invitationTokenValid ? 1 : 0,
-                $invitationEmail !== null ? 1 : 0,
-                $invEmailStr,
-                strlen($invEmailStr),
-                $initialError,
-                strlen($initialError),
-                $initialShowRegister,
-                $outShowRegister,
-                $outBuf,
-                $cap
-            );
-            $showRegister = $outShowRegister[0];
-            if (! is_int($written) || $written <= 0 || ! is_int($showRegister)) {
-                return self::evaluateRegistrationFormStatePhp(
-                    $isOpen,
-                    $isInviteOnly,
-                    $scheduledOverrideActive,
-                    $statusMessage,
-                    $inviteCode,
-                    $invitationTokenValid,
-                    $invitationEmail,
-                    $initialError,
-                    $initialShowRegister
-                );
-            }
-
-            $parts = explode("\0", FFI::string($outBuf, $written));
-            if (count($parts) < 3) {
-                return self::evaluateRegistrationFormStatePhp(
-                    $isOpen,
-                    $isInviteOnly,
-                    $scheduledOverrideActive,
-                    $statusMessage,
-                    $inviteCode,
-                    $invitationTokenValid,
-                    $invitationEmail,
-                    $initialError,
-                    $initialShowRegister
-                );
-            }
-
-            return [
-                'showregister' => $showRegister,
-                'error' => $parts[0],
-                'notice' => $parts[1],
-                'email' => $parts[2],
-            ];
-        } catch (Throwable) {
-            return self::evaluateRegistrationFormStatePhp(
-                $isOpen,
-                $isInviteOnly,
-                $scheduledOverrideActive,
-                $statusMessage,
-                $inviteCode,
-                $invitationTokenValid,
-                $invitationEmail,
-                $initialError,
-                $initialShowRegister
-            );
-        }
-    }
 
     public function __construct(
         private readonly RegistrationStatusService $registrationStatusService
@@ -665,30 +219,50 @@ CDEF;
     {
         $inviteCode = $this->extractInviteCode($request);
 
+        $emailFromInvite = '';
+        $notice = '';
         $status = $this->registrationStatusService->resolve();
-        $invitation = (! empty($inviteCode) && ($status['is_open'] || $status['is_invite_only']))
-            ? Invitation::findValidByToken($inviteCode)
-            : null;
-        $invitationTokenValid = $invitation !== null;
-        $invitationEmail = ($invitation !== null && ! empty($invitation->email)) ? (string) $invitation->email : null;
 
-        $state = self::evaluateRegistrationFormState(
-            (bool) $status['is_open'],
-            (bool) $status['is_invite_only'],
-            (bool) $status['scheduled_override_active'],
-            (string) $status['message'],
-            $inviteCode,
-            $invitationTokenValid,
-            $invitationEmail,
-            $error,
-            $showRegister
-        );
+        if ($status['is_open']) {
+            $showRegister = 1;
+
+            if (! empty($inviteCode)) {
+                $invitation = Invitation::findValidByToken($inviteCode);
+                if ($invitation && ! empty($invitation->email)) {
+                    $emailFromInvite = $invitation->email;
+                } elseif (! $this->isInvitationTokenValid($inviteCode)) {
+                    $notice = 'Registration is currently open, so you can register without a valid invitation.';
+                }
+            }
+
+            if ($status['scheduled_override_active']) {
+                $notice = $status['message'];
+            }
+        } elseif ($status['is_invite_only']) {
+            if (! empty($inviteCode) && $this->isInvitationTokenValid($inviteCode)) {
+                $showRegister = 1;
+
+                $invitation = Invitation::findValidByToken($inviteCode);
+                if ($invitation && ! empty($invitation->email)) {
+                    $emailFromInvite = $invitation->email;
+                }
+            } elseif (! empty($inviteCode)) {
+                $error = 'Invalid or expired invitation token!';
+                $showRegister = 0;
+            } else {
+                $error = $status['message'];
+                $showRegister = 0;
+            }
+        } else {
+            $error = $status['message'];
+            $showRegister = 0;
+        }
 
         return view('auth.register')->with([
-            'showregister' => $state['showregister'],
-            'error' => $state['error'],
-            'notice' => $state['notice'],
-            'email' => $state['email'],
+            'showregister' => $showRegister,
+            'error' => $error,
+            'notice' => $notice,
+            'email' => $emailFromInvite,
             'invite_code_query' => $this->inviteCodeQuery,
             'invitecode' => $inviteCode,
             'registrationStatus' => $status,
@@ -815,29 +389,22 @@ CDEF;
 
     private function extractInviteCode(Request $request): string
     {
-        $resolved = self::resolveInviteCode(
-            $request->filled('invitecode') ? (string) $request->input('invitecode') : null,
-            $request->filled('token') ? (string) $request->input('token') : null,
-            $request->filled('invitation') ? (string) $request->input('invitation') : null,
-        );
-        $this->inviteCodeQuery = $resolved['invite_code_query'];
+        $this->inviteCodeQuery = '';
 
-        return $resolved['invite_code'];
+        foreach (['invitecode', 'token', 'invitation'] as $parameter) {
+            if ($request->filled($parameter)) {
+                $inviteCode = (string) $request->input($parameter);
+                $this->inviteCodeQuery = '&'.$parameter.'='.$inviteCode;
+
+                return $inviteCode;
+            }
+        }
+
+        return '';
     }
 
-    private static function additionalFfi(): ?FFI
+    private function emailsMatch(string $firstEmail, string $secondEmail): bool
     {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
+        return strcasecmp(trim($firstEmail), trim($secondEmail)) === 0;
     }
 }

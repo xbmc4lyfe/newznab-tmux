@@ -9,11 +9,8 @@ use App\Models\Category;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseManagementService;
-use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
 use Exception;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -22,127 +19,6 @@ use Illuminate\Support\Facades\Log;
  */
 class ReleaseRemoverService
 {
-    // Opt-in candidate dispatch only. Production defaults to PHP until every benchmark gate passes.
-    private static bool $useRustFfi = false;
-
-    private const string REMOVER_CDEF = 'ssize_t nntmux_remover_transform(const char *input, size_t input_len, const char *second, size_t second_len, const char *third, size_t third_len, uint32_t mode, char *out_buf, size_t out_cap);';
-
-    public static function useRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public function cleanSpacesNative(string $string): ?string
-    {
-        // PCRE character tables depend on LC_CTYPE; decline non-C locales.
-        if (ini_get('pcre.backtrack_limit') !== '1000000' || ini_get('pcre.recursion_limit') !== '100000') {
-            return null;
-        }
-
-        return in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true) ? self::removerTransform(0, $string) : null;
-    }
-
-    public function formatLikeNative(string $string, string $column): ?string
-    {
-        return self::removerTransform(1, $string, $column);
-    }
-
-    public function formatCriteriaQueryNative(string $argument): bool|string|null
-    {
-        if (! in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true)
-            || ini_get('pcre.backtrack_limit') !== '1000000' || ini_get('pcre.recursion_limit') !== '100000') {
-            return null;
-        }
-        $result = self::removerTransform(2, $argument);
-        if ($result === null) {
-            return null;
-        }
-        if ($result === 'I') {
-            $this->ignoreUserCheck = true;
-
-            return '';
-        }
-        $this->error = 'Invalid argument supplied: '.$argument.PHP_EOL;
-
-        return $this->decodeCriteria($result);
-    }
-
-    public function buildCriteriaClauseNative(string $column, string $modifier, string $value): bool|string|null
-    {
-        return $this->decodeCriteria(self::removerTransform(3, $column, $modifier, $value));
-    }
-
-    public function buildNumericClauseNative(string $column, string $modifier, string $value): bool|string|null
-    {
-        return $this->decodeCriteria(self::removerTransform(4, $column, $modifier, $value));
-    }
-
-    public function buildImdbClauseNative(string $modifier, string $value): bool|string|null
-    {
-        return $this->decodeCriteria(self::removerTransform(5, $modifier, $value));
-    }
-
-    public function buildCompletionClauseNative(string $modifier, string $value): bool|string|null
-    {
-        return $this->decodeCriteria(self::removerTransform(6, $modifier, $value));
-    }
-
-    public function formatBlacklistIDNative(int|string $blacklistID): ?string
-    {
-        // PHP owns sprintf's float/exponent/overflow coercion when Rust declines.
-        return self::removerTransform(7, (string) $blacklistID) ?? $this->formatBlacklistIDPhp($blacklistID);
-    }
-
-    private function decodeCriteria(?string $result): bool|string|null
-    {
-        if ($result === null || $result === '') {
-            return null;
-        }
-        if ($result[0] === 'S') {
-            return substr($result, 1);
-        }
-        if ($result === 'F') {
-            return false;
-        }
-        if ($result[0] === 'D') {
-            $parts = explode("\0", substr($result, 1));
-            if (count($parts) === 3) {
-                // Escaping and all database lookups stay in Laravel/PHP.
-                return $this->buildCriteriaClausePhp($parts[0], $parts[1], $parts[2]);
-            }
-        }
-
-        return null;
-    }
-
-    private static function removerTransform(int $mode, string $input, string $second = '', string $third = ''): ?string
-    {
-        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::REMOVER_CDEF);
-        if ($ffi === null) {
-            return null;
-        }
-        $capacity = 0;
-        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) + strlen($second) + strlen($third) + 128), $capacity);
-        if ($buffer === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_remover_transform($input, strlen($input), $second, strlen($second), $third, strlen($third), $mode, $buffer, $capacity);
-        if (is_int($written) && $written <= -4) {
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written - 3, $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_remover_transform($input, strlen($input), $second, strlen($second), $third, strlen($third), $mode, $buffer, $capacity);
-        }
-        if (! is_int($written) || $written < 0 || $written > $capacity) {
-            return null;
-        }
-
-        return $written === 0 ? '' : FFI::string($buffer, $written);
-    }
-
     private const int BATCH_SIZE = 500;
 
     private const int BATCH_PAUSE_US = 10000;
@@ -328,11 +204,6 @@ class ReleaseRemoverService
      * Format the blacklist ID for query use.
      */
     private function formatBlacklistID(int|string $blacklistID): string
-    {
-        return self::$useRustFfi ? ($this->formatBlacklistIDNative($blacklistID) ?? $this->formatBlacklistIDPhp($blacklistID)) : $this->formatBlacklistIDPhp($blacklistID);
-    }
-
-    private function formatBlacklistIDPhp(int|string $blacklistID): string
     {
         if ($blacklistID !== '' && is_numeric($blacklistID)) {
             return sprintf('AND id = %d', $blacklistID);
@@ -1160,11 +1031,6 @@ class ReleaseRemoverService
      */
     protected function formatCriteriaQuery(string $argument): bool|string
     {
-        return self::$useRustFfi ? ($this->formatCriteriaQueryNative($argument) ?? $this->formatCriteriaQueryPhp($argument)) : $this->formatCriteriaQueryPhp($argument);
-    }
-
-    protected function formatCriteriaQueryPhp(string $argument): bool|string
-    {
         if ($argument === 'ignore') {
             $this->ignoreUserCheck = true;
 
@@ -1189,11 +1055,6 @@ class ReleaseRemoverService
      * Build a criteria clause based on column, modifier and value.
      */
     private function buildCriteriaClause(string $column, string $modifier, string $value): bool|string
-    {
-        return self::$useRustFfi ? ($this->buildCriteriaClauseNative($column, $modifier, $value) ?? $this->buildCriteriaClausePhp($column, $modifier, $value)) : $this->buildCriteriaClausePhp($column, $modifier, $value);
-    }
-
-    private function buildCriteriaClausePhp(string $column, string $modifier, string $value): bool|string
     {
         // Simple equals columns
         $simpleEqualsColumns = ['categories_id', 'nzbstatus', 'videos_id'];
@@ -1242,11 +1103,6 @@ class ReleaseRemoverService
      */
     private function buildNumericClause(string $column, string $modifier, string $value): bool|string
     {
-        return self::$useRustFfi ? ($this->buildNumericClauseNative($column, $modifier, $value) ?? $this->buildNumericClausePhp($column, $modifier, $value)) : $this->buildNumericClausePhp($column, $modifier, $value);
-    }
-
-    private function buildNumericClausePhp(string $column, string $modifier, string $value): bool|string
-    {
         return match ($modifier) {
             'equals' => " AND {$column} = {$value}",
             'bigger' => " AND {$column} > {$value}",
@@ -1283,11 +1139,6 @@ class ReleaseRemoverService
      * Build imdbid clause.
      */
     private function buildImdbClause(string $modifier, string $value): bool|string
-    {
-        return self::$useRustFfi ? ($this->buildImdbClauseNative($modifier, $value) ?? $this->buildImdbClausePhp($modifier, $value)) : $this->buildImdbClausePhp($modifier, $value);
-    }
-
-    private function buildImdbClausePhp(string $modifier, string $value): bool|string
     {
         if ($modifier !== 'equals') {
             return false;
@@ -1333,11 +1184,6 @@ class ReleaseRemoverService
      */
     private function buildCompletionClause(string $modifier, string $value): bool|string
     {
-        return self::$useRustFfi ? ($this->buildCompletionClauseNative($modifier, $value) ?? $this->buildCompletionClausePhp($modifier, $value)) : $this->buildCompletionClausePhp($modifier, $value);
-    }
-
-    private function buildCompletionClausePhp(string $modifier, string $value): bool|string
-    {
         if (! is_numeric($value) || $modifier !== 'smaller') {
             return false;
         }
@@ -1376,11 +1222,6 @@ class ReleaseRemoverService
      */
     protected function cleanSpaces(string $string): string
     {
-        return self::$useRustFfi ? ($this->cleanSpacesNative($string) ?? $this->cleanSpacesPhp($string)) : $this->cleanSpacesPhp($string);
-    }
-
-    protected function cleanSpacesPhp(string $string): string
-    {
         return trim(preg_replace('/\s{2,}/', ' ', $string));
     }
 
@@ -1388,11 +1229,6 @@ class ReleaseRemoverService
      * Format a "like" string. ie: "name LIKE '%test%' AND name LIKE '%123%'.
      */
     protected function formatLike(string $string, string $column): string
-    {
-        return self::$useRustFfi ? ($this->formatLikeNative($string, $column) ?? $this->formatLikePhp($string, $column)) : $this->formatLikePhp($string, $column);
-    }
-
-    protected function formatLikePhp(string $string, string $column): string
     {
         $parts = explode(' ', $string);
         if (\count($parts) > 1) {
@@ -1412,278 +1248,5 @@ class ReleaseRemoverService
         }
 
         return false;
-    }
-
-    /**
-     * PHP stays the default for summarizeRemovalCandidateBatch(): the paired benchmark in
-     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php does not clear 1.5x.
-     */
-    public const bool W401_RUST_FFI_DEFAULT = false;
-
-    private const string W401_ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-
-    private const array W401_CANDIDATE_KEYS = ['candidates', 'invalid_rows', 'undersized', 'gibberish', 'passworded', 'eligible'];
-
-    private static ?bool $w401UseRustFfi = null;
-
-    private static FFI|false|null $w401Ffi = null;
-
-    /**
-     * Summarizes removal candidate rows (`size`, `searchname`, `passwordstatus`): an integer size below `$minSizeBytes` is
-     * undersized, a searchname matching the gibberish (15+ alphanumerics only) or hashed (a 25-alphanumeric run) removal
-     * patterns is gibberish, and a password status of 1 or more is passworded. Rows with any flag are eligible for deletion;
-     * non-array rows are invalid.
-     *
-     * @param  array<array-key, mixed>  $candidates
-     * @return array<string, int>
-     */
-    public static function summarizeRemovalCandidateBatch(array $candidates, int $minSizeBytes = 1048576): array
-    {
-        return (self::usesW401RustFfi() ? self::summarizeRemovalCandidateBatchNative($candidates, $minSizeBytes) : null)
-            ?? self::summarizeRemovalCandidateBatchPhp($candidates, $minSizeBytes);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $candidates
-     * @return array<string, int>
-     */
-    private static function summarizeRemovalCandidateBatchPhp(array $candidates, int $minSizeBytes): array
-    {
-        $summary = array_fill_keys(self::W401_CANDIDATE_KEYS, 0);
-        $summary['candidates'] = count($candidates);
-        foreach ($candidates as $candidate) {
-            if (! is_array($candidate)) {
-                $summary['invalid_rows']++;
-
-                continue;
-            }
-            $size = CollectionCleanupService::w401Int($candidate['size'] ?? null);
-            $name = $candidate['searchname'] ?? null;
-            $small = $size !== null && $size < $minSizeBytes;
-            $hashed = is_string($name) && self::w401Gibberish($name);
-            $locked = (CollectionCleanupService::w401Int($candidate['passwordstatus'] ?? null) ?? 0) >= 1;
-            $summary['undersized'] += (int) $small;
-            $summary['gibberish'] += (int) $hashed;
-            $summary['passworded'] += (int) $locked;
-            $summary['eligible'] += (int) ($small || $hashed || $locked);
-        }
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $candidates
-     * @return array<string, int>|null
-     */
-    private static function summarizeRemovalCandidateBatchNative(array $candidates, int $minSizeBytes): ?array
-    {
-        $words = [$minSizeBytes, count($candidates)];
-        $blob = [];
-        foreach ($candidates as $candidate) {
-            if (is_array($candidate)) {
-                CollectionCleanupService::w401PackRow($words, $blob, [$candidate['size'] ?? null, $candidate['searchname'] ?? null, $candidate['passwordstatus'] ?? null]);
-            } else {
-                $words[] = 0;
-            }
-        }
-        $values = CollectionCleanupService::w401Invoke(self::$w401Ffi, 3, $words, $blob);
-
-        return $values !== null && count($values) === count(self::W401_CANDIDATE_KEYS) ? array_combine(self::W401_CANDIDATE_KEYS, $values) : null;
-    }
-
-    /** removeGibberish()'s `^[a-zA-Z0-9]{15,}$` or removeHashed()'s `[a-zA-Z0-9]{25,}` searchname pattern. */
-    private static function w401Gibberish(string $name): bool
-    {
-        $length = strlen($name);
-
-        return ($length >= 15 && strspn($name, self::W401_ALNUM) === $length) || ($length >= 25 && preg_match('/[a-zA-Z0-9]{25}/', $name) === 1);
-    }
-
-    public static function useW401RustFfi(?bool $enabled): void
-    {
-        self::$w401UseRustFfi = $enabled;
-    }
-
-    public static function usesW401RustFfi(): bool
-    {
-        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW401RustFfi(): void
-    {
-        self::$w401UseRustFfi = null;
-        self::$w401Ffi = null;
-    }
-
-    /**
-     * Enabled: the paired benchmark in the W55 parity test measures 6.484x common mean, 4.585x common
-     * p99, 4.544x uncommon mean and 3.534x uncommon p99 (per-metric minimum of four runs), above
-     * the 1.5x rule.
-     */
-    private const bool W55_RUST_FFI_DEFAULT = true;
-
-    private const string W55_FFI_CDEF = 'ssize_t nntmux_w551_removal_pattern_mask_batch(const char *names, size_t names_len, size_t count, int64_t *out, size_t out_cap);';
-
-    public static function usesW55RustFfi(): bool
-    {
-        $enabled = self::w55RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
-    }
-
-    /** Runs $callback with the Wave 55 batch routed to Rust or PHP, then restores the routing. */
-    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w55RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w55RustFfiState('set', $previous);
-        }
-    }
-
-    public const int W55_REMOVE_GIBBERISH = 1;
-
-    public const int W55_REMOVE_HASHED = 2;
-
-    public const int W55_REMOVE_SHORT = 4;
-
-    public const int W55_REMOVE_PASSWORDED = 8;
-
-    public const int W55_REMOVE_SCR = 16;
-
-    public const int W55_REMOVE_SAMPLE = 32;
-
-    public const int W55_REMOVE_EXE = 64;
-
-    public const int W55_REMOVE_INSTALL_BIN = 128;
-
-    public const int W55_REMOVE_PASSWORD_URL = 256;
-
-    public const int W55_REMOVE_NZB = 512;
-
-    /**
-     * One `W55_REMOVE_*` mask per release or file name, flagging the name patterns of the crap
-     * removal queries: gibberish, hashed and short names, passworded names (without the excluded
-     * advanced/no password/not password/recovery/reset/unlocker words), `.scr` files, samples,
-     * `.exe` files, install.bin, password.url and `.nzb` names. LIKE patterns are ASCII
-     * case-insensitive, as under the default collation.
-     *
-     * @param  array<array-key, string>  $names
-     * @return list<int>
-     */
-    public static function removalPatternMasks(array $names): array
-    {
-        return self::usesW55RustFfi() ? self::removalPatternMasksNative($names) : self::removalPatternMasksPhp($names);
-    }
-
-    /**
-     * @param  array<array-key, string>  $names
-     * @return list<int>
-     */
-    public static function removalPatternMasksPhp(array $names): array
-    {
-        $masks = [];
-        foreach ($names as $name) {
-            $mask = 0;
-            if (preg_match('/\A[a-zA-Z0-9]{15,}\z/', $name) === 1) {
-                $mask |= self::W55_REMOVE_GIBBERISH;
-            }
-            if (preg_match('/[a-zA-Z0-9]{25}/', $name) === 1) {
-                $mask |= self::W55_REMOVE_HASHED;
-            }
-            if (preg_match('/\A[a-zA-Z0-9]{0,5}\z/', $name) === 1) {
-                $mask |= self::W55_REMOVE_SHORT;
-            }
-            if (stripos($name, 'passwor') !== false && preg_match('/advanced|no password|not password|recovery|reset|unlocker/i', $name) !== 1) {
-                $mask |= self::W55_REMOVE_PASSWORDED;
-            }
-            if (preg_match('/\.scr[$ "]/i', $name) === 1) {
-                $mask |= self::W55_REMOVE_SCR;
-            }
-            if (stripos($name, 'sample') !== false) {
-                $mask |= self::W55_REMOVE_SAMPLE;
-            }
-            if (preg_match('/\.exe\z/i', $name) === 1) {
-                $mask |= self::W55_REMOVE_EXE;
-            }
-            if (stripos($name, 'install.bin') !== false) {
-                $mask |= self::W55_REMOVE_INSTALL_BIN;
-            }
-            if (stripos($name, 'password.url') !== false) {
-                $mask |= self::W55_REMOVE_PASSWORD_URL;
-            }
-            if (stripos($name, '.nzb') !== false) {
-                $mask |= self::W55_REMOVE_NZB;
-            }
-            $masks[] = $mask;
-        }
-
-        return $masks;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing or declines the batch (a row
-     * holding a NUL byte).
-     *
-     * @param  array<array-key, string>  $names
-     * @return list<int>
-     */
-    public static function removalPatternMasksNative(array $names): array
-    {
-        $count = \count($names);
-        /** @var array{0: FFI, 1: CData, 2: int}|null $buffer */
-        $buffer = $count === 0 ? null : self::w55RustFfiState('out', $count);
-        if ($buffer === null) {
-            return self::removalPatternMasksPhp($names);
-        }
-        [$ffi, $out, $cap] = $buffer;
-        $joined = implode("\0", $names);
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w551_removal_pattern_mask_batch($joined, \strlen($joined), $count, $out, $cap);
-        } catch (\Throwable) {
-            $written = -1;
-        }
-        $codes = $written === $count ? unpack('P*', FFI::string($out, $count * 8)) : false;
-        if (! \is_array($codes)) {
-            return self::removalPatternMasksPhp($names);
-        }
-
-        /** @var list<int> */
-        return array_values($codes);
-    }
-
-    /**
-     * Wave 55 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
-     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
-     */
-    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $outCap = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = $val;
-
-                return $previous;
-            case 'out':
-                $ffi ??= RustPipelineLibrary::resolveDomain('release_remover_w55', self::W55_FFI_CDEF) ?? false;
-                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
-                    return null;
-                }
-                if (! $out instanceof CData || $outCap < $val) {
-                    $outCap = max(512, $val * 2);
-                    $out = $ffi->new("int64_t[{$outCap}]");
-                }
-
-                return [$ffi, $out, $outCap];
-            default:
-                return $enabled;
-        }
     }
 }

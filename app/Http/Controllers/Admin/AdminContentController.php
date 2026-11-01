@@ -7,8 +7,6 @@ namespace App\Http\Controllers\Admin;
 use App\Http\Controllers\BasePageController;
 use App\Http\Requests\Admin\AdminContentRequest;
 use App\Models\Content;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
@@ -16,36 +14,9 @@ use Illuminate\Routing\Redirector;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\View\View;
-use Throwable;
 
 class AdminContentController extends BasePageController
 {
-    public const string FFI_CDEF = <<<'CDEF'
-    ssize_t nntmux_admin_ctl_content_normalize_url(
-        const char *url_ptr,
-        size_t url_len,
-        char *out_buf,
-        size_t out_cap
-    );
-    ssize_t nntmux_admin_ctl_content_reorder(
-        const int64_t *ordered_ptr,
-        size_t ordered_len,
-        const int64_t *expected_ptr,
-        size_t expected_len,
-        int64_t *out_ordinals,
-        size_t out_cap
-    );
-    int64_t nntmux_admin_ctl_content_toggle_status(int64_t status, int64_t enabled, int64_t disabled);
-    CDEF;
-
-    /**
-     * Production default stays false until benchmark/parity sign-off; see
-     * tests/Unit/RustAdminCategoryReleaseContentControllersParityTest.php.
-     */
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     /**
      * Display list of all content.
      *
@@ -176,7 +147,9 @@ class AdminContentController extends BasePageController
             $content = Content::query()->find($request->input('id'));
 
             if ($content) {
-                $newStatus = self::toggledStatus($content->status);
+                $newStatus = $content->status === Content::STATUS_ENABLED
+                    ? Content::STATUS_DISABLED
+                    : Content::STATUS_ENABLED;
 
                 $content->update(['status' => $newStatus, 'updated_at' => now()]);
 
@@ -213,8 +186,11 @@ class AdminContentController extends BasePageController
             ->map(fn ($id) => (int) $id)
             ->all();
 
-        $ordinals = self::reorderOrdinals($orderedIds, $expectedIds);
-        if ($ordinals === null) {
+        if (
+            count($orderedIds) !== count($expectedIds)
+            || array_diff($orderedIds, $expectedIds) !== []
+            || array_diff($expectedIds, $orderedIds) !== []
+        ) {
             return response()->json([
                 'success' => false,
                 'message' => 'Reorder payload must include every content row for the selected group.',
@@ -222,9 +198,12 @@ class AdminContentController extends BasePageController
         }
 
         $timestamp = now();
+        $ordinals = [];
 
-        DB::transaction(function () use ($contentType, $ordinals, $timestamp): void {
-            foreach ($ordinals as $contentId => $ordinal) {
+        DB::transaction(function () use ($contentType, $orderedIds, $timestamp, &$ordinals): void {
+            foreach ($orderedIds as $index => $contentId) {
+                $ordinal = $index + 1;
+
                 Content::query()
                     ->whereKey($contentId)
                     ->where('contenttype', $contentType)
@@ -232,6 +211,8 @@ class AdminContentController extends BasePageController
                         'ordinal' => $ordinal,
                         'updated_at' => $timestamp,
                     ]);
+
+                $ordinals[$contentId] = $ordinal;
             }
         });
 
@@ -352,44 +333,6 @@ class AdminContentController extends BasePageController
      */
     protected function normalizeContentUrl(array $data): array
     {
-        return self::normalizeContentUrlData($data);
-    }
-
-    /**
-     * Overrides the base page toggle for this controller's helpers; `null` restores the PHP default.
-     */
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi ?? false;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi): void
-    {
-        self::$ffi = $ffi;
-    }
-
-    /**
-     * Internal URLs gain a leading and trailing `/`; external (`http://`, `https://` or domain) URLs are unchanged.
-     *
-     * @param  array<string, mixed>  $data
-     * @return array<string, mixed>
-     */
-    public static function normalizeContentUrlData(array $data): array
-    {
-        return self::$useRustFfi ? self::normalizeContentUrlDataNative($data) : self::normalizeContentUrlDataPhp($data);
-    }
-
-    /**
-     * @param  array<string, mixed>  $data
-     * @return array<string, mixed>
-     */
-    public static function normalizeContentUrlDataPhp(array $data): array
-    {
         if (isset($data['url']) && $data['url'] !== '') {
             $url = $data['url'];
 
@@ -416,143 +359,6 @@ class AdminContentController extends BasePageController
     }
 
     /**
-     * @param  array<string, mixed>  $data
-     * @return array<string, mixed>
-     */
-    public static function normalizeContentUrlDataNative(array $data): array
-    {
-        $url = $data['url'] ?? null;
-        $ffi = self::ffi();
-        if ($ffi === null || ! \is_string($url) || $url === '') {
-            return self::normalizeContentUrlDataPhp($data);
-        }
-
-        $normalized = self::callForString($ffi, 'nntmux_admin_ctl_content_normalize_url', \strlen($url) + 2, $url, \strlen($url));
-        if ($normalized === null) {
-            return self::normalizeContentUrlDataPhp($data);
-        }
-        $data['url'] = $normalized;
-
-        return $data;
-    }
-
-    /**
-     * 1-based ordinals keyed by content id, or `null` unless the ordered ids are exactly the expected ids.
-     *
-     * @param  array<int, int>  $orderedIds
-     * @param  array<int, int>  $expectedIds
-     * @return array<int, int>|null
-     */
-    public static function reorderOrdinals(array $orderedIds, array $expectedIds): ?array
-    {
-        return self::$useRustFfi ? self::reorderOrdinalsNative($orderedIds, $expectedIds) : self::reorderOrdinalsPhp($orderedIds, $expectedIds);
-    }
-
-    /**
-     * @param  array<int, int>  $orderedIds
-     * @param  array<int, int>  $expectedIds
-     * @return array<int, int>|null
-     */
-    public static function reorderOrdinalsPhp(array $orderedIds, array $expectedIds): ?array
-    {
-        if (
-            count($orderedIds) !== count($expectedIds)
-            || array_diff($orderedIds, $expectedIds) !== []
-            || array_diff($expectedIds, $orderedIds) !== []
-        ) {
-            return null;
-        }
-
-        $ordinals = [];
-        foreach ($orderedIds as $index => $contentId) {
-            $ordinals[$contentId] = $index + 1;
-        }
-
-        return $ordinals;
-    }
-
-    /**
-     * @param  array<int, int>  $orderedIds
-     * @param  array<int, int>  $expectedIds
-     * @return array<int, int>|null
-     */
-    public static function reorderOrdinalsNative(array $orderedIds, array $expectedIds): ?array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null || PHP_INT_SIZE !== 8 || ! array_is_list($orderedIds) || ! array_is_list($expectedIds)) {
-            return self::reorderOrdinalsPhp($orderedIds, $expectedIds);
-        }
-
-        try {
-            $orderedCount = count($orderedIds);
-            $expectedCount = count($expectedIds);
-            $ordered = $ffi->new('int64_t['.max(1, $orderedCount).']');
-            $expected = $ffi->new('int64_t['.max(1, $expectedCount).']');
-            $out = $ffi->new('int64_t['.max(1, $orderedCount).']');
-            foreach ($orderedIds as $index => $id) {
-                if (! \is_int($id)) {
-                    return self::reorderOrdinalsPhp($orderedIds, $expectedIds);
-                }
-                $ordered[$index] = $id;
-            }
-            foreach ($expectedIds as $index => $id) {
-                if (! \is_int($id)) {
-                    return self::reorderOrdinalsPhp($orderedIds, $expectedIds);
-                }
-                $expected[$index] = $id;
-            }
-
-            $result = self::callFfi($ffi, 'nntmux_admin_ctl_content_reorder', $ordered, $orderedCount, $expected, $expectedCount, $out, max(1, $orderedCount));
-            if ($result === 0) {
-                return null;
-            }
-            if ($result !== 1) {
-                return self::reorderOrdinalsPhp($orderedIds, $expectedIds);
-            }
-
-            $ordinals = [];
-            foreach ($orderedIds as $index => $contentId) {
-                $ordinals[$contentId] = (int) $out[$index];
-            }
-
-            return $ordinals;
-        } catch (Throwable) {
-            return self::reorderOrdinalsPhp($orderedIds, $expectedIds);
-        }
-    }
-
-    /**
-     * Enabled content becomes disabled; any other status becomes enabled.
-     */
-    public static function toggledStatus(mixed $status): int
-    {
-        return self::$useRustFfi ? self::toggledStatusNative($status) : self::toggledStatusPhp($status);
-    }
-
-    public static function toggledStatusPhp(mixed $status): int
-    {
-        return $status === Content::STATUS_ENABLED
-            ? Content::STATUS_DISABLED
-            : Content::STATUS_ENABLED;
-    }
-
-    public static function toggledStatusNative(mixed $status): int
-    {
-        $ffi = self::ffi();
-        if ($ffi === null || PHP_INT_SIZE !== 8 || ! \is_int($status)) {
-            return self::toggledStatusPhp($status);
-        }
-
-        try {
-            $result = self::callFfi($ffi, 'nntmux_admin_ctl_content_toggle_status', $status, Content::STATUS_ENABLED, Content::STATUS_DISABLED);
-
-            return $result === Content::STATUS_ENABLED || $result === Content::STATUS_DISABLED ? $result : self::toggledStatusPhp($status);
-        } catch (Throwable) {
-            return self::toggledStatusPhp($status);
-        }
-    }
-
-    /**
      * Get the ordinal that places new content at the bottom of the list.
      */
     protected function nextBottomOrdinal(int $contentType): int
@@ -566,55 +372,5 @@ class AdminContentController extends BasePageController
         }
 
         return (int) $maximumOrdinal + 1;
-    }
-
-    /**
-     * Calls a byte-output export with a scratch buffer, growing it once when Rust reports a larger requirement.
-     */
-    private static function callForString(FFI $ffi, string $symbol, int $estimate, mixed ...$args): ?string
-    {
-        try {
-            $capacity = 0;
-            $outBuf = RustPipelineLibrary::obtainScratch($ffi, max(1, $estimate), $capacity);
-            if ($outBuf === null) {
-                return null;
-            }
-            $written = self::callFfi($ffi, $symbol, ...[...$args, $outBuf, $capacity]);
-            if (\is_int($written) && $written < -1 && -$written > $capacity) {
-                $outBuf = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($outBuf === null) {
-                    return null;
-                }
-                $written = self::callFfi($ffi, $symbol, ...[...$args, $outBuf, $capacity]);
-            }
-            if (! \is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-
-            return $written === 0 ? '' : FFI::string($outBuf, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
-    {
-        return $ffi->$symbol(...$args);
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $ffi = RustPipelineLibrary::resolveDomain('w28-admin-category-release-content-controllers', self::FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 }

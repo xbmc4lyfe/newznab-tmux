@@ -17,29 +17,6 @@ use Illuminate\Support\Carbon;
  */
 final class ReleaseFingerprintMetadata extends Model
 {
-    // Paired common/uncommon mean and p99 must all reach 1.5x before adoption.
-    private static bool $useRustFfi = false;
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
     protected $primaryKey = 'releases_id';
 
     public $incrementing = false;
@@ -52,32 +29,12 @@ final class ReleaseFingerprintMetadata extends Model
     /** @return array<string, string> */
     protected function casts(): array
     {
-        return self::castPayload();
+        return ['metadata' => 'array', 'collected_at' => 'datetime'];
     }
 
     /** @return BelongsTo<Release, $this> */
     public function release(): BelongsTo
     {
         return $this->belongsTo(Release::class, 'releases_id');
-    }
-
-    /** @return array<string, string> */
-    public static function castPayload(): array
-    {
-        return (self::$useRustFfi ? self::castPayloadNative() : null) ?? self::castPayloadPhp();
-    }
-
-    /** @return array<string, string> */
-    public static function castPayloadPhp(): array
-    {
-        return ['metadata' => 'array', 'collected_at' => 'datetime'];
-    }
-
-    /** @return array<string, string>|null */
-    public static function castPayloadNative(): ?array
-    {
-        $result = ReleaseNfo::computeNative(1, []);
-
-        return is_array($result) ? $result : null;
     }
 }

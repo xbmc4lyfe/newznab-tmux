@@ -6,39 +6,12 @@ namespace App\Http\Middleware;
 
 use App\Models\Category;
 use App\Models\RootCategory;
-use App\Support\RustPipelineLibrary;
 use Closure;
-use FFI;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
 class ClearanceMiddleware
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_clearance_matches_category_path(const char *path, size_t path_len, const char *category, size_t category_len);
-        ssize_t nntmux_clearance_resolve_main_category(const char *parent_category, size_t parent_category_len, char *out_buf, size_t out_cap);
-        C;
-
-    public static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function setUseRustFfi(bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi;
-    }
-
-    public static function mediaFfi(): ?FFI
-    {
-        if (self::$ffi !== null) {
-            return self::$ffi === false ? null : self::$ffi;
-        }
-
-        self::$ffi = RustPipelineLibrary::resolveDomain('media', self::FFI_CDEF) ?? false;
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
     /**
      * Handle an incoming request.
      *
@@ -174,17 +147,7 @@ class ClearanceMiddleware
      *
      * @return string|null The blocked category name, or null if allowed
      */
-    public function checkMainCategoryPermission(mixed $user, string $parentCategoryName): ?string
-    {
-        return self::$useRustFfi
-            ? $this->checkMainCategoryPermissionNative($user, $parentCategoryName)
-            : $this->checkMainCategoryPermissionPhp($user, $parentCategoryName);
-    }
-
-    /**
-     * @return string|null The blocked category name, or null if allowed
-     */
-    public function checkMainCategoryPermissionPhp(mixed $user, string $parentCategoryName): ?string
+    protected function checkMainCategoryPermission(mixed $user, string $parentCategoryName): ?string
     {
         $categoryPermissions = [
             'movies' => 'view movies',
@@ -213,48 +176,6 @@ class ClearanceMiddleware
             if (! $user->hasDirectPermission($categoryPermissions[$lowerName])) {
                 return $categoryDisplayNames[$lowerName];
             }
-        }
-
-        return null;
-    }
-
-    /**
-     * @return string|null The blocked category name, or null if allowed
-     */
-    public function checkMainCategoryPermissionNative(mixed $user, string $parentCategoryName): ?string
-    {
-        $ffi = self::mediaFfi();
-        if ($ffi === null) {
-            return $this->checkMainCategoryPermissionPhp($user, $parentCategoryName);
-        }
-
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 128, $cap);
-        if ($scratch === null) {
-            return $this->checkMainCategoryPermissionPhp($user, $parentCategoryName);
-        }
-
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_clearance_resolve_main_category(
-            $parentCategoryName,
-            \strlen($parentCategoryName),
-            $scratch,
-            $cap,
-        );
-        if (! \is_int($written) || $written < 0) {
-            return $this->checkMainCategoryPermissionPhp($user, $parentCategoryName);
-        }
-        if ($written === 0) {
-            return null;
-        }
-
-        $pair = explode("\0", FFI::string($scratch, $written), 2);
-        if (\count($pair) !== 2) {
-            return $this->checkMainCategoryPermissionPhp($user, $parentCategoryName);
-        }
-
-        if (! $user->hasDirectPermission($pair[0])) {
-            return $pair[1];
         }
 
         return null;
@@ -301,14 +222,7 @@ class ClearanceMiddleware
     /**
      * Check if the path matches a category pattern (case-insensitive).
      */
-    public function matchesCategoryPath(string $path, string $category): bool
-    {
-        return self::$useRustFfi
-            ? $this->matchesCategoryPathNative($path, $category)
-            : $this->matchesCategoryPathPhp($path, $category);
-    }
-
-    public function matchesCategoryPathPhp(string $path, string $category): bool
+    protected function matchesCategoryPath(string $path, string $category): bool
     {
         $lowerPath = strtolower($path);
         $lowerCategory = strtolower($category);
@@ -318,27 +232,6 @@ class ClearanceMiddleware
             || str_starts_with($lowerPath, $lowerCategory.'/')
             || $lowerPath === 'browse/'.$lowerCategory
             || str_starts_with($lowerPath, 'browse/'.$lowerCategory.'/');
-    }
-
-    public function matchesCategoryPathNative(string $path, string $category): bool
-    {
-        $ffi = self::mediaFfi();
-        if ($ffi === null) {
-            return $this->matchesCategoryPathPhp($path, $category);
-        }
-
-        // @phpstan-ignore method.notFound
-        $res = $ffi->nntmux_clearance_matches_category_path(
-            $path,
-            \strlen($path),
-            $category,
-            \strlen($category),
-        );
-        if (! \is_int($res) || $res < 0) {
-            return $this->matchesCategoryPathPhp($path, $category);
-        }
-
-        return $res === 1;
     }
 
     /**

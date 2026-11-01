@@ -28,12 +28,9 @@ use App\Services\Nzb\NzbService;
 use App\Services\ReleaseExtraService;
 use App\Services\ReleaseImageService;
 use App\Services\TempWorkspaceService;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\ServiceProvider;
-use Throwable;
 
 /**
  * Service provider for Additional Processing services.
@@ -41,77 +38,6 @@ use Throwable;
  */
 class AdditionalProcessingServiceProvider extends ServiceProvider
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_w356_dto_provider(uint8_t operation, const char *input, size_t input_len, char *output, size_t output_capacity);
-        C;
-
-    // PHP remains the default until the complete caller clears the 1.5x gate.
-    private const bool RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function setUseRustFfi(?bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-        if ($enabled === null) {
-            self::$ffi = null;
-        }
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
-    }
-
-    private static function rust(string $input, int $capacity): ?string
-    {
-        if (strlen($input) > 16_777_216 || $capacity < 1 || $capacity > 16_777_216) {
-            return null;
-        }
-        try {
-            self::$ffi ??= RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-            if (self::$ffi === false) {
-                return null;
-            }
-            $output = self::$ffi->new("char[{$capacity}]");
-            // @phpstan-ignore method.notFound
-            $written = self::$ffi->nntmux_w356_dto_provider(5, $input, strlen($input), $output, $capacity);
-            if (! is_int($written) || $written < 1 || $written > $capacity) {
-                return null;
-            }
-
-            return FFI::string($output, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** Missing, negative and nonfinite timings contribute zero milliseconds. */
-    public static function normalizeQueryDurationMs(?float $timeMs): float
-    {
-        return (self::usesRustFfi() ? self::normalizeQueryDurationMsNative($timeMs) : null)
-            ?? self::normalizeQueryDurationMsPhp($timeMs);
-    }
-
-    public static function normalizeQueryDurationMsPhp(?float $timeMs): float
-    {
-        return $timeMs !== null && is_finite($timeMs) && $timeMs > 0.0 ? $timeMs : 0.0;
-    }
-
-    public static function normalizeQueryDurationMsNative(?float $timeMs): ?float
-    {
-        $bytes = self::rust(pack('d', $timeMs ?? NAN), 8);
-        if ($bytes === null || strlen($bytes) !== 8) {
-            return null;
-        }
-        /** @var array{time: float} $result */
-        $result = unpack('dtime', $bytes);
-
-        return $result['time'];
-    }
-
     /**
      * Register services.
      */
@@ -262,7 +188,7 @@ class AdditionalProcessingServiceProvider extends ServiceProvider
     public function boot(PersistenceMetricsCollector $persistenceMetrics): void
     {
         DB::listen(static function (QueryExecuted $query) use ($persistenceMetrics): void {
-            $persistenceMetrics->recordDatabaseStatement(self::normalizeQueryDurationMs($query->time));
+            $persistenceMetrics->recordDatabaseStatement($query->time);
         });
 
         $this->app->terminating(function (): void {

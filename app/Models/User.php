@@ -13,9 +13,7 @@ use App\Notifications\VerifyEmailBranded;
 use App\Rules\ValidEmailDomain;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\InvitationService;
-use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
-use FFI;
 use Illuminate\Auth\MustVerifyEmail as MustVerifyEmailTrait;
 use Illuminate\Contracts\Auth\CanResetPassword as CanResetPasswordContract;
 use Illuminate\Contracts\Auth\MustVerifyEmail as MustVerifyEmailContract;
@@ -44,7 +42,6 @@ use Spatie\LaravelPasskeys\Models\Concerns\InteractsWithPasskeys;
 use Spatie\LaravelPasskeys\Models\Passkey;
 use Spatie\Permission\Models\Role;
 use Spatie\Permission\Traits\HasRoles;
-use Throwable;
 
 /**
  * @property int $id
@@ -176,22 +173,6 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
         'User',
         'FreeUser',
     ];
-
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_w361_user_gdpr_auth(uint8_t operation, const char *input, size_t input_len, char *out_buf, size_t out_cap);
-        C;
-
-    private const array API_QUOTA_REASONS = ['unverified', 'admin', 'within_quota', 'quota_exhausted'];
-
-    /**
-     * PHP remains the default: the paired benchmark in
-     * tests/Unit/RustUserGdprAuthEventsProviderParityTest.php is below 1.5x.
-     */
-    private const bool RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
 
     /**
      * Days in a year for subscription calculations.
@@ -1897,104 +1878,5 @@ final class User extends Authenticatable implements CanResetPasswordContract, Ha
     public function getTimezone(): string
     {
         return $this->timezone ?? 'UTC';
-    }
-
-    public static function setUseRustFfi(?bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-        if ($enabled === null) {
-            self::$ffi = null;
-        }
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Unverified users are always refused; admins are unlimited; other users are allowed
-     * while their nonnegative request count stays below the nonnegative daily maximum.
-     *
-     * @return array{current_requests: int, max_requests: int, allowed: bool, unlimited: bool, remaining: int|null, reason: string}
-     */
-    public static function summarizeApiQuotaDecision(int $currentRequests, int $maxRequests, bool $isAdmin, bool $isVerified): array
-    {
-        return (self::usesRustFfi() ? self::summarizeApiQuotaDecisionNative($currentRequests, $maxRequests, $isAdmin, $isVerified) : null)
-            ?? self::summarizeApiQuotaDecisionPhp($currentRequests, $maxRequests, $isAdmin, $isVerified);
-    }
-
-    /**
-     * @return array{current_requests: int, max_requests: int, allowed: bool, unlimited: bool, remaining: int|null, reason: string}
-     */
-    public static function summarizeApiQuotaDecisionPhp(int $currentRequests, int $maxRequests, bool $isAdmin, bool $isVerified): array
-    {
-        $current = max(0, $currentRequests);
-        $max = max(0, $maxRequests);
-        $decision = ['current_requests' => $current, 'max_requests' => $max];
-        if (! $isVerified) {
-            return $decision + ['allowed' => false, 'unlimited' => false, 'remaining' => 0, 'reason' => 'unverified'];
-        }
-        if ($isAdmin) {
-            return $decision + ['allowed' => true, 'unlimited' => true, 'remaining' => null, 'reason' => 'admin'];
-        }
-        $allowed = $current < $max;
-
-        return $decision + [
-            'allowed' => $allowed,
-            'unlimited' => false,
-            'remaining' => max(0, $max - $current),
-            'reason' => $allowed ? 'within_quota' : 'quota_exhausted',
-        ];
-    }
-
-    /**
-     * @return array{current_requests: int, max_requests: int, allowed: bool, unlimited: bool, remaining: int|null, reason: string}|null
-     */
-    public static function summarizeApiQuotaDecisionNative(int $currentRequests, int $maxRequests, bool $isAdmin, bool $isVerified): ?array
-    {
-        $bytes = self::rust(2, pack('q4', $currentRequests, $maxRequests, (int) $isAdmin, (int) $isVerified));
-        if ($bytes === null || strlen($bytes) !== 48) {
-            return null;
-        }
-        /** @var array{1: int, 2: int, 3: int, 4: int, 5: int, 6: int} $fields */
-        $fields = unpack('q6', $bytes);
-        $reason = self::API_QUOTA_REASONS[$fields[6]] ?? null;
-        if ($reason === null || ($fields[3] !== 0 && $fields[3] !== 1) || ($fields[4] !== 0 && $fields[4] !== 1) || $fields[5] < -1) {
-            return null;
-        }
-
-        return [
-            'current_requests' => $fields[1],
-            'max_requests' => $fields[2],
-            'allowed' => $fields[3] === 1,
-            'unlimited' => $fields[4] === 1,
-            'remaining' => $fields[5] === -1 ? null : $fields[5],
-            'reason' => $reason,
-        ];
-    }
-
-    private static function rust(int $operation, string $input): ?string
-    {
-        try {
-            self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
-            if (self::$ffi === false) {
-                return null;
-            }
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch(self::$ffi, strlen($input) + 128, $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = self::$ffi->nntmux_w361_user_gdpr_auth($operation, $input, strlen($input), $buffer, $capacity);
-            if (! is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-
-            return FFI::string($buffer, $written);
-        } catch (Throwable) {
-            return null;
-        }
     }
 }

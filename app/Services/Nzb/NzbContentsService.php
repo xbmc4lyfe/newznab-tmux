@@ -11,57 +11,22 @@ use App\Services\NfoService;
 use App\Services\NNTP\NNTPService;
 use App\Services\PostProcessService;
 use App\Support\Par2RenameProgress;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use JsonException;
 use RuntimeException;
 use SimpleXMLElement;
 use Throwable;
 use UnexpectedValueException;
-use WeakMap;
 
 /**
  * Service for processing NZB contents - extracting NFO files, PAR2 information,
  * and calculating release completion from NZB files.
- *
- * {@see par2Candidates()} runs in Rust (`nntmux_nzb_par2_candidates_batch` in
- * `rust/pipeline-ffi/src/predb_feeds.rs`) over the source {@see loadNzb()} parsed (or the element's `asXML()`)
- * when the pipeline library is available, and the PAR2 progress signature is hashed there too;
- * {@see par2CandidatesPhp()} remains the fallback and parity reference. {@see par2FamilyKeyNative()}
- * (`nntmux_par2_family_key`) is kept for parity tests only: one FFI call per subject did not reach the 1.5x gate.
- * {@see parseNzb()} classifies NFO/PAR2 candidates and completion in Rust straight from the NZB source
- * ({@see scanNzb()}); {@see scanNzbFilesPhp()} remains the fallback and parity reference.
  */
 class NzbContentsService
 {
-    private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_nzb_par2_candidates_batch(const char *xml, size_t xml_len, uint32_t raw, int64_t max_bytes, const char *families, size_t families_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_par2_family_key(const char *subject, size_t subject_len, char *out_buf, size_t out_cap);
-        ssize_t nntmux_par2_signature_sha256(const char *head, size_t head_len, const char *manifest, size_t manifest_len, const char *tail, size_t tail_len, char *out_hex);
-        C;
-
-    private static bool $useRustFfi = true;
-
-    private static FFI|false|null $ffi = null;
-
-    /**
-     * Default for the Wave 40.2 toggle only; it stays false because the paired benchmark in
-     * tests/Unit/RustNzbServiceParserManifestWriteContentsW40ParityTest.php is below 1.5x.
-     */
-    public const bool W402_RUST_FFI_DEFAULT = false;
-
-    /** Fixed lower-case extensions for {@see summarizeArchiveMediaBreakdown()}: 0 archive, 1 PAR2, 2 NFO/SFV, 3 media. */
-    private const array W402_EXTENSION_SLOTS = ['rar' => 0, '7z' => 0, 'par2' => 1, 'nfo' => 2, 'sfv' => 2, 'avi' => 3, 'flac' => 3, 'm2ts' => 3, 'm4a' => 3,
-        'm4v' => 3, 'mkv' => 3, 'mov' => 3, 'mp3' => 3, 'mp4' => 3, 'mpeg' => 3, 'mpg' => 3, 'ogg' => 3, 'ts' => 3, 'wav' => 3, 'webm' => 3, 'wmv' => 3];
-
-    private static ?bool $useW402RustFfi = null;
-
     protected NzbService $nzbService;
 
     protected NzbParserService $parserService;
@@ -83,16 +48,10 @@ class NzbContentsService
 
     private bool $par2StructureValid = true;
 
-    /** JSON encoding of the manifest (subject, classification and raw segment attributes per file). */
-    private string $par2Manifest = '[]';
+    /** @var list<array<string, mixed>> */
+    private array $par2Manifest = [];
 
     private int $par2NonExplicitBytes = 0;
-
-    /** Rust's JSON encoding of the last par2Candidates() result, identical to json_encode(); null after PHP. */
-    private ?string $par2CandidatesJson = null;
-
-    /** @var WeakMap<SimpleXMLElement, string>|null NZB source text of documents returned by loadNzb() */
-    private ?WeakMap $nzbSources = null;
 
     public function __construct(
         ?NzbService $nzbService = null,
@@ -185,22 +144,76 @@ class NzbContentsService
      */
     public function parseNzb(string $guid, int $relID, int $groupID, bool $nfoCheck = false): bool|array
     {
-        $scan = $this->scanNzb($guid, $nfoCheck, $this->lookupPar2);
-        if ($scan === null) {
+        $nzbFile = $this->loadNzb($guid);
+        if ($nzbFile === false) {
             return false;
         }
-        $nfoMessageId = $scan['nfo'];
 
-        // --- PAR2 Detection ---
-        // Parse the first .par2 index file (often small, but not always 1/1) whose first segment parses.
-        foreach ($scan['par2'] as $firstSegmentId) {
-            if ($this->postProcessService->parsePAR2($firstSegmentId, $relID, $groupID, $this->nntp, 1) === true) {
-                Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
+        $messageID = $hiddenID = '';
+        $actualParts = $artificialParts = 0;
+        // Initialize foundPAR2 based on settings; if lookupPar2 is false, we don't need to find one.
+        $foundPAR2 = $this->lookupPar2 === false;
+        // Initialize NFO flags based on whether we are checking for NFOs.
+        $foundNFO = $hiddenNFO = $nfoCheck === false;
+        $nfoMessageId = null; // Store potential NFO message ID here
+        $hasNonPar2File = false;
+        foreach ($nzbFile->file as $nzbContents) {
+            if (preg_match('/\.par2(?:["\s]|$)/i', (string) $nzbContents->attributes()->subject) !== 1) {
+                $hasNonPar2File = true;
                 break;
             }
         }
 
-        $completion = $scan['completion'];
+        foreach ($nzbFile->file as $nzbContents) {
+            $segmentCountInFile = 0;
+            $firstSegmentId = null; // Initialize here for each file
+            foreach ($nzbContents->segments->segment as $segment) {
+                $actualParts++;
+                $segmentCountInFile++;
+                // Store the first segment ID of the current file, potentially useful for NFO/PAR2
+                if ($segmentCountInFile === 1) {
+                    $firstSegmentId = (string) $segment;
+                }
+            }
+
+            $subject = (string) $nzbContents->attributes()->subject;
+
+            // Calculate artificial parts from subject
+            $artificialParts += $this->parserService->extractPartsTotal($subject);
+
+            // --- NFO Detection ---
+            // Check for explicit NFO files first (with enhanced patterns)
+            if ($nfoCheck && ! $foundNFO && isset($firstSegmentId)) {
+                $nfoDetection = $this->parserService->detectNfoFile($subject);
+                if ($nfoDetection !== false) {
+                    $nfoMessageId = ['hidden' => $nfoDetection['hidden'], 'id' => $firstSegmentId, 'priority' => $nfoDetection['priority']];
+                    $foundNFO = true;
+                }
+            }
+
+            // Check for potential "hidden" NFOs with improved detection
+            // Only consider this if an explicit NFO wasn't found yet
+            if ($nfoCheck && ! $foundNFO && ! $hiddenNFO && isset($firstSegmentId)) {
+                $hiddenNfoDetection = $this->parserService->detectHiddenNfoFile($subject, $segmentCountInFile);
+                if ($hiddenNfoDetection !== false) {
+                    $nfoMessageId = ['hidden' => $hiddenNfoDetection['hidden'], 'id' => $firstSegmentId, 'priority' => $hiddenNfoDetection['priority']];
+                    $hiddenNFO = true;
+                }
+            }
+
+            // --- PAR2 Detection ---
+            // Look specifically for the .par2 index file (often small, but not always 1/1)
+            if ($this->lookupPar2 && $hasNonPar2File && ! $foundPAR2 && isset($firstSegmentId) && $this->parserService->detectPar2IndexFile($subject)) {
+                // Attempt to parse the PAR2 file using its first segment ID
+                if ($this->postProcessService->parsePAR2($firstSegmentId, $relID, $groupID, $this->nntp, 1) === true) {
+                    Release::query()->where('id', $relID)->update(['proc_par2' => 1]);
+                    $foundPAR2 = true;
+                }
+            }
+        } // End foreach $nzbFile->file
+
+        // Calculate completion
+        $completion = $this->calculateCompletion($actualParts, $artificialParts);
 
         Release::query()->where('id', $relID)->update(['completion' => $completion]);
 
@@ -229,22 +242,6 @@ class NzbContentsService
      */
     public function loadNzb(string $guid): SimpleXMLElement|false
     {
-        $nzbContents = $this->readNzbSource($guid);
-        if ($nzbContents === false) {
-            return false;
-        }
-
-        $nzb = $this->parserService->parseNzbXml($nzbContents, $this->echoOutput, $guid);
-        if ($nzb !== false && self::$useRustFfi) {
-            $this->nzbSources ??= new WeakMap;
-            $this->nzbSources[$nzb] = $nzbContents;
-        }
-
-        return $nzb;
-    }
-
-    private function readNzbSource(string $guid): string|false
-    {
         $nzbContents = $this->nzbService->readNzbContents($guid);
         if (empty($nzbContents)) {
             if ($this->echoOutput) {
@@ -254,7 +251,7 @@ class NzbContentsService
             return false;
         }
 
-        return $nzbContents;
+        return $this->parserService->parseNzbXml($nzbContents, $this->echoOutput, $guid);
     }
 
     /**
@@ -345,8 +342,8 @@ class NzbContentsService
             $maxArticleBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
             $maxStateBytes = max(1, (int) config('tmux.fix_names.par2_max_state_bytes', 8388608));
             $alternate = $this->alternateNntp;
-            $signature = $this->par2Signature(['guid' => $guid, 'group' => $groupID, 'article_limit' => $maxArticleBytes,
-                'state_limit' => $maxStateBytes, 'alternate' => $alternate], $candidates);
+            $signature = hash('sha256', json_encode(['guid' => $guid, 'group' => $groupID, 'article_limit' => $maxArticleBytes,
+                'state_limit' => $maxStateBytes, 'alternate' => $alternate, 'manifest' => $this->par2Manifest, 'candidates' => $candidates], JSON_THROW_ON_ERROR));
             $progress = $this->strictPar2Progress($relID, $signature, count($candidates));
             $offset = $progress['offset'] ?? 0;
             $retry = [];
@@ -496,145 +493,6 @@ class NzbContentsService
         return false;
     }
 
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function useW402RustFfi(?bool $use): void
-    {
-        self::$useW402RustFfi = $use;
-    }
-
-    public static function usesW402RustFfi(): bool
-    {
-        return self::$useW402RustFfi ?? self::W402_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW402RustFfi(): void
-    {
-        self::$useW402RustFfi = null;
-    }
-
-    /**
-     * Classify NZB member filenames by the ASCII case-insensitive text after their last dot: `rar`, `7z`, `r` plus two or
-     * three digits, or three digits after `.7z` are archive volumes; then `par2` is recovery, `nfo`/`sfv` text and a known
-     * media extension media. Non-strings, names without a dot and every other extension are other.
-     *
-     * @param  array<array-key, mixed>  $filenames
-     * @return array{members: int, archive: int, par2: int, text: int, media: int, other: int}
-     */
-    public static function summarizeArchiveMediaBreakdown(array $filenames): array
-    {
-        return (self::usesW402RustFfi() ? self::summarizeArchiveMediaBreakdownNative($filenames) : null)
-            ?? self::summarizeArchiveMediaBreakdownPhp($filenames);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $filenames
-     * @return array{members: int, archive: int, par2: int, text: int, media: int, other: int}
-     */
-    private static function summarizeArchiveMediaBreakdownPhp(array $filenames): array
-    {
-        $counts = [0, 0, 0, 0, 0];
-        foreach ($filenames as $filename) {
-            $counts[self::archiveMediaSlot($filename)]++;
-        }
-
-        return self::archiveMediaSummary(\count($filenames), $counts);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $filenames
-     * @return array{members: int, archive: int, par2: int, text: int, media: int, other: int}|null
-     */
-    private static function summarizeArchiveMediaBreakdownNative(array $filenames): ?array
-    {
-        $size = 16 + 8 * \count($filenames);
-        foreach ($filenames as $filename) {
-            $size += \is_string($filename) ? \strlen($filename) : 0;
-        }
-        if ($size > NzbService::W402_MAX_INPUT) {
-            return null;
-        }
-        $words = [0, \count($filenames)];
-        $tail = '';
-        foreach ($filenames as $filename) {
-            $words[] = \is_string($filename) ? \strlen($filename) : -1;
-            $tail .= \is_string($filename) ? $filename : '';
-        }
-        $slots = NzbService::evaluateW402Native(2, pack('q*', ...$words).$tail, 6);
-        if ($slots === null) {
-            return null;
-        }
-        [$count, $archive, $par2, $text, $media, $other] = $slots;
-        if ($count !== \count($filenames) || min($archive, $par2, $text, $media, $other) < 0 || $archive + $par2 + $text + $media + $other !== $count) {
-            return null;
-        }
-
-        return self::archiveMediaSummary($count, [$archive, $par2, $text, $media, $other]);
-    }
-
-    /** 0 archive, 1 PAR2, 2 NFO/SFV, 3 media, 4 other. */
-    private static function archiveMediaSlot(mixed $filename): int
-    {
-        $dot = \is_string($filename) ? strrpos($filename, '.') : false;
-        if ($dot === false) {
-            return 4;
-        }
-        $extension = strtolower(substr($filename, $dot + 1));
-        if (isset(self::W402_EXTENSION_SLOTS[$extension])) {
-            return self::W402_EXTENSION_SLOTS[$extension];
-        }
-        // `r` plus two or three digits, or three digits after `.7z`, is an archive volume.
-        if (preg_match('/\A(r\d\d\d?|\d\d\d)\z/', $extension) === 1
-            && ($extension[0] === 'r' || ($dot >= 3 && strtolower(substr($filename, $dot - 3, 3)) === '.7z'))) {
-            return 0;
-        }
-
-        return 4;
-    }
-
-    /**
-     * @param  array{int, int, int, int, int}  $counts  archive, PAR2, text, media, other
-     * @return array{members: int, archive: int, par2: int, text: int, media: int, other: int}
-     */
-    private static function archiveMediaSummary(int $members, array $counts): array
-    {
-        return ['members' => $members, 'archive' => $counts[0], 'par2' => $counts[1], 'text' => $counts[2], 'media' => $counts[3], 'other' => $counts[4]];
-    }
-
-    /**
-     * sha256 of json_encode($head + ['manifest' => manifest, 'candidates' => $candidates]), built from the
-     * pre-encoded manifest (and Rust's candidate JSON when par2Candidates() ran in Rust).
-     *
-     * @param  array<string, mixed>  $head
-     * @param  list<array<string, mixed>>  $candidates
-     */
-    private function par2Signature(array $head, array $candidates): string
-    {
-        $prefix = substr(json_encode($head, JSON_THROW_ON_ERROR), 0, -1).',"manifest":';
-        $suffix = ',"candidates":'.($this->par2CandidatesJson ?? json_encode($candidates, JSON_THROW_ON_ERROR)).'}';
-        $ffi = self::$useRustFfi ? (self::$ffi ??= RustPipelineLibrary::resolveDomain('nzb_par2_candidates', self::FFI_CDEF) ?? false) : false;
-        if ($ffi !== false) {
-            try {
-                $digest = $ffi->new('char[64]');
-                // @phpstan-ignore method.notFound
-                if ($ffi->nntmux_par2_signature_sha256($prefix, strlen($prefix), $this->par2Manifest, strlen($this->par2Manifest), $suffix, strlen($suffix), $digest) === 64) {
-                    return FFI::string($digest, 64);
-                }
-            } catch (Throwable) {
-                // Hash in PHP below.
-            }
-        }
-        $hash = hash_init('sha256');
-        hash_update($hash, $prefix);
-        hash_update($hash, $this->par2Manifest);
-        hash_update($hash, $suffix);
-
-        return hash_final($hash);
-    }
-
     private function par2FamilyKey(string $subject): ?string
     {
         $subject = preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject) ?? $subject;
@@ -648,31 +506,6 @@ class NzbContentsService
         $name = preg_replace('/\.vol\d+\+\d+\.par2$/i', '.par2', $name) ?? $name;
 
         return preg_match('/\.par2$/i', $name) === 1 ? $name : null;
-    }
-
-    /**
-     * Rust equivalent of {@see par2FamilyKey()}; $supported is false when the library is unavailable.
-     */
-    public function par2FamilyKeyNative(string $subject, bool &$supported = false): ?string
-    {
-        $supported = false;
-        $ffi = self::$ffi ??= RustPipelineLibrary::resolveDomain('nzb_par2_candidates', self::FFI_CDEF) ?? false;
-        if ($ffi === false) {
-            return null;
-        }
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, strlen($subject) + 16, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_par2_family_key($subject, strlen($subject), $scratch, $capacity);
-        if (! is_int($written) || $written < -1) {
-            return null;
-        }
-        $supported = true;
-
-        return $written === -1 ? null : FFI::string($scratch, $written);
     }
 
     /**
@@ -753,96 +586,11 @@ class NzbContentsService
     /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
     private function par2Candidates(SimpleXMLElement $nzb): array
     {
-        $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
-
-        return (self::$useRustFfi ? $this->par2CandidatesNative($nzb, $maxBytes) : null) ?? $this->par2CandidatesPhp($nzb, $maxBytes);
-    }
-
-    /**
-     * Rust {@see par2CandidatesPhp()} over the document's `asXML()` output, or null when PHP must decide: library
-     * missing, a parser override or non-C locale (subject patterns), or a document outside the reproduced subset.
-     *
-     * @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}>|null
-     */
-    private function par2CandidatesNative(SimpleXMLElement $nzb, int $maxBytes): ?array
-    {
-        if ($this->parserService::class !== NzbParserService::class
-            || ! in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true)) {
-            return null;
-        }
-        $ffi = self::$ffi ??= RustPipelineLibrary::resolveDomain('nzb_par2_candidates', self::FFI_CDEF) ?? false;
-        if ($ffi === false) {
-            return null;
-        }
-        $source = $this->nzbSources[$nzb] ?? null;
-        $raw = $source !== null;
-        $output = $raw ? $this->par2CandidatesCall($ffi, $source, true, $maxBytes) : null;
-        if ($output === null) {
-            // The source scan declines what libxml normalizes (such as literal tabs in attribute values); the
-            // serialization does not. A child element serializes without its document's encoding declaration.
-            $source = $nzb->asXML();
-            $raw = false;
-            if (! is_string($source) || ! str_starts_with($source, '<?xml')) {
-                return null;
-            }
-            $output = $this->par2CandidatesCall($ffi, $source, false, $maxBytes);
-        }
-        if ($output !== null && $output[0] === 'F') {
-            // Family keys outside Rust's lowercase table: repeat the scan with mb_strtolower's answers.
-            $lower = implode("\0", array_map(mb_strtolower(...), explode("\0", substr($output, 1))));
-            $output = $this->par2CandidatesCall($ffi, $source, $raw, $maxBytes, $lower);
-        }
-        if ($output === null || $output[0] === 'F') {
-            return null;
-        }
-        $parts = explode("\n", $output);
-        if (count($parts) !== 3) {
-            return null;
-        }
-        try {
-            /** @var list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> $candidates */
-            $candidates = json_decode($parts[1], true, 8, JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
-            return null;
-        }
-        $this->par2Manifest = $parts[0];
-        $this->par2CandidatesJson = $parts[1];
-        $this->par2StructureValid = $parts[2][0] === '1';
-        $this->par2NonExplicitBytes = (int) substr($parts[2], 1);
-
-        return $candidates;
-    }
-
-    /** Output of `nntmux_nzb_par2_candidates_batch`, or null when Rust declined the document. */
-    private function par2CandidatesCall(FFI $ffi, string $xml, bool $raw, int $maxBytes, string $families = ''): ?string
-    {
-        $length = strlen($xml);
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 4096, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_nzb_par2_candidates_batch($xml, $length, (int) $raw, $maxBytes, $families, strlen($families), $scratch, $capacity);
-        if (is_int($written) && $written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_nzb_par2_candidates_batch($xml, $length, (int) $raw, $maxBytes, $families, strlen($families), $scratch, $capacity);
-        }
-
-        return is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
-    }
-
-    /** @return list<array{subject:string,explicit:bool,segments:list<array{number:int,id:string,bytes:int}>,classification:string}> */
-    private function par2CandidatesPhp(SimpleXMLElement $nzb, int $maxBytes): array
-    {
-        $explicit = $volumes = $firstVolumes = $matchingVolumes = $indexFamilies = $families = $legacy = $hidden = $manifest = [];
-        $this->par2CandidatesJson = null;
+        $explicit = $volumes = $firstVolumes = $matchingVolumes = $indexFamilies = $families = $legacy = $hidden = [];
+        $this->par2Manifest = [];
         $this->par2NonExplicitBytes = 0;
         $this->par2StructureValid = count($nzb->file) > 0;
+        $maxBytes = max(1, (int) config('tmux.fix_names.par2_max_probe_bytes', 2097152));
         foreach ($nzb->file as $file) {
             $subject = (string) $file->attributes()->subject;
             $segments = $raw = [];
@@ -875,7 +623,7 @@ class NzbContentsService
                     $classification = $singlePart && preg_match('/\.(par[" ]|\d{2,3}").+\(1\/1\)/i', $subject) === 1 ? 'legacy' : 'hidden';
                 }
             }
-            $manifest[] = ['subject' => $subject, 'classification' => $classification, 'segments' => $raw];
+            $this->par2Manifest[] = ['subject' => $subject, 'classification' => $classification, 'segments' => $raw];
             if (! $valid && $classification !== 'excluded') {
                 $this->par2StructureValid = false;
             }
@@ -904,7 +652,6 @@ class NzbContentsService
                 }
             }
         }
-        $this->par2Manifest = json_encode($manifest, JSON_THROW_ON_ERROR);
         uasort($hidden, static fn (array $left, array $right): int => $left['segments'][0]['bytes'] <=> $right['segments'][0]['bytes']);
 
         foreach ($firstVolumes as $key => $candidate) {
@@ -916,225 +663,6 @@ class NzbContentsService
 
         // Family matches affect priority only; standalone and later volumes remain resumable.
         return array_values($explicit + $matchingVolumes + $legacy + $hidden + $firstVolumes + $volumes);
-    }
-
-    /**
-     * Load the NZB and classify its files for {@see parseNzb()}: segment totals, completion, the NFO
-     * candidate (explicit names win over the first hidden candidate) and, when $par2 is set and a
-     * non-PAR2 file exists, the first-segment ids of PAR2 index files in document order. Null when the
-     * NZB cannot be read or parsed.
-     *
-     * Rust (`nntmux_nzb_classify_nfo_par2_packed`) scans the source directly when the library is
-     * available, skipping the SimpleXML parse; documents it declines take {@see loadNzb()} and
-     * {@see scanNzbFilesPhp()}, which remain the fallback and parity reference. Subclasses (which may
-     * override loading or completion) and custom parsers keep the PHP path.
-     *
-     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}|null
-     */
-    protected function scanNzb(string $guid, bool $nfoCheck, bool $par2): ?array
-    {
-        if (! self::$useRustFfi || static::class !== self::class || $this->parserService::class !== NzbParserService::class) {
-            $nzbFile = $this->loadNzb($guid);
-
-            return $nzbFile === false ? null : $this->scanNzbFilesPhp($nzbFile, $nfoCheck, $par2);
-        }
-        $nzbContents = $this->readNzbSource($guid);
-        if ($nzbContents === false) {
-            return null;
-        }
-        $scan = $this->scanNzbFilesNative($nzbContents, $nfoCheck, $par2);
-        if ($scan !== null) {
-            // parseNzbXml() leaves libxml's internal error handling enabled; keep that process state.
-            libxml_use_internal_errors(true);
-
-            return $scan;
-        }
-        $nzbFile = $this->parserService->parseNzbXml($nzbContents, $this->echoOutput, $guid);
-
-        return $nzbFile === false ? null : $this->scanNzbFilesPhp($nzbFile, $nfoCheck, $par2);
-    }
-
-    /**
-     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}
-     */
-    public function scanNzbFilesPhp(SimpleXMLElement $nzbFile, bool $nfoCheck, bool $par2): array
-    {
-        $files = $actualParts = $artificialParts = 0;
-        // Initialize NFO flags based on whether we are checking for NFOs.
-        $foundNFO = $hiddenNFO = $nfoCheck === false;
-        $nfoMessageId = null; // Store potential NFO message ID here
-        $par2Ids = [];
-        $hasNonPar2File = false;
-        foreach ($nzbFile->file as $nzbContents) {
-            if (preg_match('/\.par2(?:["\s]|$)/i', (string) $nzbContents->attributes()->subject) !== 1) {
-                $hasNonPar2File = true;
-                break;
-            }
-        }
-
-        foreach ($nzbFile->file as $nzbContents) {
-            $files++;
-            $segmentCountInFile = 0;
-            $firstSegmentId = null; // Initialize here for each file
-            foreach ($nzbContents->segments->segment as $segment) {
-                $actualParts++;
-                $segmentCountInFile++;
-                // Store the first segment ID of the current file, potentially useful for NFO/PAR2
-                if ($segmentCountInFile === 1) {
-                    $firstSegmentId = (string) $segment;
-                }
-            }
-
-            $subject = (string) $nzbContents->attributes()->subject;
-
-            // Calculate artificial parts from subject
-            $artificialParts += $this->parserService->extractPartsTotal($subject);
-
-            // --- NFO Detection ---
-            // Check for explicit NFO files first (with enhanced patterns)
-            if (! $foundNFO && isset($firstSegmentId)) {
-                $nfoDetection = $this->parserService->detectNfoFile($subject);
-                if ($nfoDetection !== false) {
-                    $nfoMessageId = ['hidden' => $nfoDetection['hidden'], 'id' => $firstSegmentId, 'priority' => $nfoDetection['priority']];
-                    $foundNFO = true;
-                }
-            }
-
-            // Check for potential "hidden" NFOs with improved detection
-            // Only consider this if an explicit NFO wasn't found yet
-            if (! $foundNFO && ! $hiddenNFO && isset($firstSegmentId)) {
-                $hiddenNfoDetection = $this->parserService->detectHiddenNfoFile($subject, $segmentCountInFile);
-                if ($hiddenNfoDetection !== false) {
-                    $nfoMessageId = ['hidden' => $hiddenNfoDetection['hidden'], 'id' => $firstSegmentId, 'priority' => $hiddenNfoDetection['priority']];
-                    $hiddenNFO = true;
-                }
-            }
-
-            // Look specifically for the .par2 index file; parseNzb() parses them in this order.
-            if ($par2 && $hasNonPar2File && isset($firstSegmentId) && $this->parserService->detectPar2IndexFile($subject)) {
-                $par2Ids[] = $firstSegmentId;
-            }
-        }
-
-        return [
-            'files' => $files,
-            'actual' => $actualParts,
-            'artificial' => $artificialParts,
-            'completion' => $this->calculateCompletion($actualParts, $artificialParts),
-            'nfo' => $nfoMessageId,
-            'par2' => $par2Ids,
-        ];
-    }
-
-    /**
-     * Rust {@see scanNzbFilesPhp()} over the NZB source, or null when PHP must decide (library missing,
-     * non-C locale, or a document outside the strict subset the scanner reproduces).
-     *
-     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}|null
-     */
-    public function scanNzbFilesNative(string $source, bool $nfoCheck, bool $par2): ?array
-    {
-        $ffi = NzbParserService::nfoCandidateFfi();
-        if ($ffi === null) {
-            return null;
-        }
-        $output = self::classifyCall($ffi, 'nntmux_nzb_classify_nfo_par2_packed', $source, (int) $nfoCheck | ($par2 ? 2 : 0));
-
-        return $output === null ? null : self::decodeScan($output, null);
-    }
-
-    /**
-     * Rust batch over subjects and segment counts collected from SimpleXML
-     * (`nntmux_nzb_classify_nfo_par2_batch_nul`). Kept for parity tests: the SimpleXML walk it still
-     * needs dominates, so it does not reach the 1.5x gate.
-     *
-     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}|null
-     */
-    public function scanNzbFilesBatchNative(SimpleXMLElement $nzbFile, bool $nfoCheck, bool $par2): ?array
-    {
-        $ffi = NzbParserService::nfoCandidateFfi();
-        if ($ffi === null) {
-            return null;
-        }
-        $records = '';
-        $firstIds = [];
-        foreach ($nzbFile->file as $file) {
-            $count = 0;
-            $first = '';
-            foreach ($file->segments->segment as $segment) {
-                if ($count++ === 0) {
-                    $first = (string) $segment;
-                }
-            }
-            $subject = (string) $file->attributes()->subject;
-            if (str_contains($subject, "\0")) {
-                return null;
-            }
-            $records .= $subject."\0".$count."\0";
-            $firstIds[] = $first;
-        }
-        $output = self::classifyCall($ffi, 'nntmux_nzb_classify_nfo_par2_batch_nul', $records, (int) $nfoCheck | ($par2 ? 2 : 0));
-
-        return $output === null ? null : self::decodeScan($output, $firstIds);
-    }
-
-    private static function classifyCall(FFI $ffi, string $function, string $input, int $flags): ?string
-    {
-        $length = \strlen($input);
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 4096, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-        $written = $ffi->$function($input, $length, $flags, $scratch, $capacity);
-        if (\is_int($written) && $written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-            if ($scratch === null) {
-                return null;
-            }
-            $written = $ffi->$function($input, $length, $flags, $scratch, $capacity);
-        }
-
-        return \is_int($written) && $written > 0 ? FFI::string($scratch, $written) : null;
-    }
-
-    /**
-     * Decode the scanner record; $firstIds maps file indexes to ids for the batch variant.
-     *
-     * @param  list<string>|null  $firstIds
-     * @return array{files:int,actual:int,artificial:int,completion:float,nfo:array{hidden:bool,id:string,priority:int}|null,par2:list<string>}|null
-     */
-    private static function decodeScan(string $output, ?array $firstIds): ?array
-    {
-        /** @var array{files:int,actual:int,artificial:int,completion:float,kind:int,priority:int,index:int,length:int}|false $head */
-        $head = unpack('Pfiles/Pactual/Partificial/ecompletion/Ckind/Cpriority/Vindex/Vlength', $output);
-        if ($head === false) {
-            return null;
-        }
-        $offset = 42;
-        $nfo = null;
-        if ($head['kind'] !== 0) {
-            $nfo = ['hidden' => $head['kind'] === 2, 'id' => $firstIds === null ? substr($output, $offset, $head['length']) : $firstIds[$head['index']], 'priority' => $head['priority']];
-        }
-        $offset += $head['length'];
-        $count = unpack('V', $output, $offset)[1] ?? 0;
-        $offset += 4;
-        $par2 = [];
-        for ($i = 0; $i < $count; $i++) {
-            [, $index, $length] = unpack('V2', $output, $offset) ?: [0, 0, 0];
-            $offset += 8;
-            $par2[] = $firstIds === null ? substr($output, $offset, $length) : $firstIds[$index];
-            $offset += $length;
-        }
-
-        return [
-            'files' => $head['files'],
-            'actual' => $head['actual'],
-            'artificial' => $head['artificial'],
-            'completion' => $head['completion'],
-            'nfo' => $nfo,
-            'par2' => $par2,
-        ];
     }
 
     /**
@@ -1189,188 +717,5 @@ class NzbContentsService
     public function getEchoOutput(): bool
     {
         return $this->echoOutput;
-    }
-
-    /** Wave 55.2 paired benchmarks decide this default; see RustNfoServiceDbNzbStoreNfoImportNzbContentsParserW55ParityTest. */
-    private const bool W55_RUST_FFI_DEFAULT = true;
-
-    private const string W55_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w552_nzb_par2_family_plan_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Wave 55 routing, binding and output buffer, kept in function-local statics. Operations:
-     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
-     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
-     * least $val words (null without the library).
-     */
-    private static function w55RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w55', self::W55_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w55RustFfiState('ffi');
-                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return [$ffi, $out, $capacity];
-            default:
-                return $enabled;
-        }
-    }
-
-    public static function usesW55RustFfi(): bool
-    {
-        $enabled = self::w55RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W55_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with planPar2FamilyBatch() routed to Rust ($enabled) or PHP, then restores the previous
-     * routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW55RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w55RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w55RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Batch PAR2 family plan over file subjects, grouping them by par2FamilyKey(). Two words per
-     * subject: `flags | min(key length, 0xFFFFFF) << 8 | crc32(key) << 32` and the index of the
-     * first subject with the same key (-1 without a key). Flags: 1 has a key, 2 an earlier
-     * subject has the key, 4 a `.volN+M` member suffix was folded, 8 quoted name, 16 bare `.par2`
-     * token, 32 a leading `[n/m]` was removed. Keyed subjects, distinct families, volume members,
-     * prefixed subjects, the largest family and the XXH64 digest of all earlier words follow.
-     *
-     * @param  list<string>  $subjects
-     * @return list<int>
-     */
-    public static function planPar2FamilyBatch(array $subjects): array
-    {
-        return self::usesW55RustFfi() ? self::planPar2FamilyBatchNative($subjects) : self::planPar2FamilyBatchPhp($subjects);
-    }
-
-    /**
-     * @param  list<string>  $subjects
-     * @return list<int>
-     */
-    public static function planPar2FamilyBatchPhp(array $subjects): array
-    {
-        $out = $families = $sizes = [];
-        $keyed = $volumes = $prefixed = $largest = 0;
-        foreach (array_values($subjects) as $i => $subject) {
-            [$key, $flags] = self::w55Par2Family($subject);
-            $volumes += ($flags & 4) !== 0 ? 1 : 0;
-            $prefixed += ($flags & 32) !== 0 ? 1 : 0;
-            if ($key === null) {
-                array_push($out, $flags, -1);
-
-                continue;
-            }
-            $keyed++;
-            if (isset($families[$key])) {
-                $flags |= 2;
-                $first = $families[$key];
-                $largest = max($largest, ++$sizes[$key]);
-            } else {
-                $first = $families[$key] = $i;
-                $sizes[$key] = 1;
-                $largest = max($largest, 1);
-            }
-            array_push($out, 1 | $flags | min(\strlen($key), 0xFFFFFF) << 8 | crc32($key) << 32, $first);
-        }
-        array_push($out, $keyed, \count($families), $volumes, $prefixed, $largest);
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-        $out[] = $digest[1];
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, PCRE's character tables are not
-     * the default (C) ones, a subject holds a NUL byte, or the subjects are not a list.
-     *
-     * @param  list<string>  $subjects
-     * @return list<int>
-     */
-    public static function planPar2FamilyBatchNative(array $subjects): array
-    {
-        $count = \count($subjects);
-        $words = 2 * $count + 6;
-        /** @var array{FFI, CData, int}|null $state */
-        $state = $count === 0 ? null : self::w55RustFfiState('out', $words);
-        if ($state === null || ! array_is_list($subjects) || ! NzbParserService::pcreUsesDefaultTables()) {
-            return self::planPar2FamilyBatchPhp($subjects);
-        }
-        $blob = implode("\0", $subjects);
-        [$ffi, $out, $cap] = $state;
-        try {
-            // @phpstan-ignore method.notFound (Declared by W55_FFI_CDEF.)
-            $written = $ffi->nntmux_w552_nzb_par2_family_plan_batch($blob, \strlen($blob), $count, $out, $cap);
-        } catch (Throwable) {
-            $written = -1;
-        }
-        /** @var array<int, int>|false $values */
-        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
-
-        return \is_array($values) ? array_values($values) : self::planPar2FamilyBatchPhp($subjects);
-    }
-
-    /**
-     * par2FamilyKey() with its source flags (see planPar2FamilyBatch()).
-     *
-     * @return array{string|null, int}
-     */
-    private static function w55Par2Family(string $subject): array
-    {
-        $flags = 0;
-        $stripped = preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject, -1, $prefixes);
-        if ($stripped !== null && $prefixes > 0) {
-            [$subject, $flags] = [$stripped, 32];
-        }
-        if (preg_match('/"([^"]+\.par2)"/i', $subject, $match) === 1) {
-            [$name, $flags] = [$match[1], $flags | 8];
-        } elseif (preg_match('/(?:^|\s)([^\s"]+\.par2)(?=\s|$)/i', $subject, $match) === 1) {
-            [$name, $flags] = [$match[1], $flags | 16];
-        } else {
-            $name = trim($subject, " \t\"'");
-        }
-        $folded = preg_replace('/\.vol\d+\+\d+\.par2$/i', '.par2', $name, -1, $volumes);
-        if ($folded !== null && $volumes > 0) {
-            [$name, $flags] = [$folded, $flags | 4];
-        }
-
-        return [preg_match('/\.par2$/i', $name) === 1 ? $name : null, $flags];
     }
 }

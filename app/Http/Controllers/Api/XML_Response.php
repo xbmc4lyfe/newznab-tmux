@@ -29,26 +29,12 @@ use App\Models\Category;
 use App\Services\Api\V1\ReleaseItemPayloadBuilder;
 use App\Services\Api\V1\ReleaseRows;
 use App\Services\Api\V1\XmlResponseContext;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
-use Throwable;
 
 /**
  * Class XMLReturn.
  */
 class XML_Response
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_api_build_cdata(const char *pairs_nul, size_t pairs_len, size_t pair_count, uint32_t tz_is_utc, char *out_buf, size_t out_cap);
-        C;
-
-    private static FFI|false|null $ffi = null;
-
-    private static ?CData $outBuf1024 = null;
-
-    private static bool $useRustFfi = true;
-
     /**
      * @var string The buffered cData before final write
      */
@@ -803,16 +789,6 @@ class XML_Response
 		</li>\n";
     }
 
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
     /**
      * Accepts an array of values to loop through to build cData from the release info.
      *
@@ -821,157 +797,21 @@ class XML_Response
      */
     protected function buildCdata(array $columns): string
     {
-        return self::buildCdataForRelease($this->release, $columns);
-    }
-
-    /**
-     * Retains native PHP string interpolation in production under the < 1.5x FFI threshold
-     * (`0.83x` mean / `0.49x` p99 on movie cData and `1.31x` mean / `1.29x` p99 on music cData
-     * due to per-column PHP property lookup and NUL-packing overhead); see `buildCdataForReleaseNative`.
-     *
-     * @param  array<int|string, mixed>  $columns
-     */
-    public static function buildCdataForRelease(mixed $release, array $columns): string
-    {
-        return self::buildCdataForReleasePhp($release, $columns);
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $columns
-     *
-     * @param-out bool $supported
-     */
-    public static function buildCdataForReleaseNative(mixed $release, array $columns, bool &$supported = false): ?string
-    {
-        $supported = false;
-        if (! self::$useRustFfi || (! \is_object($release) && ! \is_array($release))) {
-            return null;
-        }
-        if ($columns === []) {
-            $supported = true;
-
-            return '';
-        }
-
-        $flat = [];
-        $pairCount = 0;
-        $isObj = \is_object($release);
-        foreach ($columns as $info) {
-            if (! \is_string($info) || $info === '') {
-                return null;
-            }
-            $raw = $isObj ? ($release->$info ?? null) : ($release[$info] ?? null);
-            if (! empty($raw)) {
-                if (! \is_scalar($raw) && ! (\is_object($raw) && \method_exists($raw, '__toString'))) {
-                    return null;
-                }
-                $flat[] = $info;
-                $flat[] = (string) $raw;
-                $pairCount++;
-            }
-        }
-        if ($pairCount === 0) {
-            $supported = true;
-
-            return '';
-        }
-
-        $packed = \implode("\0", $flat);
-        if (\substr_count($packed, "\0") !== ($pairCount * 2 - 1)) {
-            return null;
-        }
-
-        $ffi = self::$ffi ?? self::resolveFfi();
-        $buf = self::$outBuf1024;
-        if ($ffi === null || $ffi === false || $buf === null) {
-            return null;
-        }
-
-        $tzIsUtc = \date_default_timezone_get() === 'UTC' ? 1 : 0;
-        $packedLen = \strlen($packed);
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_api_build_cdata($packed, $packedLen, $pairCount, $tzIsUtc, $buf, 1024);
-            if (! \is_int($written) || $written === -1 || $written === -2) {
-                return null;
-            }
-            if ($written < -2) {
-                $cap = 0;
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_api_build_cdata($packed, $packedLen, $pairCount, $tzIsUtc, $scratch, $cap);
-                if (! \is_int($written) || $written < 0) {
-                    return null;
-                }
-                $supported = true;
-
-                return $written === 0 ? '' : FFI::string($scratch, $written);
-            }
-
-            $supported = true;
-
-            return $written === 0 ? '' : FFI::string($buf, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $columns
-     */
-    public static function buildCdataForReleasePhp(mixed $release, array $columns): string
-    {
-        if (! \is_object($release) && ! \is_array($release)) {
-            return '';
-        }
-
         $cData = '';
-        $isObj = \is_object($release);
 
         foreach ($columns as $info) {
-            if (! \is_string($info) || $info === '') {
-                continue;
-            }
-            $value = $isObj ? ($release->$info ?? null) : ($release[$info] ?? null);
-            if (! empty($value)) {
+            if (! empty($this->release->$info)) {
                 if ($info === 'mu_releasedate') {
                     $ucInfo = 'Released';
-                    $rDate = date('Y-m-d', strtotime((string) $value));
+                    $rDate = date('Y-m-d', strtotime((string) $this->release->$info));
                     $cData .= "<li>{$ucInfo}: {$rDate}</li>\n";
                 } else {
                     $ucInfo = ucfirst(preg_replace('/^[a-z]{2}_/i', '', $info));
-                    $cData .= "<li>{$ucInfo}: {$value}</li>\n";
+                    $cData .= "<li>{$ucInfo}: {$this->release->$info}</li>\n";
                 }
             }
         }
 
         return $cData;
-    }
-
-    private static function resolveFfi(): ?FFI
-    {
-        if (self::$ffi !== null) {
-            return self::$ffi === false ? null : self::$ffi;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('xml_response', self::FFI_CDEF);
-        if ($ffi === null) {
-            self::$ffi = false;
-
-            return null;
-        }
-        try {
-            self::$outBuf1024 = $ffi->new('char[1024]');
-            self::$ffi = $ffi;
-
-            return $ffi;
-        } catch (Throwable) {
-            self::$ffi = false;
-
-            return null;
-        }
     }
 }

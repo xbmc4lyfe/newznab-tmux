@@ -4,77 +4,11 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
-use Throwable;
 
 class UpdateNNTmuxDB extends Command
 {
-    private const FFI_CDEF = <<<'CDEF'
-int32_t nntmux_installer_migration_mode(const char *env, size_t env_len, uint8_t seed);
-CDEF;
-
-    // The end-to-end FFI benchmark must qualify before changing this default.
-    private const bool RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useRustFfi = null;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
-    }
-
-    public static function setUseRustFfi(?bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    private static function additionalFfi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi instanceof FFI ? self::$ffi : null;
-    }
-
-    /** @return array{migrate: array<string, bool>, seed: bool} */
-    public static function normalizeMigrationMode(string $appEnv, bool $seedRequested): array
-    {
-        return self::usesRustFfi()
-            ? self::normalizeMigrationModeNative($appEnv, $seedRequested)
-            : self::normalizeMigrationModePhp($appEnv, $seedRequested);
-    }
-
-    /** @return array{migrate: array<string, bool>, seed: bool} */
-    public static function normalizeMigrationModePhp(string $appEnv, bool $seedRequested): array
-    {
-        return ['migrate' => $appEnv === 'production' ? ['--force' => true] : [], 'seed' => $seedRequested];
-    }
-
-    /** @return array{migrate: array<string, bool>, seed: bool} */
-    public static function normalizeMigrationModeNative(string $appEnv, bool $seedRequested): array
-    {
-        try {
-            $ffi = self::additionalFfi();
-            if ($ffi !== null) {
-                // @phpstan-ignore method.notFound
-                $mode = $ffi->nntmux_installer_migration_mode($appEnv, strlen($appEnv), (int) $seedRequested);
-                if (is_int($mode) && $mode >= 0 && $mode <= 3) {
-                    return ['migrate' => ($mode & 1) !== 0 ? ['--force' => true] : [], 'seed' => ($mode & 2) !== 0];
-                }
-            }
-        } catch (Throwable) {
-            // Fall back without changing migration or seeder semantics.
-        }
-
-        return self::normalizeMigrationModePhp($appEnv, $seedRequested);
-    }
-
     /**
      * The name and signature of the console command.
      */
@@ -119,7 +53,7 @@ CDEF;
             $this->runMigrations();
 
             // Run seeders if requested
-            if (self::normalizeMigrationMode((string) app()->environment(), (bool) $this->option('seed'))['seed']) {
+            if ($this->option('seed')) {
                 $this->info('🌱 Running database seeders...');
                 $this->runSeeders();
             }
@@ -223,7 +157,11 @@ CDEF;
      */
     private function runMigrations(): void
     {
-        $migrateOptions = self::normalizeMigrationMode((string) app()->environment(), false)['migrate'];
+        $migrateOptions = [];
+
+        if (app()->environment('production')) {
+            $migrateOptions['--force'] = true;
+        }
 
         $exitCode = $this->call('migrate', $migrateOptions);
 
@@ -239,7 +177,11 @@ CDEF;
      */
     private function runSeeders(): void
     {
-        $seedOptions = self::normalizeMigrationMode((string) app()->environment(), true)['migrate'];
+        $seedOptions = [];
+
+        if (app()->environment('production')) {
+            $seedOptions['--force'] = true;
+        }
 
         $exitCode = $this->call('db:seed', $seedOptions);
 

@@ -141,9 +141,3 @@ docker/Justfile		-binary text eol=lf
 /rust/fingerprint-worker/Cargo.lock -binary text eol=lf
 /rust/fingerprint-worker/**/*.rs -binary text eol=lf
 /rust/fingerprint-worker/**/*.py -binary text eol=lf
-/rust/pipeline-ffi/Cargo.toml -binary text eol=lf
-/rust/pipeline-ffi/Cargo.lock -binary text eol=lf
-/rust/pipeline-ffi/**/*.rs -binary text eol=lf
-
-# Everything under the new indexer workspace is source and must stay reviewable and mergeable.
-/rust/indexer/** -binary text eol=lf

@@ -13,8 +13,6 @@ use App\Models\User;
 use App\Models\UserDownload;
 use App\Models\UserRequest;
 use App\Services\AdminDashboardSnapshotService;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Contracts\View\View;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Http\JsonResponse;
@@ -25,404 +23,11 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use Spatie\LaravelPasskeys\Models\Passkey;
 use Spatie\Permission\Models\Role;
-use Throwable;
 
 class AdminUserController extends BasePageController
 {
-    private const FFI_CDEF = <<<'CDEF'
-ssize_t nntmux_admin_user_signup_error_message(
-    int64_t code,
-    uint8_t *out_buf,
-    size_t out_cap
-);
-ssize_t nntmux_admin_user_build_order_urls_nul(
-    const char *order_types_nul_ptr,
-    size_t order_types_nul_len,
-    size_t count,
-    const char *base_url_ptr,
-    size_t base_url_len,
-    uint8_t *out_buf,
-    size_t out_cap
-);
-int32_t nntmux_admin_user_normalize_bulk_ids(
-    const int64_t *in_ids,
-    size_t count,
-    int64_t *out_ids,
-    size_t out_cap,
-    size_t *out_unique_count
-);
-ssize_t nntmux_admin_user_format_passkey_wipe_nul(
-    int64_t target_user_id,
-    const char *target_username_ptr,
-    size_t target_username_len,
-    int64_t wiped_count,
-    uint8_t *out_buf,
-    size_t out_cap
-);
-CDEF;
-
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = false;
-        self::$ffi = null;
-    }
-
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = (bool) $useRustFfi;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi = null): void
-    {
-        self::$ffi = $ffi;
-    }
-
-    public static function resolveSignupErrorMessage(int $code): string
-    {
-        if (self::$useRustFfi) {
-            return self::resolveSignupErrorMessageNative($code);
-        }
-
-        return self::resolveSignupErrorMessagePhp($code);
-    }
-
-    public static function resolveSignupErrorMessagePhp(int $code): string
-    {
-        return match ($code) {
-            SignupError::BAD_USERNAME->value => 'Bad username. Try a better one.',
-            SignupError::BAD_PASSWORD->value => 'Bad password. Try a longer one.',
-            SignupError::BAD_EMAIL->value => 'Bad email.',
-            SignupError::USERNAME_IN_USE->value => 'Username in use.',
-            SignupError::EMAIL_IN_USE->value => 'Email in use.',
-            default => 'Unknown save error.',
-        };
-    }
-
-    public static function resolveSignupErrorMessageNative(int $code): string
-    {
-        $ffi = self::additionalFfi();
-        if (! $ffi instanceof FFI) {
-            return self::resolveSignupErrorMessagePhp($code);
-        }
-
-        try {
-            $cap = 64;
-            $outBuf = $ffi->new("uint8_t[{$cap}]");
-
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_admin_user_signup_error_message($code, $outBuf, $cap);
-            if (! is_int($written) || $written <= 0) {
-                return self::resolveSignupErrorMessagePhp($code);
-            }
-
-            return FFI::string($outBuf, $written);
-        } catch (Throwable) {
-            return self::resolveSignupErrorMessagePhp($code);
-        }
-    }
-
     /**
-     * @param  array<int, string>  $ordering
-     * @return array<string, string>
-     */
-    public static function buildAdminUserOrderByUrls(array $ordering, ?string $baseUrl = null): array
-    {
-        $resolvedBaseUrl = $baseUrl ?? url('admin/user-list');
-        if (self::$useRustFfi) {
-            return self::buildAdminUserOrderByUrlsNative($ordering, $resolvedBaseUrl);
-        }
-
-        return self::buildAdminUserOrderByUrlsPhp($ordering, $resolvedBaseUrl);
-    }
-
-    /**
-     * @param  array<int, string>  $ordering
-     * @return array<string, string>
-     */
-    public static function buildAdminUserOrderByUrlsPhp(array $ordering, string $baseUrl = 'admin/user-list'): array
-    {
-        $orderByUrls = [];
-        foreach ($ordering as $orderType) {
-            $orderByUrls['orderby'.$orderType] = $baseUrl.'?ob='.$orderType;
-        }
-
-        return $orderByUrls;
-    }
-
-    /**
-     * @param  array<int, string>  $ordering
-     * @return array<string, string>
-     */
-    public static function buildAdminUserOrderByUrlsNative(array $ordering, string $baseUrl = 'admin/user-list'): array
-    {
-        if ($ordering === []) {
-            return [];
-        }
-
-        $ffi = self::additionalFfi();
-        if (! $ffi instanceof FFI) {
-            return self::buildAdminUserOrderByUrlsPhp($ordering, $baseUrl);
-        }
-
-        foreach ($ordering as $orderType) {
-            if (! is_string($orderType) || str_contains($orderType, "\0")) {
-                return self::buildAdminUserOrderByUrlsPhp($ordering, $baseUrl);
-            }
-        }
-
-        try {
-            $count = count($ordering);
-            $joined = implode("\0", $ordering);
-            $cap = max(256, $count * (strlen($baseUrl) + 48) + strlen($joined) * 2);
-            $outBuf = $ffi->new("uint8_t[{$cap}]");
-
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_admin_user_build_order_urls_nul(
-                $joined,
-                strlen($joined),
-                $count,
-                $baseUrl,
-                strlen($baseUrl),
-                $outBuf,
-                $cap
-            );
-            if (! is_int($written) || $written <= 0) {
-                return self::buildAdminUserOrderByUrlsPhp($ordering, $baseUrl);
-            }
-
-            $parts = explode("\0", FFI::string($outBuf, $written));
-            if (count($parts) !== $count * 2) {
-                return self::buildAdminUserOrderByUrlsPhp($ordering, $baseUrl);
-            }
-
-            $urls = [];
-            for ($i = 0; $i < $count; $i++) {
-                $urls[$parts[$i * 2]] = $parts[$i * 2 + 1];
-            }
-
-            return $urls;
-        } catch (Throwable) {
-            return self::buildAdminUserOrderByUrlsPhp($ordering, $baseUrl);
-        }
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $userIds
-     * @return list<int>
-     */
-    public static function normalizeBulkUserIds(array $userIds): array
-    {
-        if (self::$useRustFfi) {
-            return self::normalizeBulkUserIdsNative($userIds);
-        }
-
-        return self::normalizeBulkUserIdsPhp($userIds);
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $userIds
-     * @return list<int>
-     */
-    public static function normalizeBulkUserIdsPhp(array $userIds): array
-    {
-        return array_values(array_unique(array_map('intval', $userIds)));
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $userIds
-     * @return list<int>
-     */
-    public static function normalizeBulkUserIdsNative(array $userIds): array
-    {
-        if ($userIds === []) {
-            return [];
-        }
-
-        $ffi = self::additionalFfi();
-        if (! $ffi instanceof FFI) {
-            return self::normalizeBulkUserIdsPhp($userIds);
-        }
-
-        try {
-            $intValues = array_values(array_map('intval', $userIds));
-            $count = count($intValues);
-            $inIds = $ffi->new("int64_t[{$count}]");
-            $outIds = $ffi->new("int64_t[{$count}]");
-            $outUniqueCount = $ffi->new('size_t[1]');
-
-            for ($i = 0; $i < $count; $i++) {
-                $inIds[$i] = $intValues[$i];
-            }
-
-            // @phpstan-ignore method.notFound
-            $rc = $ffi->nntmux_admin_user_normalize_bulk_ids(
-                $inIds,
-                $count,
-                $outIds,
-                $count,
-                $outUniqueCount
-            );
-            $uniqueCount = $outUniqueCount[0];
-            if ($rc !== 1 || ! is_int($uniqueCount) || $uniqueCount < 0 || $uniqueCount > $count) {
-                return self::normalizeBulkUserIdsPhp($userIds);
-            }
-
-            $result = [];
-            for ($i = 0; $i < $uniqueCount; $i++) {
-                $val = $outIds[$i];
-                if (! is_int($val)) {
-                    return self::normalizeBulkUserIdsPhp($userIds);
-                }
-                $result[] = $val;
-            }
-
-            return $result;
-        } catch (Throwable) {
-            return self::normalizeBulkUserIdsPhp($userIds);
-        }
-    }
-
-    /**
-     * @return array{
-     *     log_message: string,
-     *     audit_context: array{
-     *         admin_user_id: int|null,
-     *         target_user_id: int,
-     *         target_username: string,
-     *         wiped_count: int
-     *     },
-     *     message: string,
-     *     redirect_url: string
-     * }
-     */
-    public static function formatPasskeyWipeOutcome(
-        ?int $adminUserId,
-        int $targetUserId,
-        string $targetUsername,
-        int $wipedCount
-    ): array {
-        if (self::$useRustFfi) {
-            return self::formatPasskeyWipeOutcomeNative($adminUserId, $targetUserId, $targetUsername, $wipedCount);
-        }
-
-        return self::formatPasskeyWipeOutcomePhp($adminUserId, $targetUserId, $targetUsername, $wipedCount);
-    }
-
-    /**
-     * @return array{
-     *     log_message: string,
-     *     audit_context: array{
-     *         admin_user_id: int|null,
-     *         target_user_id: int,
-     *         target_username: string,
-     *         wiped_count: int
-     *     },
-     *     message: string,
-     *     redirect_url: string
-     * }
-     */
-    public static function formatPasskeyWipeOutcomePhp(
-        ?int $adminUserId,
-        int $targetUserId,
-        string $targetUsername,
-        int $wipedCount
-    ): array {
-        return [
-            'log_message' => 'Admin wiped user passkeys',
-            'audit_context' => [
-                'admin_user_id' => $adminUserId,
-                'target_user_id' => $targetUserId,
-                'target_username' => $targetUsername,
-                'wiped_count' => $wipedCount,
-            ],
-            'message' => "{$wipedCount} passkeys removed from {$targetUsername}. They can now regain access with their password or an admin-issued reset.",
-            'redirect_url' => 'admin/user-edit?id='.$targetUserId,
-        ];
-    }
-
-    /**
-     * @return array{
-     *     log_message: string,
-     *     audit_context: array{
-     *         admin_user_id: int|null,
-     *         target_user_id: int,
-     *         target_username: string,
-     *         wiped_count: int
-     *     },
-     *     message: string,
-     *     redirect_url: string
-     * }
-     */
-    public static function formatPasskeyWipeOutcomeNative(
-        ?int $adminUserId,
-        int $targetUserId,
-        string $targetUsername,
-        int $wipedCount
-    ): array {
-        $ffi = self::additionalFfi();
-        if (! $ffi instanceof FFI) {
-            return self::formatPasskeyWipeOutcomePhp($adminUserId, $targetUserId, $targetUsername, $wipedCount);
-        }
-
-        try {
-            $cap = max(256, strlen($targetUsername) + 224);
-            $outBuf = $ffi->new("uint8_t[{$cap}]");
-
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_admin_user_format_passkey_wipe_nul(
-                $targetUserId,
-                $targetUsername,
-                strlen($targetUsername),
-                $wipedCount,
-                $outBuf,
-                $cap
-            );
-            if (! is_int($written) || $written <= 0) {
-                return self::formatPasskeyWipeOutcomePhp($adminUserId, $targetUserId, $targetUsername, $wipedCount);
-            }
-
-            $parts = explode("\0", FFI::string($outBuf, $written));
-            if (count($parts) < 3) {
-                return self::formatPasskeyWipeOutcomePhp($adminUserId, $targetUserId, $targetUsername, $wipedCount);
-            }
-
-            return [
-                'log_message' => $parts[0],
-                'audit_context' => [
-                    'admin_user_id' => $adminUserId,
-                    'target_user_id' => $targetUserId,
-                    'target_username' => $targetUsername,
-                    'wiped_count' => $wipedCount,
-                ],
-                'message' => $parts[1],
-                'redirect_url' => $parts[2],
-            ];
-        } catch (Throwable) {
-            return self::formatPasskeyWipeOutcomePhp($adminUserId, $targetUserId, $targetUsername, $wipedCount);
-        }
-    }
-
-    /**
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function index(AdminUserListRequest $request): View
     {
@@ -443,7 +48,10 @@ CDEF;
         )->withQueryString();
 
         // Build order by URLs
-        $orderByUrls = self::buildAdminUserOrderByUrls($ordering);
+        $orderByUrls = [];
+        foreach ($ordering as $orderType) {
+            $orderByUrls['orderby'.$orderType] = url('admin/user-list?ob='.$orderType);
+        }
 
         $this->viewData = array_merge($this->viewData, [
             'username' => $variables['username'],
@@ -466,7 +74,7 @@ CDEF;
     /**
      * @return RedirectResponse|\Illuminate\View\View
      *
-     * @throws \Exception|Throwable
+     * @throws \Exception|\Throwable
      */
     public function edit(Request $request)
     {
@@ -634,7 +242,14 @@ CDEF;
                     return redirect()->to('admin/user-list');
                 }
 
-                $error = self::resolveSignupErrorMessage((int) $ret);
+                $error = match ($ret) {
+                    SignupError::BAD_USERNAME->value => 'Bad username. Try a better one.',
+                    SignupError::BAD_PASSWORD->value => 'Bad password. Try a longer one.',
+                    SignupError::BAD_EMAIL->value => 'Bad email.',
+                    SignupError::USERNAME_IN_USE->value => 'Username in use.',
+                    SignupError::EMAIL_IN_USE->value => 'Email in use.',
+                    default => 'Unknown save error.',
+                };
                 $user += [
                     'id' => $request->input('id'),
                     'username' => $request->input('username'),
@@ -689,7 +304,7 @@ CDEF;
             'user_ids.*' => ['integer', 'exists:users,id'],
         ]);
 
-        $userIds = self::normalizeBulkUserIds($validated['user_ids']);
+        $userIds = array_values(array_unique(array_map('intval', $validated['user_ids'])));
 
         if ($validated['action'] === 'delete') {
             $count = $this->bulkActionUsersQuery($userIds)->delete();
@@ -841,40 +456,23 @@ CDEF;
         $wipedCount = $target->passkeys()->count();
         $target->passkeys()->delete();
 
-        $adminId = Auth::id();
-        $outcome = self::formatPasskeyWipeOutcome(
-            is_int($adminId) ? $adminId : (is_numeric($adminId) ? (int) $adminId : null),
-            (int) $target->id,
-            (string) $target->username,
-            $wipedCount
-        );
+        Log::channel('admin')->warning('Admin wiped user passkeys', [
+            'admin_user_id' => Auth::id(),
+            'target_user_id' => $target->id,
+            'target_username' => $target->username,
+            'wiped_count' => $wipedCount,
+        ]);
 
-        Log::channel('admin')->warning($outcome['log_message'], $outcome['audit_context']);
+        $message = "{$wipedCount} passkeys removed from {$target->username}. They can now regain access with their password or an admin-issued reset.";
 
         if ($request->expectsJson()) {
             return response()->json([
                 'ok' => true,
                 'wiped_count' => $wipedCount,
-                'message' => $outcome['message'],
+                'message' => $message,
             ]);
         }
 
-        return redirect()->to($outcome['redirect_url'])->with('success', $outcome['message']);
-    }
-
-    private static function additionalFfi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
+        return redirect()->to('admin/user-edit?id='.$target->id)->with('success', $message);
     }
 }

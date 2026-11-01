@@ -7,11 +7,8 @@ namespace App\Support;
 use App\Services\NameFixing\FileNameCleaner;
 use App\Services\NameFixing\SeasonPackDetector;
 use App\Services\Nzb\NzbSourceGuard;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
-use Throwable;
 
 /** Durable archive scope; processing statuses and retained file rows are not completeness proof. */
 final class ReleaseArchiveNamingEvidence
@@ -24,27 +21,7 @@ final class ReleaseArchiveNamingEvidence
 
     private const SCOPES = ['unknown', 'incomplete', 'complete_single', 'multi_episode'];
 
-    private const int DECODE_NAMES_RUST_MIN_JSON_BYTES = 256;
-
-    private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_archive_witness_bounded_names_nul(const char *input, size_t input_len, size_t count, uint8_t *overflow_out, char *out_buf, size_t out_cap);
-        ssize_t nntmux_archive_witness_decode_names_json(const char *json, size_t json_len, char *out_buf, size_t out_cap);
-        C;
-
-    private static ?FFI $ffi = null;
-
-    private static bool $ffiResolved = false;
-
-    private static ?CData $overflowOut = null;
-
-    private static bool $useRustFfi = true;
-
     public function __construct(private readonly NzbSourceGuard $sources) {}
-
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
 
     /**
      * Call inside the same guarded transaction as inventory/status writes. False
@@ -243,82 +220,6 @@ final class ReleaseArchiveNamingEvidence
      */
     private function boundedNames(array $names): array
     {
-        // Retain native PHP path in production: marshaling a PHP array<string> via implode("\0")
-        // and explode("\0") across FFI achieves 0.51x-0.77x vs in-engine array_unique().
-        return self::boundedNamesPhp($names);
-    }
-
-    /**
-     * @param  list<string>  $names
-     * @return array{list<string>, bool}|null
-     */
-    public static function boundedNamesNative(array $names): ?array
-    {
-        $count = count($names);
-        if ($count === 0) {
-            return [[], false];
-        }
-        $ffi = self::ffi();
-        if ($ffi === null || self::$overflowOut === null) {
-            return null;
-        }
-        $joined = implode("\0", $names);
-        if (substr_count($joined, "\0") !== $count - 1) {
-            return null;
-        }
-        $len = strlen($joined);
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(512, $len + 64), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_archive_witness_bounded_names_nul(
-                $joined,
-                $len,
-                $count,
-                FFI::addr(self::$overflowOut),
-                $scratch,
-                $cap,
-            );
-            if (! is_int($written) || $written === -1) {
-                return null;
-            }
-            if ($written < -1) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_archive_witness_bounded_names_nul(
-                    $joined,
-                    $len,
-                    $count,
-                    FFI::addr(self::$overflowOut),
-                    $scratch,
-                    $cap,
-                );
-                if (! is_int($written) || $written < 0) {
-                    return null;
-                }
-            }
-            // @phpstan-ignore property.notFound
-            $overflow = ((int) self::$overflowOut->cdata) === 1;
-            $bounded = $written === 0 ? [] : explode("\0", FFI::string($scratch, $written));
-
-            return [$bounded, $overflow];
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * @param  list<string>  $names
-     * @return array{list<string>, bool}
-     */
-    private static function boundedNamesPhp(array $names): array
-    {
         $bounded = [];
         $overflow = false;
         $bytes = 0;
@@ -343,61 +244,6 @@ final class ReleaseArchiveNamingEvidence
     /** @return list<string> */
     private function decodeNames(string $json): array
     {
-        if (self::$useRustFfi && strlen($json) >= self::DECODE_NAMES_RUST_MIN_JSON_BYTES) {
-            $native = self::decodeNamesNative($json);
-            if ($native !== null) {
-                return $native;
-            }
-        }
-
-        return $this->decodeNamesPhp($json);
-    }
-
-    /**
-     * @return list<string>|null
-     */
-    public static function decodeNamesNative(string $json): ?array
-    {
-        $len = strlen($json);
-        if ($len === 0) {
-            return null;
-        }
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(512, $len + 64), $cap);
-        if ($scratch === null) {
-            return null;
-        }
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_archive_witness_decode_names_json($json, $len, $scratch, $cap);
-            if (! is_int($written) || $written === -1) {
-                return null;
-            }
-            if ($written < -1) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_archive_witness_decode_names_json($json, $len, $scratch, $cap);
-                if (! is_int($written) || $written < 0) {
-                    return null;
-                }
-            }
-
-            return $written === 0 ? [] : explode("\0", FFI::string($scratch, $written));
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @return list<string> */
-    private function decodeNamesPhp(string $json): array
-    {
         if (! str_starts_with(ltrim($json), '[')) {
             throw new RuntimeException('Malformed archive filename witnesses.');
         }
@@ -416,24 +262,6 @@ final class ReleaseArchiveNamingEvidence
         }
 
         return $names;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (! self::$ffiResolved) {
-            $ffi = RustPipelineLibrary::resolveDomain('support_archive_witness', self::FFI_CDEF);
-            if ($ffi !== null) {
-                try {
-                    self::$overflowOut = $ffi->new('uint8_t');
-                    self::$ffi = $ffi;
-                } catch (Throwable) {
-                    self::$ffi = null;
-                }
-            }
-            self::$ffiResolved = true;
-        }
-
-        return self::$ffi;
     }
 
     private function validateDigest(string $digest): void

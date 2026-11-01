@@ -4,12 +4,9 @@ declare(strict_types=1);
 
 namespace App\Models;
 
-use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
-use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
-use Throwable;
 
 /**
  * App\Models\UserMovie.
@@ -36,60 +33,12 @@ use Throwable;
  */
 class UserMovie extends Model
 {
-    private const FFI_CDEF = <<<'CDEF'
-ssize_t nntmux_user_movie_serialize_category_ids_nul(
-    const char *cats_ptr,
-    size_t cats_len,
-    size_t cats_count,
-    uint8_t *out_buf,
-    size_t out_cap
-);
-CDEF;
-
-    /**
-     * Production default stays PHP until paired benchmarks show >= 1.5x Rust speedup.
-     */
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
     /**
      * @var array<string>
      */
     protected $guarded = [];
 
     protected $dateFormat = false;
-
-    public static function enableRustFfi(): void
-    {
-        self::$useRustFfi = true;
-    }
-
-    public static function disableRustFfi(): void
-    {
-        self::$useRustFfi = false;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$useRustFfi = false;
-        self::$ffi = null;
-    }
-
-    public static function setUseRustFfi(bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi): void
-    {
-        self::$ffi = $ffi;
-    }
 
     /**
      * @param  array<int|string, mixed>  $catID
@@ -102,7 +51,7 @@ CDEF;
                 [
                     'users_id' => $uid,
                     'imdbid' => $imdbid,
-                    'categories' => self::serializeCategoryIds($catID),
+                    'categories' => ! empty($catID) ? implode('|', $catID) : 'NULL',
                     'created_at' => now(),
                 ]
             );
@@ -154,99 +103,6 @@ CDEF;
     {
         self::query()
             ->where(['users_id' => $uid, 'imdbid' => $imdbid])
-            ->update(['categories' => self::serializeCategoryIds($catID)]);
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $catIds
-     */
-    public static function serializeCategoryIds(array $catIds): string
-    {
-        if (self::$useRustFfi) {
-            return self::serializeCategoryIdsNative($catIds);
-        }
-
-        return self::serializeCategoryIdsPhp($catIds);
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $catIds
-     */
-    public static function serializeCategoryIdsPhp(array $catIds): string
-    {
-        return ! empty($catIds) ? implode('|', array_map(self::coerceString(...), $catIds)) : 'NULL';
-    }
-
-    /**
-     * @param  array<int|string, mixed>  $catIds
-     */
-    public static function serializeCategoryIdsNative(array $catIds): string
-    {
-        $ffi = self::additionalFfi();
-        if (! $ffi instanceof FFI) {
-            return self::serializeCategoryIdsPhp($catIds);
-        }
-
-        $parts = [];
-        foreach ($catIds as $catId) {
-            $str = self::coerceString($catId);
-            if (str_contains($str, "\0")) {
-                return self::serializeCategoryIdsPhp($catIds);
-            }
-            $parts[] = $str;
-        }
-
-        try {
-            $packed = implode("\0", $parts);
-            $cap = max(16, strlen($packed) + count($parts) + 8);
-            $out = $ffi->new("uint8_t[{$cap}]");
-
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_user_movie_serialize_category_ids_nul(
-                $packed,
-                strlen($packed),
-                count($parts),
-                $out,
-                $cap
-            );
-            if (! is_int($written) || $written < 0) {
-                return self::serializeCategoryIdsPhp($catIds);
-            }
-            if ($written === 0) {
-                return '';
-            }
-
-            return FFI::string($out, $written);
-        } catch (Throwable) {
-            return self::serializeCategoryIdsPhp($catIds);
-        }
-    }
-
-    private static function coerceString(mixed $value): string
-    {
-        if (is_string($value)) {
-            return $value;
-        }
-        if (is_int($value) || is_float($value) || is_bool($value)) {
-            return (string) $value;
-        }
-
-        return '';
-    }
-
-    private static function additionalFfi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
+            ->update(['categories' => ! empty($catID) ? implode('|', $catID) : 'NULL']);
     }
 }

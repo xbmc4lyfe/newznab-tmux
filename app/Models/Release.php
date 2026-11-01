@@ -7,8 +7,6 @@ namespace App\Models;
 use App\Facades\Search;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
@@ -22,7 +20,6 @@ use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
-use Throwable;
 
 /**
  * Properties from computed columns, joins, and subqueries.
@@ -62,31 +59,6 @@ use Throwable;
 class Release extends Model
 {
     use HasFactory; // @phpstan-ignore missingType.generics
-
-    /**
-     * Production default stays false: the paired benchmark in
-     * tests/Unit/RustReleaseModelDetailsFeedSourceParityTest.php is below 1.5x.
-     */
-    public const bool RUST_FFI_DEFAULT = false;
-
-    private const string RELEASE_GUID_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w374_release_guid_batch(
-            size_t count,
-            const char *input,
-            size_t input_len,
-            char *out_buf,
-            size_t out_cap
-        );
-        C;
-
-    /** Lowercase UUID (8-4-4-4-12) or legacy 40-character SHA-1 GUID. */
-    private const string RELEASE_GUID_PATTERN = '/\A(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{40})\z/';
-
-    private const string RELEASE_FIELD_SEPARATOR = "\x1F";
-
-    private static ?bool $releaseUseRustFfi = null;
-
-    private static FFI|false|null $releaseFfi = null;
 
     protected $dateFormat = false;
 
@@ -797,112 +769,5 @@ class Release extends Model
     public static function checkGuidForApi(mixed $guid): bool
     {
         return self::whereGuid($guid)->exists();
-    }
-
-    public static function useRustFfi(?bool $enabled = true): void
-    {
-        self::$releaseUseRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$releaseUseRustFfi ?? self::RUST_FFI_DEFAULT;
-    }
-
-    public static function resetRustFfi(): void
-    {
-        self::$releaseUseRustFfi = null;
-        self::$releaseFfi = null;
-    }
-
-    /**
-     * Trims and lowercases GUIDs, keeps the first occurrence of each UUID or legacy SHA-1 GUID in
-     * input order and counts malformed and repeated entries.
-     *
-     * @param  list<string>  $guids
-     * @return array{guids: list<string>, valid: int, invalid: int, duplicates: int}
-     */
-    public static function normalizeGuidBatch(array $guids): array
-    {
-        return self::usesRustFfi() ? self::normalizeGuidBatchNative($guids) : self::normalizeGuidBatchPhp($guids);
-    }
-
-    /**
-     * @param  list<string>  $guids
-     * @return array{guids: list<string>, valid: int, invalid: int, duplicates: int}
-     */
-    private static function normalizeGuidBatchNative(array $guids): array
-    {
-        $output = self::callReleaseNative(count($guids), implode(self::RELEASE_FIELD_SEPARATOR, $guids));
-        $fields = $output === null ? [] : explode(self::RELEASE_FIELD_SEPARATOR, $output);
-        if (count($fields) < 3 || count($fields) - 3 !== (int) $fields[0]) {
-            return self::normalizeGuidBatchPhp($guids);
-        }
-
-        return [
-            'guids' => array_slice($fields, 3),
-            'valid' => (int) $fields[0],
-            'invalid' => (int) $fields[1],
-            'duplicates' => (int) $fields[2],
-        ];
-    }
-
-    /**
-     * @param  list<string>  $guids
-     * @return array{guids: list<string>, valid: int, invalid: int, duplicates: int}
-     */
-    private static function normalizeGuidBatchPhp(array $guids): array
-    {
-        $unique = [];
-        $seen = [];
-        $invalid = 0;
-        $duplicates = 0;
-        foreach ($guids as $guid) {
-            $guid = strtolower(trim($guid));
-            if (preg_match(self::RELEASE_GUID_PATTERN, $guid) !== 1) {
-                $invalid++;
-            } elseif (isset($seen[$guid])) {
-                $duplicates++;
-            } else {
-                $seen[$guid] = true;
-                $unique[] = $guid;
-            }
-        }
-
-        return ['guids' => $unique, 'valid' => count($unique), 'invalid' => $invalid, 'duplicates' => $duplicates];
-    }
-
-    private static function callReleaseNative(int $count, string $input): ?string
-    {
-        self::$releaseFfi ??= RustPipelineLibrary::resolveDomain('metadata_w374', self::RELEASE_GUID_FFI_CDEF) ?? false;
-        if (self::$releaseFfi === false) {
-            return null;
-        }
-        $ffi = self::$releaseFfi;
-
-        try {
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($input) + 64, $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w374_release_guid_batch($count, $input, strlen($input), $buffer, $capacity);
-            if (is_int($written) && $written < -1) {
-                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($buffer === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w374_release_guid_batch($count, $input, strlen($input), $buffer, $capacity);
-            }
-            if (! is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-
-            return FFI::string($buffer, $written);
-        } catch (Throwable) {
-            return null;
-        }
     }
 }

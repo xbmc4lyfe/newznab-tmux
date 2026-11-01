@@ -69,10 +69,10 @@ on:
 permissions:
   contents: read
 
-# Keep manual measurements independent of automatic push coverage and never cancel runs.
+# Keep manual measurements independent of automatic push coverage.
 concurrency:
-  group: yenc-performance-${{ github.ref }}-${{ github.event_name }}-${{ github.run_id }}
-  cancel-in-progress: false
+  group: yenc-performance-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   paired-decoding:
@@ -84,7 +84,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: [spot, '${{ matrix.runner }}']
+    runs-on: ${{ matrix.runner == 'ubuntu-latest' && vars.NNTMUX_VBMI2_RUNNER && vars.NNTMUX_VBMI2_SHA == (github.event.pull_request.head.sha || github.sha) && vars.NNTMUX_VBMI2_RUNNER || matrix.runner }}
     # Keep the original comparison budget plus bounded diagnostics and upload time.
     timeout-minutes: 60
     env:
@@ -382,7 +382,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: [spot, '${{ matrix.runner }}']
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     env:
       RUST_TOOLCHAIN: '1.98.0'
@@ -633,7 +633,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
-    runs-on: [spot, '${{ matrix.runner }}']
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     env:
       RUST_TOOLCHAIN: '1.98.0'

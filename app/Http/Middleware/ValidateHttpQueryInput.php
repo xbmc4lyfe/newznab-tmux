@@ -5,15 +5,11 @@ declare(strict_types=1);
 namespace App\Http\Middleware;
 
 use App\Services\Api\ApiInputCanonicalizer;
-use App\Support\RustPipelineLibrary;
 use Closure;
-use FFI;
-use FFI\CData;
 use Illuminate\Http\Request;
 use JsonException;
 use stdClass;
 use Symfony\Component\HttpFoundation\Response;
-use Throwable;
 
 /**
  * Strict input contract for HTTP QUERY (RFC 10008) API requests.
@@ -28,32 +24,11 @@ use Throwable;
  */
 final class ValidateHttpQueryInput
 {
-    public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_http_is_json_media_type(const char *input, size_t input_len);
-        ssize_t nntmux_http_validate_query(const char *content_type, size_t content_type_len, uint32_t has_content_type, const char *raw_body, size_t raw_body_len, size_t max_body_bytes, const char *query_keys_nul, size_t query_keys_len, size_t query_keys_count, int32_t *out_status, char *out_buf, size_t out_cap);
-        C;
-
     private const MAX_PARAMETERS = 64;
 
     private const KEY_PATTERN = '/^[A-Za-z0-9_]{1,32}$/';
 
-    private static FFI|false|null $ffi = null;
-
-    private static ?CData $outStatus = null;
-
-    private static bool $useRustFfi = true;
-
     public function __construct(private readonly ApiInputCanonicalizer $canonicalizer) {}
-
-    public static function setUseRustFfi(bool $use): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
 
     /**
      * @param  Closure(Request): (Response)  $next
@@ -86,25 +61,9 @@ final class ValidateHttpQueryInput
     /**
      * @return array{status: int, message: string}|null
      */
-    public function validate(Request $request): ?array
+    private function validate(Request $request): ?array
     {
-        if (self::$useRustFfi) {
-            $supported = false;
-            $native = $this->validateNative($request, $supported);
-            if ($supported) {
-                return $native;
-            }
-        }
-
-        return $this->validatePhp($request);
-    }
-
-    /**
-     * @return array{status: int, message: string}|null
-     */
-    public function validatePhp(Request $request): ?array
-    {
-        if (! $this->isJsonMediaTypePhp($request->headers->get('Content-Type'))) {
+        if (! $this->isJsonMediaType($request->headers->get('Content-Type'))) {
             return ['status' => 415, 'message' => 'QUERY requests must use Content-Type: application/json'];
         }
 
@@ -154,110 +113,6 @@ final class ValidateHttpQueryInput
     }
 
     /**
-     * @param-out bool $supported
-     *
-     * @return array{status: int, message: string}|null
-     */
-    public function validateNative(Request $request, bool &$supported = false): ?array
-    {
-        $supported = false;
-        if (! self::$useRustFfi) {
-            return null;
-        }
-
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false || self::$outStatus === null) {
-            return null;
-        }
-
-        $contentType = $request->headers->get('Content-Type');
-        $hasContentType = $contentType !== null ? 1 : 0;
-        $ctStr = $contentType ?? '';
-
-        $raw = $request->getContent();
-        $maxBodyBytes = max(0, (int) config('nntmux.api.query_max_body_bytes', 8192));
-        $query = $request->query->all();
-        $queryCount = \count($query);
-        $queryKeysNul = '';
-        if ($queryCount > 0) {
-            $qKeys = [];
-            foreach ($query as $k => $v) {
-                $ks = (string) $k;
-                if (\str_contains($ks, "\0")) {
-                    return null;
-                }
-                $qKeys[] = $ks;
-            }
-            $queryKeysNul = implode("\0", $qKeys);
-        }
-
-        $cap = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $cap);
-        if ($scratch === null) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_http_validate_query(
-                $ctStr,
-                \strlen($ctStr),
-                $hasContentType,
-                $raw,
-                \strlen($raw),
-                $maxBodyBytes,
-                $queryKeysNul,
-                \strlen($queryKeysNul),
-                $queryCount,
-                FFI::addr(self::$outStatus),
-                $scratch,
-                $cap,
-            );
-            if (! \is_int($written) || $written === -1) {
-                return null;
-            }
-            if ($written < -1) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_http_validate_query(
-                    $ctStr,
-                    \strlen($ctStr),
-                    $hasContentType,
-                    $raw,
-                    \strlen($raw),
-                    $maxBodyBytes,
-                    $queryKeysNul,
-                    \strlen($queryKeysNul),
-                    $queryCount,
-                    FFI::addr(self::$outStatus),
-                    $scratch,
-                    $cap,
-                );
-                if (! \is_int($written) || $written < 0) {
-                    return null;
-                }
-            }
-            // @phpstan-ignore property.notFound
-            $status = (int) self::$outStatus->cdata;
-        } catch (Throwable) {
-            return null;
-        }
-
-        $supported = true;
-        if ($status !== 0) {
-            return [
-                'status' => $status,
-                'message' => $written > 0 ? FFI::string($scratch, $written) : '',
-            ];
-        }
-
-        return $queryCount === 0 ? null : $this->validateUrlValues($query);
-    }
-
-    /**
      * Reject URL parameters sent as arrays (`?id[]=x`) unless they are list
      * parameters, so scalar filters never reach the controllers as arrays.
      *
@@ -277,12 +132,7 @@ final class ValidateHttpQueryInput
         return null;
     }
 
-    public function isJsonMediaType(?string $contentType): bool
-    {
-        return $this->isJsonMediaTypePhp($contentType);
-    }
-
-    public function isJsonMediaTypePhp(?string $contentType): bool
+    private function isJsonMediaType(?string $contentType): bool
     {
         if ($contentType === null) {
             return false;
@@ -305,53 +155,6 @@ final class ValidateHttpQueryInput
         }
 
         return true;
-    }
-
-    public static function isJsonMediaTypeNative(?string $contentType): ?bool
-    {
-        if (! self::$useRustFfi) {
-            return null;
-        }
-        if ($contentType === null) {
-            return false;
-        }
-
-        $ffi = self::$ffi ?? self::resolveFfi();
-        if ($ffi === null || $ffi === false) {
-            return null;
-        }
-
-        try {
-            // @phpstan-ignore method.notFound
-            $res = $ffi->nntmux_http_is_json_media_type($contentType, \strlen($contentType));
-
-            return \is_int($res) && $res >= 0 ? ($res === 1) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function resolveFfi(): ?FFI
-    {
-        if (self::$ffi !== null) {
-            return self::$ffi === false ? null : self::$ffi;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
-        if ($ffi === null) {
-            self::$ffi = false;
-
-            return null;
-        }
-        try {
-            self::$outStatus = $ffi->new('int32_t');
-            self::$ffi = $ffi;
-
-            return $ffi;
-        } catch (Throwable) {
-            self::$ffi = false;
-
-            return null;
-        }
     }
 
     private function isValidBodyValue(string $key, mixed $value): bool

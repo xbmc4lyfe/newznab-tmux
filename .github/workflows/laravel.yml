@@ -5,7 +5,7 @@ on: [push]
 jobs:
   tests:
     # Avoid self-hosted workers that also advertise ubuntu-latest but have no Docker daemon.
-    runs-on: [spot, ubuntu-latest]
+    runs-on: ubuntu-24.04
 
     strategy:
       fail-fast: true
@@ -82,7 +82,7 @@ jobs:
         run: php -d ffi.enable=true vendor/bin/phpunit --fail-on-skipped --filter='YencNativeDecoderTest|YencNativeLibraryTest|YencServiceTest|YencDoctorCommandTest|NNTPBodyDecodingTest|NNTPBoundedArticleTest'
 
       - name: Install the pinned Rust build toolchain
-        run: rustc +1.98.0 --version || rustup toolchain install 1.98.0 --profile minimal
+        run: rustup toolchain install 1.98.0 --profile minimal
 
       - name: Build native utilities and verification framer
         env:

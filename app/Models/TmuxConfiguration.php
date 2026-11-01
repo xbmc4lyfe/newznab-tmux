@@ -8,11 +8,9 @@ use App\Enums\TmuxBackfillMode;
 use App\Enums\TmuxPostProcessMode;
 use App\Enums\TmuxSequentialMode;
 use App\Models\Concerns\IsSingletonConfiguration;
-use App\Support\RustPipelineLibrary;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
-use Throwable;
 
 /**
  * @property string $session_name
@@ -101,77 +99,5 @@ final class TmuxConfiguration extends Model
     public function colorExclusions(): HasMany
     {
         return $this->hasMany(TmuxColorExclusion::class);
-    }
-
-    public const string FFI_CDEF = 'ssize_t nntmux_w346_configuration_status(uint8_t operation, const int64_t *input, size_t input_count, int64_t *output, size_t output_capacity);';
-
-    // These small computations retain PHP until caller-inclusive benchmarks qualify Rust.
-    private const bool RUST_FFI_DEFAULT = false;
-
-    private static ?bool $useRustFfi = null;
-
-    public static function setUseRustFfi(?bool $use = true): void
-    {
-        self::$useRustFfi = $use;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * @param  list<int>  $input
-     * @return list<int>|null
-     */
-    private static function rustValues(int $operation, array $input, int $count): ?array
-    {
-        try {
-            $ffi = RustPipelineLibrary::resolveDomain('w346', self::FFI_CDEF);
-            if ($ffi === null) {
-                return null;
-            }
-            $length = count($input);
-            $source = $ffi->new("int64_t[{$length}]");
-            $output = $ffi->new("int64_t[{$count}]");
-            foreach ($input as $index => $value) {
-                $source[$index] = $value;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w346_configuration_status($operation, $source, $length, $output, $count);
-            if ($written !== $count) {
-                return null;
-            }
-            $values = [];
-            for ($index = 0; $index < $count; $index++) {
-                $values[] = (int) $output[$index];
-            }
-
-            return $values;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /** @return array{sequential_mode: int, backfill_mode: int, post_mode: int, post_amazon_mode: int, post_non_mode: int} */
-    public static function normalizeModes(int $sequential, int $backfill, int $post, int $amazon, int $non): array
-    {
-        if (self::usesRustFfi() && ($values = self::rustValues(2, [$sequential, $backfill, $post, $amazon, $non], 5)) !== null) {
-            return ['sequential_mode' => $values[0], 'backfill_mode' => $values[1], 'post_mode' => $values[2], 'post_amazon_mode' => $values[3], 'post_non_mode' => $values[4]];
-        }
-
-        return self::normalizeModesPhp($sequential, $backfill, $post, $amazon, $non);
-    }
-
-    /** @return array{sequential_mode: int, backfill_mode: int, post_mode: int, post_amazon_mode: int, post_non_mode: int} */
-    public static function normalizeModesPhp(int $sequential, int $backfill, int $post, int $amazon, int $non): array
-    {
-        return [
-            'sequential_mode' => TmuxSequentialMode::tryFrom($sequential)->value ?? TmuxSequentialMode::Full->value,
-            'backfill_mode' => TmuxBackfillMode::tryFrom($backfill)->value ?? TmuxBackfillMode::Disabled->value,
-            'post_mode' => TmuxPostProcessMode::tryFrom($post)->value ?? TmuxPostProcessMode::Disabled->value,
-            'post_amazon_mode' => TmuxPostProcessMode::tryFrom($amazon)->value ?? TmuxPostProcessMode::Disabled->value,
-            'post_non_mode' => TmuxPostProcessMode::tryFrom($non)->value ?? TmuxPostProcessMode::Disabled->value,
-        ];
     }
 }

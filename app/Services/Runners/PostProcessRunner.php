@@ -13,134 +13,15 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NfoService;
 use App\Services\TempWorkspaceService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
 class PostProcessRunner extends BaseRunner
 {
-    public const string W386_FFI_CDEF = 'ssize_t nntmux_w386_tmux_drain_stop_runners(uint8_t operation, uint8_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
-
-    // Paired caller benchmarks must qualify before enabling this separate candidate.
-    private static ?bool $useRustW386 = null;
-
-    public static function setUseRustW386(?bool $enabled): void
-    {
-        self::$useRustW386 = $enabled;
-    }
-
-    public static function usesRustW386(): bool
-    {
-        return self::$useRustW386 ?? false;
-    }
-
-    private static function w386Transform(int $flags, string $input): ?string
-    {
-        $length = strlen($input);
-        if ($length > 16_777_216) {
-            return null;
-        }
-        $ffi = RustPipelineLibrary::resolveDomain('additional_w386', self::W386_FFI_CDEF);
-        if ($ffi === null) {
-            return null;
-        }
-        try {
-            $capacity = 0;
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $capacity);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w386_tmux_drain_stop_runners(4, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
-            if (is_int($written) && $written < -1 && -$written <= 16_777_216) {
-                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($scratch === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w386_tmux_drain_stop_runners(4, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
-            }
-            if (! is_int($written) || $written < 0 || $written > min($capacity, 16_777_216)) {
-                return null;
-            }
-
-            return $written === 0 ? '' : FFI::string($scratch, $written);
-        } catch (\Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * First-byte GUID buckets, preserving input order, empties and duplicates.
-     *
-     * @param  list<string>  $ids
-     * @return list<string>
-     */
-    public static function guidBucketPlan(array $ids): array
-    {
-        return (self::usesRustW386() ? self::guidBucketPlanNative($ids) : null)
-            ?? self::guidBucketPlanPhp($ids);
-    }
-
-    /**
-     * @param  list<string>  $ids
-     * @return list<string>
-     */
-    public static function guidBucketPlanPhp(array $ids): array
-    {
-        return array_map(static fn (string $id): string => substr($id, 0, 1), $ids);
-    }
-
-    /**
-     * @param  list<string>  $ids
-     * @return list<string>|null
-     */
-    public static function guidBucketPlanNative(array $ids): ?array
-    {
-        $input = pack('V', count($ids));
-        foreach ($ids as $id) {
-            $input .= pack('V', strlen($id)).$id;
-        }
-        $output = self::w386Transform(0, $input);
-        if ($output === null || strlen($output) < 4) {
-            return null;
-        }
-        $offset = 4;
-        $buckets = [];
-        foreach ($ids as $id) {
-            if ($offset + 4 > strlen($output)) {
-                return null;
-            }
-            /** @var array{size: int} $decoded */
-            $decoded = unpack('Vsize', $output, $offset);
-            $size = $decoded['size'];
-            $offset += 4;
-            if ($size > 1 || $offset + $size > strlen($output)) {
-                return null;
-            }
-            $buckets[] = substr($output, $offset, $size);
-            $offset += $size;
-        }
-
-        return $offset === strlen($output) ? $buckets : null;
-    }
-
     public const int ADDITIONAL_WORKER_MAX_BATCHES = 4;
 
     private function guidBucketExpression(string $column = 'leftguid'): string
-    {
-        return self::usesRustFfi() ? $this->guidBucketExpressionNative($column) : $this->guidBucketExpressionPhp($column);
-    }
-
-    public function guidBucketExpressionNative(string $column = 'leftguid'): string
-    {
-        return self::runnerTransformNative(6, [DB::getDriverName(), $column]) ?? $this->guidBucketExpressionPhp($column);
-    }
-
-    public function guidBucketExpressionPhp(string $column = 'leftguid'): string
     {
         return DB::getDriverName() === 'sqlite'
             ? 'substr('.$column.', 1, 1)'
@@ -278,45 +159,16 @@ class PostProcessRunner extends BaseRunner
      */
     private function getBooksBuckets(): array
     {
-        return self::usesRustFfi() ? $this->getBooksBucketsNative() : $this->getBooksBucketsPhp();
-    }
-
-    /** @return array<int, object{id: string}> */
-    public function getBooksBucketsNative(): array
-    {
-        return DB::select($this->getBooksBucketsSqlNative());
-    }
-
-    /** @return array<int, object{id: string}> */
-    public function getBooksBucketsPhp(): array
-    {
-        return DB::select($this->getBooksBucketsSqlPhp());
-    }
-
-    public function getBooksBucketsSqlPhp(): string
-    {
-        $bucketExpr = $this->guidBucketExpressionPhp();
+        $bucketExpr = $this->guidBucketExpression();
         $workCondition = BookProcessingCandidateQuery::workCondition(
             (int) app(ConfigurationProvider::class)->metadata()->bookLookup->value
         );
 
-        return '
+        return DB::select('
             SELECT DISTINCT '.$bucketExpr.' AS id
             FROM releases
             WHERE '.$workCondition.'
-            LIMIT 16';
-    }
-
-    public function getBooksBucketsSqlNative(): string
-    {
-        $bucketExpr = $this->guidBucketExpressionNative();
-        $workCondition = BookProcessingCandidateQuery::workCondition(
-            (int) app(ConfigurationProvider::class)->metadata()->bookLookup->value
-        );
-
-        $condition = $workCondition;
-
-        return self::runnerTransformNative(7, [$bucketExpr, $condition]) ?? $this->getBooksBucketsSqlPhp();
+            LIMIT 16');
     }
 
     /**
@@ -324,43 +176,15 @@ class PostProcessRunner extends BaseRunner
      */
     private function getMusicBuckets(): array
     {
-        return self::usesRustFfi() ? $this->getMusicBucketsNative() : $this->getMusicBucketsPhp();
-    }
+        $bucketExpr = $this->guidBucketExpression();
 
-    /** @return array<int, object{id: string}> */
-    public function getMusicBucketsNative(): array
-    {
-        return DB::select($this->getMusicBucketsSqlNative());
-    }
-
-    /** @return array<int, object{id: string}> */
-    public function getMusicBucketsPhp(): array
-    {
-        return DB::select($this->getMusicBucketsSqlPhp());
-    }
-
-    public function getMusicBucketsSqlPhp(): string
-    {
-        $bucketExpr = $this->guidBucketExpressionPhp();
-
-        return '
+        return DB::select('
             SELECT DISTINCT '.$bucketExpr.' AS id
             FROM releases
             WHERE categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.')
             AND musicinfo_id IS NULL
             AND '.Release::nzbSettledSql().'
-            LIMIT 16';
-    }
-
-    public function getMusicBucketsSqlNative(): string
-    {
-        $bucketExpr = $this->guidBucketExpressionNative();
-
-        $condition = 'categories_id IN ('.Category::MUSIC_MP3.', '.Category::MUSIC_LOSSLESS.', '.Category::MUSIC_OTHER.')
-            AND musicinfo_id IS NULL
-            AND '.Release::nzbSettledSql();
-
-        return self::runnerTransformNative(7, [$bucketExpr, $condition]) ?? $this->getMusicBucketsSqlPhp();
+            LIMIT 16');
     }
 
     /**
@@ -368,47 +192,17 @@ class PostProcessRunner extends BaseRunner
      */
     private function getConsoleBuckets(): array
     {
-        return self::usesRustFfi() ? $this->getConsoleBucketsNative() : $this->getConsoleBucketsPhp();
-    }
-
-    /** @return array<int, object{id: string}> */
-    public function getConsoleBucketsNative(): array
-    {
-        return DB::select($this->getConsoleBucketsSqlNative());
-    }
-
-    /** @return array<int, object{id: string}> */
-    public function getConsoleBucketsPhp(): array
-    {
-        return DB::select($this->getConsoleBucketsSqlPhp());
-    }
-
-    public function getConsoleBucketsSqlPhp(): string
-    {
-        $bucketExpr = $this->guidBucketExpressionPhp();
+        $bucketExpr = $this->guidBucketExpression();
         $renamedFilter = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2 ? 'AND isrenamed = 1' : '';
 
-        return '
+        return DB::select('
             SELECT DISTINCT '.$bucketExpr.' AS id
             FROM releases
             WHERE categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.'
             AND consoleinfo_id IS NULL
             AND '.Release::nzbSettledSql().'
             '.$renamedFilter.'
-            LIMIT 16';
-    }
-
-    public function getConsoleBucketsSqlNative(): string
-    {
-        $bucketExpr = $this->guidBucketExpressionNative();
-        $renamedFilter = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2 ? 'AND isrenamed = 1' : '';
-
-        $condition = 'categories_id BETWEEN '.Category::GAME_ROOT.' AND '.Category::GAME_OTHER.'
-            AND consoleinfo_id IS NULL
-            AND '.Release::nzbSettledSql().'
-            '.$renamedFilter;
-
-        return self::runnerTransformNative(7, [$bucketExpr, $condition]) ?? $this->getConsoleBucketsSqlPhp();
+            LIMIT 16');
     }
 
     /**
@@ -416,47 +210,17 @@ class PostProcessRunner extends BaseRunner
      */
     private function getGamesBuckets(): array
     {
-        return self::usesRustFfi() ? $this->getGamesBucketsNative() : $this->getGamesBucketsPhp();
-    }
-
-    /** @return array<int, object{id: string}> */
-    public function getGamesBucketsNative(): array
-    {
-        return DB::select($this->getGamesBucketsSqlNative());
-    }
-
-    /** @return array<int, object{id: string}> */
-    public function getGamesBucketsPhp(): array
-    {
-        return DB::select($this->getGamesBucketsSqlPhp());
-    }
-
-    public function getGamesBucketsSqlPhp(): string
-    {
-        $bucketExpr = $this->guidBucketExpressionPhp();
+        $bucketExpr = $this->guidBucketExpression();
         $renamedFilter = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2 ? 'AND isrenamed = 1' : '';
 
-        return '
+        return DB::select('
             SELECT DISTINCT '.$bucketExpr.' AS id
             FROM releases
             WHERE categories_id = '.Category::PC_GAMES.'
             AND gamesinfo_id = 0
             AND '.Release::nzbSettledSql().'
             '.$renamedFilter.'
-            LIMIT 16';
-    }
-
-    public function getGamesBucketsSqlNative(): string
-    {
-        $bucketExpr = $this->guidBucketExpressionNative();
-        $renamedFilter = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2 ? 'AND isrenamed = 1' : '';
-
-        $condition = 'categories_id = '.Category::PC_GAMES.'
-            AND gamesinfo_id = 0
-            AND '.Release::nzbSettledSql().'
-            '.$renamedFilter;
-
-        return self::runnerTransformNative(7, [$bucketExpr, $condition]) ?? $this->getGamesBucketsSqlPhp();
+            LIMIT 16');
     }
 
     public function processAdditional(): void
@@ -696,23 +460,6 @@ class PostProcessRunner extends BaseRunner
      */
     private function tvWorkCondition(bool $renamedOnly): ?string
     {
-        return self::usesRustFfi() ? $this->tvWorkConditionNative($renamedOnly) : $this->tvWorkConditionPhp($renamedOnly);
-    }
-
-    public function tvWorkConditionNative(bool $renamedOnly): ?string
-    {
-        $lookupMode = (int) app(ConfigurationProvider::class)->metadata()->tvLookup->value;
-        $mode = self::runnerTransformNative(8, [(string) $lookupMode, $renamedOnly ? '1' : '0']);
-        if ($mode === null) {
-            return $this->tvWorkConditionPhp($renamedOnly);
-        }
-
-        // Keep shared provider eligibility and schema-dependent policy in its existing owner.
-        return $mode === '-1' ? null : TvProcessingCandidateQuery::workCondition((int) $mode);
-    }
-
-    public function tvWorkConditionPhp(bool $renamedOnly): ?string
-    {
         $lookupMode = (int) app(ConfigurationProvider::class)->metadata()->tvLookup->value;
         if ($lookupMode <= 0) {
             return null;
@@ -947,216 +694,5 @@ class PostProcessRunner extends BaseRunner
         }
 
         $this->runPostProcessMixed($tasks, $maxProcesses, 'amazon (books+music+console+games)');
-    }
-
-    // ========================================================================
-    // WAVE 58.3 BATCH HELPER
-    // ========================================================================
-
-    /** Enabled: the minimum of three 301-round paired runs cleared every 1.5x gate (common mean 3.37x, p99 3.26x; uncommon mean 3.02x, p99 2.78x); see RustPostProcessReleasesRunnerDowntimeCompensatorTmuxCommandW58ParityTest. */
-    public const bool W58_RUST_FFI_DEFAULT = true;
-
-    public const string W58_POSTPROCESS_RUNNER_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w58_postprocess_runner_work_batch(const char *blob, size_t blob_len, const int64_t *lens, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /** ASCII-lowercased postprocess mode => mode index of w58PostProcessWorkBatch(). */
-    public const array W58_POSTPROCESS_MODES = ['additional' => 1, 'nfo' => 2, 'movie' => 3, 'tv' => 4, 'amazon' => 5];
-
-    /** Base score per mode index of w58PostProcessWorkBatch(). */
-    public const array W58_POSTPROCESS_MODE_WEIGHTS = [0, 40, 30, 50, 50, 20];
-
-    /** Trailer words after the per-item words of w58PostProcessWorkBatch(). */
-    public const int W58_POSTPROCESS_TRAILER = 25;
-
-    public static function usesW58RustFfi(): bool
-    {
-        $override = self::w58RustFfiState();
-
-        return \is_bool($override) ? $override : self::W58_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with the Wave 58 Rust path forced on or off, then restores the previous setting.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW58RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w58RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w58RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Wave 58.3 postprocess work items `mode:guid:retries` (split as explode(':', $item, 3)). Per item
-     * `mode | bucket << 3 | valid << 8 | numeric << 9 | retries << 10 | score << 17 | min(length, 1023) << 25`:
-     * mode is the W58_POSTPROCESS_MODES index of the ASCII-lowercased first field (0 unknown), bucket the hex
-     * value of the guid's first byte (16 when it is missing or not hex), valid a 40-byte hex guid, numeric an
-     * all-digit retry field, retries its value (99 past two digits, 0 when not numeric) and score
-     * max(0, mode weight + 20 valid + 5 hex bucket - 5 * min(retries, 10)). Then the six mode counts, the 17
-     * bucket counts, the valid count and the max score.
-     *
-     * @param  array<array-key, string>  $items
-     * @return list<int>
-     */
-    public static function w58PostProcessWorkBatch(array $items): array
-    {
-        return self::usesW58RustFfi() ? self::w58PostProcessWorkBatchNative($items) : self::w58PostProcessWorkBatchPhp($items);
-    }
-
-    /**
-     * @param  array<array-key, string>  $items
-     * @return list<int>
-     */
-    public static function w58PostProcessWorkBatchNative(array $items): array
-    {
-        return self::w58Invoke($items, \count($items) + self::W58_POSTPROCESS_TRAILER) ?? self::w58PostProcessWorkBatchPhp($items);
-    }
-
-    /**
-     * @param  array<array-key, string>  $items
-     * @return list<int>
-     */
-    public static function w58PostProcessWorkBatchPhp(array $items): array
-    {
-        $out = [];
-        $modes = array_fill(0, 6, 0);
-        $buckets = array_fill(0, 17, 0);
-        $validCount = 0;
-        $maxScore = 0;
-        foreach ($items as $item) {
-            $item = (string) $item;
-            $parts = explode(':', $item, 3);
-            $mode = self::W58_POSTPROCESS_MODES[strtolower($parts[0])] ?? 0;
-            $guid = $parts[1] ?? '';
-            $retry = $parts[2] ?? '';
-            $bucket = $guid === '' ? false : strpos('0123456789abcdef', strtolower($guid[0]));
-            $bucket = $bucket === false ? 16 : $bucket;
-            $valid = \strlen($guid) === 40 && strspn($guid, '0123456789abcdefABCDEF') === 40;
-            $numeric = $retry !== '' && strspn($retry, '0123456789') === \strlen($retry);
-            $retries = $numeric ? (\strlen($retry) > 2 ? 99 : (int) $retry) : 0;
-            $score = max(0, self::W58_POSTPROCESS_MODE_WEIGHTS[$mode] + ($valid ? 20 : 0) + ($bucket < 16 ? 5 : 0) - 5 * min($retries, 10));
-            $modes[$mode]++;
-            $buckets[$bucket]++;
-            $validCount += $valid ? 1 : 0;
-            $maxScore = max($maxScore, $score);
-            $out[] = $mode | $bucket << 3 | ($valid ? 1 : 0) << 8 | ($numeric ? 1 : 0) << 9 | $retries << 10 | $score << 17
-                | min(\strlen($item), 1023) << 25;
-        }
-        array_push($out, ...$modes);
-        array_push($out, ...$buckets);
-        array_push($out, $validCount, $maxScore);
-
-        return $out;
-    }
-
-    /**
-     * Wave 58 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
-     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out' and
-     * 'lens' return `int64_t` output and length-column buffers of at least $val words.
-     */
-    private static function w58RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        /** @var bool|null $override */
-        static $override = null;
-        /** @var FFI|false|null $ffi */
-        static $ffi = null;
-        /** @var CData|null $out */
-        static $out = null;
-        /** @var int $outCap */
-        static $outCap = 0;
-        /** @var CData|null $lens */
-        static $lens = null;
-        /** @var int $lensCap */
-        static $lensCap = 0;
-
-        if ($op === 'set') {
-            $previous = $override;
-            $override = \is_bool($val) ? $val : null;
-
-            return $previous;
-        }
-        if ($op === 'ffi') {
-            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w58', self::W58_POSTPROCESS_RUNNER_FFI_CDEF) ?? false;
-
-            return $ffi === false ? null : $ffi;
-        }
-        if ($op === 'out') {
-            $words = \is_int($val) ? $val : 0;
-            if ($out === null || $outCap < $words) {
-                $handle = self::w58RustFfiState('ffi');
-                if (! $handle instanceof FFI) {
-                    return null;
-                }
-                $outCap = max(1024, $words * 2);
-                $out = $handle->new('int64_t['.$outCap.']');
-            }
-
-            return $out;
-        }
-        if ($op === 'lens') {
-            $words = \is_int($val) ? $val : 0;
-            if ($lens === null || $lensCap < $words) {
-                $handle = self::w58RustFfiState('ffi');
-                if (! $handle instanceof FFI) {
-                    return null;
-                }
-                $lensCap = max(256, $words * 2);
-                $lens = $handle->new('int64_t['.$lensCap.']');
-            }
-
-            return $lens;
-        }
-
-        return $override;
-    }
-
-    /**
-     * Calls the Wave 58.3 export with the NUL-joined $items, or with the items concatenated plus an
-     * `int64_t` length column when an item holds a NUL byte. Null when the library is missing, the call
-     * declines or it writes other than $words words, so the caller falls back to PHP.
-     *
-     * @param  array<array-key, mixed>  $items
-     * @return list<int>|null
-     */
-    private static function w58Invoke(array $items, int $words): ?array
-    {
-        try {
-            $ffi = self::w58RustFfiState('ffi');
-            $out = self::w58RustFfiState('out', $words);
-            if (! $ffi instanceof FFI || ! $out instanceof CData) {
-                return null;
-            }
-            $count = \count($items);
-            $blob = implode("\0", $items);
-            $lens = null;
-            if (substr_count($blob, "\0") !== max(0, $count - 1)) {
-                $blob = implode('', $items);
-                $column = self::w58RustFfiState('lens', $count);
-                if (! $column instanceof CData) {
-                    return null;
-                }
-                FFI::memcpy($column, pack('P*', ...array_map(strlen(...), array_values($items))), $count * 8);
-                $lens = FFI::addr($column[0]);
-            }
-            // @phpstan-ignore method.notFound (Declared by W58_POSTPROCESS_RUNNER_FFI_CDEF.)
-            $written = $ffi->nntmux_w58_postprocess_runner_work_batch($blob, \strlen($blob), $lens, $count, $out, $words);
-            if ($written !== $words) {
-                return null;
-            }
-            $values = unpack('P*', FFI::string($out, $words * 8));
-
-            /** @var list<int>|null */
-            return $values === false ? null : array_values($values);
-        } catch (\Throwable) {
-            return null;
-        }
     }
 }

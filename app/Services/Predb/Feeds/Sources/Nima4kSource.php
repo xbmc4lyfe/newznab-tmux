@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
-use App\Support\RustPipelineLibrary;
 use Dom\Element as HtmlElement;
 use Dom\HTMLDocument;
 use Dom\Node as HtmlNode;
@@ -14,10 +13,8 @@ use DOMDocument;
 use DOMElement;
 use DOMNode;
 use DOMXPath;
-use FFI;
 use RuntimeException;
 use SplObjectStorage;
-use Throwable;
 
 /**
  * Opt-in, latest-only NIMA4K catalogue names. The 1 MiB default bounds HTML download and DOM parsing.
@@ -25,41 +22,7 @@ use Throwable;
  */
 final class Nima4kSource extends BoundedHttpFeedSource
 {
-    /**
-     * Wave 45.3 production default is Rust: the paired benchmark in
-     * tests/Unit/RustPredbFeedsG4uGabberKnabenNima4kPassableW45ParityTest.php measures at least
-     * 2.7x (mean and p99, common and uncommon batches). PHP stays the fallback when the library is
-     * unavailable or a title holds a character Rust leaves to PCRE2.
-     * useW453RustFfi(true) keeps the Rust helper available for parity and benchmarks.
-     * Named W453 so it stays distinct from the class's existing native paths.
-     */
-    public const bool W453_RUST_FFI_DEFAULT = true;
-
-    public const string W453_FFI_CDEF = <<<'C'
-        ssize_t nntmux_w453_nima4k_title_batch(
-            const char *blob_ptr,
-            size_t blob_len,
-            const char *lens_ptr,
-            size_t lens_len,
-            char *out_buf,
-            size_t out_cap
-        );
-        C;
-
-    /** Exactly 6 0x1F-separated decimals of 1-19 digits. */
-    private const string W453_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){5}\d{1,19}\z/';
-
-    private static ?bool $w453RustFfiOverride = null;
-
-    private static FFI|false|null $w453RustFfiHandle = null;
-
     private const HTML_NAMESPACE = 'http://www.w3.org/1999/xhtml';
-
-    private const FFI_CDEF = <<<'C'
-        ssize_t nntmux_predb_nima4k_parse_html(const char *html, size_t html_len, size_t page_size, size_t max_body_bytes, char *out_buf, size_t out_cap);
-        C;
-
-    private static FFI|false|null $native = null;
 
     private const FORBIDDEN_CHARACTERS = '/[\x{0000}-\x{0008}\x{000B}\x{000C}\x{000E}-\x{001F}\x{007F}-\x{009F}\x{FDD0}-\x{FDEF}\x{FFFE}-\x{FFFF}\x{1FFFE}-\x{1FFFF}\x{2FFFE}-\x{2FFFF}\x{3FFFE}-\x{3FFFF}\x{4FFFE}-\x{4FFFF}\x{5FFFE}-\x{5FFFF}\x{6FFFE}-\x{6FFFF}\x{7FFFE}-\x{7FFFF}\x{8FFFE}-\x{8FFFF}\x{9FFFE}-\x{9FFFF}\x{AFFFE}-\x{AFFFF}\x{BFFFE}-\x{BFFFF}\x{CFFFE}-\x{CFFFF}\x{DFFFE}-\x{DFFFF}\x{EFFFE}-\x{EFFFF}\x{FFFFE}-\x{FFFFF}\x{10FFFE}-\x{10FFFF}]/u';
 
@@ -97,63 +60,11 @@ final class Nima4kSource extends BoundedHttpFeedSource
     }
 
     /**
-     * Rust accepts only a strict, unambiguous HTML subset; everything else (including every
-     * invalid document) is verified by the dual-DOM PHP parser with its exact diagnostics.
-     *
-     * @return list<PredbFeedEntry>
-     */
-    public function parseHtml(string $html): array
-    {
-        $titles = $this->nativeTitles($html);
-        if ($titles === null) {
-            return $this->parseHtmlPhp($html);
-        }
-        $entries = [];
-        foreach ($titles as $title) {
-            $entries[] = new PredbFeedEntry(title: $title, source: 'nima4k.org');
-        }
-
-        return $entries;
-    }
-
-    /** @return list<string>|null */
-    private function nativeTitles(string $html): ?array
-    {
-        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_nima4k', self::FFI_CDEF) ?? false;
-        if ($ffi === false) {
-            return null;
-        }
-        $length = strlen($html);
-        $capacity = 0;
-        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 64, $capacity);
-        if ($scratch === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_predb_nima4k_parse_html($html, $length, $this->pageSize, $this->maximumBodyBytes, $scratch, $capacity);
-        if (is_int($written) && $written < -1) {
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-            if ($scratch === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_predb_nima4k_parse_html($html, $length, $this->pageSize, $this->maximumBodyBytes, $scratch, $capacity);
-        }
-        if (! is_int($written) || $written <= 0) {
-            return null;
-        }
-        $titles = explode("\0", FFI::string($scratch, $written));
-        array_pop($titles);
-
-        return $titles;
-    }
-
-    /**
      * Require one literal subtitle and one agreeing cover label per observed release card.
      *
      * @return list<PredbFeedEntry>
      */
-    public function parseHtmlPhp(string $html): array
+    public function parseHtml(string $html): array
     {
         if (strlen($html) > $this->maximumBodyBytes) {
             throw new RuntimeException('NIMA4K HTML exceeds the body limit.');
@@ -772,157 +683,5 @@ final class Nima4kSource extends BoundedHttpFeedSource
     private function classToken(string $class): string
     {
         return 'contains(concat(" ", normalize-space(@class), " "), " '.$class.' ")';
-    }
-
-    /**
-     * Enables (true) or disables (false) the Wave 45.3 Rust helper; null restores
-     * W453_RUST_FFI_DEFAULT.
-     */
-    public static function useW453RustFfi(?bool $enable = true): void
-    {
-        self::$w453RustFfiOverride = $enable;
-    }
-
-    public static function usesW453RustFfi(): bool
-    {
-        return self::$w453RustFfiOverride ?? self::W453_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW453RustFfi(): void
-    {
-        self::$w453RustFfiOverride = null;
-        self::$w453RustFfiHandle = null;
-    }
-
-    /**
-     * Release subtitle summary, using validatedReleaseCards()'s title rules: each trim()med title
-     * is empty, nonliteral when it holds `\s`, `\p{Z}` or `\p{C}` (or invalid UTF-8), else
-     * literal; literal titles that trim() changed also count as normalized. Raw titles matching
-     * FORBIDDEN_CHARACTERS (or invalid UTF-8) separately count as forbidden. Non-strings count as
-     * empty.
-     *
-     * @param  array<array-key, mixed>  $items
-     * @return array{total: int, literal: int, empty: int, nonliteral: int, normalized: int, forbidden: int}
-     */
-    public static function summarizeNima4kTitleBatch(array $items): array
-    {
-        return (self::usesW453RustFfi() ? self::summarizeNima4kTitleBatchNative($items) : null)
-            ?? self::summarizeNima4kTitleBatchPhp($items);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $items
-     * @return array{total: int, literal: int, empty: int, nonliteral: int, normalized: int, forbidden: int}
-     */
-    public static function summarizeNima4kTitleBatchPhp(array $items): array
-    {
-        $literal = 0;
-        $empty = 0;
-        $nonliteral = 0;
-        $normalized = 0;
-        $forbidden = 0;
-        foreach ($items as $item) {
-            $raw = \is_string($item) ? $item : '';
-            $forbidden += (int) (preg_match(self::FORBIDDEN_CHARACTERS, $raw) !== 0);
-            $title = trim($raw);
-            if ($title === '') {
-                $empty++;
-            } elseif (preg_match('/[\s\p{Z}\p{C}]/u', $title) !== 0) {
-                $nonliteral++;
-            } else {
-                $literal++;
-                $normalized += (int) ($title !== $raw);
-            }
-        }
-
-        return [
-            'total' => \count($items),
-            'literal' => $literal,
-            'empty' => $empty,
-            'nonliteral' => $nonliteral,
-            'normalized' => $normalized,
-            'forbidden' => $forbidden,
-        ];
-    }
-
-    /**
-     * Declines (null) for non-string items, and whenever Rust leaves a character class to PCRE2,
-     * so PHP counts them.
-     *
-     * @param  array<array-key, mixed>  $items
-     * @return array{total: int, literal: int, empty: int, nonliteral: int, normalized: int, forbidden: int}|null
-     */
-    public static function summarizeNima4kTitleBatchNative(array $items): ?array
-    {
-        $lengths = [];
-        foreach ($items as $item) {
-            if (! \is_string($item)) {
-                return null;
-            }
-            $lengths[] = \strlen($item);
-        }
-        $fields = self::callW453Native(implode('', $items), pack('V*', ...$lengths));
-        if ($fields === null) {
-            return null;
-        }
-
-        return [
-            'total' => (int) $fields[0],
-            'literal' => (int) $fields[1],
-            'empty' => (int) $fields[2],
-            'nonliteral' => (int) $fields[3],
-            'normalized' => (int) $fields[4],
-            'forbidden' => (int) $fields[5],
-        ];
-    }
-
-    /**
-     * Calls this class's Wave 45.3 export with the shared scratch buffer, retrying once at the size
-     * it asks for. Returns its fields only when they match W453_FIELDS_PATTERN: exactly the expected
-     * count of 1-19 digit decimals.
-     *
-     * @return list<string>|null
-     */
-    private static function callW453Native(string $blob, string $lens): ?array
-    {
-        $ffi = self::w453RustFfi();
-        if ($ffi === null) {
-            return null;
-        }
-
-        try {
-            $capacity = 0;
-            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
-            if ($buffer === null) {
-                return null;
-            }
-            // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_w453_nima4k_title_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
-            if (\is_int($written) && $written < -1) {
-                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
-                if ($buffer === null) {
-                    return null;
-                }
-                // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_w453_nima4k_title_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
-            }
-            if (! \is_int($written) || $written < 0 || $written > $capacity) {
-                return null;
-            }
-            $raw = FFI::string($buffer, $written);
-
-            return preg_match(self::W453_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    private static function w453RustFfi(): ?FFI
-    {
-        if (self::$w453RustFfiHandle === null) {
-            self::$w453RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w453', self::W453_FFI_CDEF) ?? false;
-        }
-
-        return self::$w453RustFfiHandle === false ? null : self::$w453RustFfiHandle;
     }
 }

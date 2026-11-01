@@ -6,54 +6,17 @@ namespace App\Services\Binaries;
 
 use App\Enums\CollectionFileCheckStatus;
 use App\Models\Collection;
-use App\Services\CollectionCleanupService;
 use App\Services\CollectionsCleaningService;
 use App\Services\XrefService;
-use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
 use App\Support\Utf8;
-use FFI;
-use FFI\CData;
 use Illuminate\Support\Facades\DB;
-use Throwable;
 
 /**
  * Handles collection record creation and retrieval during header storage.
  */
 final class CollectionHandler
 {
-    public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_collection_unique_ids(const char *ids, size_t len, char *out, size_t cap);
-        ssize_t nntmux_collection_unique_hashes(const char *packed, size_t len, size_t width, char *out, size_t cap);
-        C;
-
-    /** Raw SHA-1 width of every collectionhash key. */
-    private const int HASH_WIDTH = 20;
-
-    // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === null) {
-            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
-        }
-
-        return self::$ffi === false ? null : self::$ffi;
-    }
-
     /**
      * Hard upper bound on rows packed into a single SQL statement
      * (multi-row INSERT, IN(...) lookup, etc.). Keeps the generated SQL
@@ -77,7 +40,7 @@ final class CollectionHandler
     /** @var array<string, int> Cached collection IDs by collectionhash (populated by bulk prefetch) */
     private array $existingIdsByHash = [];
 
-    private ?Throwable $lastException = null;
+    private ?\Throwable $lastException = null;
 
     public function __construct(
         ?CollectionsCleaningService $collectionsCleaning = null,
@@ -165,7 +128,7 @@ final class CollectionHandler
 
                 return $collectionId;
             }
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             $this->lastException = $e;
             if (config('app.debug') === true) {
                 SqlError::logFailure('Collection insert failed', $e);
@@ -195,21 +158,6 @@ final class CollectionHandler
         $hashesToPrefetch = [];
         $groupNamesByCollectionKey = [];
 
-        $groupsBatchByIndex = null;
-        if (\get_class($this->xrefService) === XrefService::class && \count($headers) > 1) {
-            $xrefList = [];
-            $indexList = [];
-            foreach ($headers as $index => $header) {
-                $xrefList[] = (string) ($header['Xref'] ?? '');
-                $indexList[] = $index;
-            }
-            $extracted = $this->xrefService->extractGroupNamesBatch($xrefList);
-            $groupsBatchByIndex = [];
-            foreach ($indexList as $pos => $index) {
-                $groupsBatchByIndex[$index] = $extracted[$pos];
-            }
-        }
-
         foreach ($headers as $index => $header) {
             $totalFiles = (int) ($totalFilesByIndex[$index] ?? 0);
             $collMatch = $this->collectionsCleaning->collectionsCleaner(
@@ -218,9 +166,7 @@ final class CollectionHandler
             );
 
             $collectionKey = $collMatch['name'].$totalFiles;
-            $groupNames = $groupsBatchByIndex !== null
-                ? $groupsBatchByIndex[$index]
-                : $this->xrefService->extractGroupNames($header['Xref'] ?? '');
+            $groupNames = $this->xrefService->extractGroupNames($header['Xref'] ?? '');
             if ($groupNames === []) {
                 $groupNames = [$groupName];
             }
@@ -284,7 +230,7 @@ final class CollectionHandler
                 }
             }
             $this->insertCollectionGroups($groupNamesByCollectionKey);
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             $this->lastException = $e;
             if (config('app.debug') === true) {
                 SqlError::logFailure('Bulk collection insert failed', $e);
@@ -763,7 +709,7 @@ final class CollectionHandler
             }
 
             return true;
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             $this->lastException = $e;
             if (config('app.debug') === true) {
                 SqlError::logFailure('Collection aggregate refresh failed', $e);
@@ -783,7 +729,7 @@ final class CollectionHandler
         return array_keys($this->insertedCollectionIds);
     }
 
-    public function getLastException(): ?Throwable
+    public function getLastException(): ?\Throwable
     {
         return $this->lastException;
     }
@@ -795,36 +741,7 @@ final class CollectionHandler
      */
     public function getAllIds(): array
     {
-        return (self::$useRustFfi ? $this->getAllIdsNative() : null) ?? $this->getAllIdsPhp();
-    }
-
-    /**
-     * @return list<int>
-     */
-    public function getAllIdsPhp(): array
-    {
         return array_values(array_unique(array_map('intval', $this->collectionIds)));
-    }
-
-    /**
-     * @return list<int>|null Null when the Rust library is unavailable.
-     */
-    public function getAllIdsNative(): ?array
-    {
-        if ($this->collectionIds === []) {
-            return [];
-        }
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $packed = pack('q*', ...array_map('intval', array_values($this->collectionIds)));
-        $packed = self::callPacked($ffi, $packed, static fn (FFI $ffi, string $in, CData $out, int $cap): int => $ffi->nntmux_collection_unique_ids($in, \strlen($in), $out, $cap)); // @phpstan-ignore method.notFound
-        if ($packed === null) {
-            return null;
-        }
-
-        return $packed === '' ? [] : array_values(unpack('q*', $packed) ?: []);
     }
 
     /**
@@ -834,588 +751,6 @@ final class CollectionHandler
      */
     public function getBatchHashes(): array
     {
-        return (self::$useRustFfi ? $this->getBatchHashesNative() : null) ?? $this->getBatchHashesPhp();
-    }
-
-    /**
-     * @return list<string>
-     */
-    public function getBatchHashesPhp(): array
-    {
         return array_keys($this->batchCollectionHashes);
-    }
-
-    /**
-     * @return list<string>|null Null when Rust is unavailable or a key is not a raw SHA-1.
-     */
-    public function getBatchHashesNative(): ?array
-    {
-        if ($this->batchCollectionHashes === []) {
-            return [];
-        }
-        $keys = array_keys($this->batchCollectionHashes);
-        foreach ($keys as $key) {
-            if (! \is_string($key) || \strlen($key) !== self::HASH_WIDTH) {
-                return null;
-            }
-        }
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return null;
-        }
-        $packed = self::callPacked($ffi, implode('', $keys), static fn (FFI $ffi, string $in, CData $out, int $cap): int => $ffi->nntmux_collection_unique_hashes($in, \strlen($in), self::HASH_WIDTH, $out, $cap)); // @phpstan-ignore method.notFound
-
-        return $packed === null ? null : str_split($packed, self::HASH_WIDTH);
-    }
-
-    /**
-     * Run a packed-input export whose output never exceeds its input length.
-     *
-     * @param  \Closure(FFI, string, CData, int): int  $call
-     */
-    private static function callPacked(FFI $ffi, string $input, \Closure $call): ?string
-    {
-        try {
-            $cap = 0;
-            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(1, \strlen($input)), $cap);
-            if ($scratch === null) {
-                return null;
-            }
-            $written = $call($ffi, $input, $scratch, $cap);
-            if ($written < 0) {
-                return null;
-            }
-
-            return $written === 0 ? '' : FFI::string($scratch, $written);
-        } catch (Throwable) {
-            return null;
-        }
-    }
-
-    /**
-     * PHP stays the default for summarizeCollectionUpsertBatch(): the paired benchmark in
-     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php does not clear 1.5x.
-     */
-    public const bool W401_RUST_FFI_DEFAULT = false;
-
-    private const array W401_UPSERT_KEYS = ['collections', 'invalid_rows', 'valid', 'oversized_parts', 'missing_subject', 'total_expected_parts'];
-
-    private static ?bool $w401UseRustFfi = null;
-
-    private static FFI|false|null $w401Ffi = null;
-
-    /**
-     * Summarizes collection upsert payloads (`subject`, `totalfiles`): a subject that is not a string or trim()s to '' is
-     * missing, a positive part count above `$maxPartsPerCollection` is oversized, and payloads with a subject and 1 to
-     * `$maxPartsPerCollection` parts are valid. Positive part counts add to the expected total (saturating at PHP_INT_MAX);
-     * non-array payloads are invalid.
-     *
-     * @param  array<array-key, mixed>  $collections
-     * @return array<string, int>
-     */
-    public static function summarizeCollectionUpsertBatch(array $collections, int $maxPartsPerCollection = 50000): array
-    {
-        return (self::usesW401RustFfi() ? self::summarizeCollectionUpsertBatchNative($collections, $maxPartsPerCollection) : null)
-            ?? self::summarizeCollectionUpsertBatchPhp($collections, $maxPartsPerCollection);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $collections
-     * @return array<string, int>
-     */
-    private static function summarizeCollectionUpsertBatchPhp(array $collections, int $maxParts): array
-    {
-        $summary = array_fill_keys(self::W401_UPSERT_KEYS, 0);
-        $summary['collections'] = \count($collections);
-        foreach ($collections as $collection) {
-            if (! \is_array($collection)) {
-                $summary['invalid_rows']++;
-
-                continue;
-            }
-            $subject = $collection['subject'] ?? null;
-            $missing = ! \is_string($subject) || trim($subject) === '';
-            $parts = CollectionCleanupService::w401Int($collection['totalfiles'] ?? null) ?? 0;
-            $oversized = $parts > 0 && $parts > $maxParts;
-            if ($parts > 0) {
-                $total = $summary['total_expected_parts'];
-                $summary['total_expected_parts'] = $parts > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $parts;
-            }
-            $summary['missing_subject'] += (int) $missing;
-            $summary['oversized_parts'] += (int) $oversized;
-            $summary['valid'] += (int) (! $missing && $parts > 0 && ! $oversized);
-        }
-
-        return $summary;
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $collections
-     * @return array<string, int>|null
-     */
-    private static function summarizeCollectionUpsertBatchNative(array $collections, int $maxParts): ?array
-    {
-        $words = [$maxParts, \count($collections)];
-        $blob = [];
-        foreach ($collections as $collection) {
-            if (\is_array($collection)) {
-                CollectionCleanupService::w401PackRow($words, $blob, [$collection['subject'] ?? null, $collection['totalfiles'] ?? null]);
-            } else {
-                $words[] = 0;
-            }
-        }
-        $values = CollectionCleanupService::w401Invoke(self::$w401Ffi, 5, $words, $blob);
-
-        return $values !== null && \count($values) === \count(self::W401_UPSERT_KEYS) ? array_combine(self::W401_UPSERT_KEYS, $values) : null;
-    }
-
-    public static function useW401RustFfi(?bool $enabled): void
-    {
-        self::$w401UseRustFfi = $enabled;
-    }
-
-    public static function usesW401RustFfi(): bool
-    {
-        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW401RustFfi(): void
-    {
-        self::$w401UseRustFfi = null;
-        self::$w401Ffi = null;
-    }
-
-    /** Wave 52.2 paired benchmarks decide this default; see RustBinariesCollectionHeaderMissedPartHandlerW52ParityTest. */
-    private const bool W52_RUST_FFI_DEFAULT = true;
-
-    public const string W52_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w522_collection_key_plan_batch(const char *names, size_t names_len, const char *totals, size_t totals_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Wave 52 routing, binding and output buffer, kept in function-local statics. Operations:
-     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
-     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
-     * least $val words (null without the library).
-     */
-    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w52', self::W52_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w52RustFfiState('ffi');
-                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return [$ffi, $out, $capacity];
-            default:
-                return $enabled;
-        }
-    }
-
-    public static function usesW52RustFfi(): bool
-    {
-        $enabled = self::w52RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with planCollectionKeys() routed to Rust ($enabled) or PHP, then restores the
-     * previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w52RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w52RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Batch collection-key plan, as getOrCreateCollections() derives `name . totalFiles` keys and
-     * their sha1 collectionhash. Two words per header: `flags | first << 8 | crc32(key) << 32`, then
-     * the first eight bytes of sha1(key, true) as a big-endian signed word. Flags: 1 first
-     * occurrence, 2 repeated key (`first` is the key's first row), 4 empty name, 8 total <= 0,
-     * 16 name longer than 255 bytes. Unique keys, repeats, empty names, non-positive totals and the
-     * XXH64 digest of all earlier words follow.
-     *
-     * @param  list<string>  $names  Cleaned collection names (collectionsCleaner()['name'])
-     * @param  list<int>  $totalFiles
-     * @return list<int>
-     */
-    public static function planCollectionKeys(array $names, array $totalFiles): array
-    {
-        return self::usesW52RustFfi()
-            ? self::planCollectionKeysNative($names, $totalFiles)
-            : self::planCollectionKeysPhp($names, $totalFiles);
-    }
-
-    /**
-     * @param  list<string>  $names
-     * @param  list<int>  $totalFiles
-     * @return list<int>
-     */
-    public static function planCollectionKeysPhp(array $names, array $totalFiles): array
-    {
-        $out = $seen = [];
-        $repeats = $empty = $nonPositive = 0;
-        foreach ($names as $i => $name) {
-            $total = $totalFiles[$i] ?? 0;
-            $key = $name.$total;
-            $flags = ($name === '' ? 4 : 0) | ($total <= 0 ? 8 : 0) | (\strlen($name) > 255 ? 16 : 0);
-            $empty += (int) ($name === '');
-            $nonPositive += (int) ($total <= 0);
-            if (isset($seen[$key])) {
-                $flags |= 2;
-                $repeats++;
-                [$first, $tag, $prefix] = $seen[$key];
-            } else {
-                $flags |= 1;
-                /** @var array{1: int} $head */
-                $head = unpack('J', sha1($key, true));
-                [$first, $tag, $prefix] = $seen[$key] = [$i, crc32($key) << 32, $head[1]];
-            }
-            $out[] = $flags | $first << 8 | $tag;
-            $out[] = $prefix;
-        }
-        $out[] = \count($seen);
-        $out[] = $repeats;
-        $out[] = $empty;
-        $out[] = $nonPositive;
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-        $out[] = $digest[1];
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
-     * are not lists, or a name holds a NUL byte.
-     *
-     * @param  list<string>  $names
-     * @param  list<int>  $totalFiles
-     * @return list<int>
-     */
-    public static function planCollectionKeysNative(array $names, array $totalFiles): array
-    {
-        $count = \count($names);
-        $words = 2 * $count + 5;
-        /** @var array{FFI, CData, int}|null $state */
-        $state = $count === 0 ? null : self::w52RustFfiState('out', $words);
-        if ($state === null || \count($totalFiles) !== $count || ! array_is_list($names) || ! array_is_list($totalFiles)) {
-            return self::planCollectionKeysPhp($names, $totalFiles);
-        }
-        [$ffi, $out, $cap] = $state;
-        $joined = implode("\0", $names);
-        $totals = pack('P*', ...$totalFiles);
-        try {
-            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
-            $written = $ffi->nntmux_w522_collection_key_plan_batch($joined, \strlen($joined), $totals, \strlen($totals), $count, $out, $cap);
-        } catch (Throwable) {
-            $written = -1;
-        }
-        /** @var array<int, int>|false $values */
-        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
-
-        return \is_array($values) ? array_values($values) : self::planCollectionKeysPhp($names, $totalFiles);
-    }
-
-    // ---- Wave 66.2 batch plan ----------------------------------------------------------------
-
-    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean/p99 8.79x/7.41x, uncommon 9.70x/7.52x); see RustBinariesCollectionHeaderParserStorageTxMissedPartW66ParityTest. */
-    public const bool W66_RUST_FFI_DEFAULT = true;
-
-    private const string W66_COLLECTION_HANDLER_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w662_collection_handler_plan_batch(const char *items, size_t items_len, size_t count, int64_t *out, size_t out_cap);
-        C;
-
-    /** Summary words after the per-row words, the digest included. */
-    public const int W66_COLLECTION_HANDLER_TAIL = 24;
-
-    /**
-     * Wave 66 routing, binding and output buffer, kept in function-local statics (no static or
-     * instance properties). Operations: null reads the routing override, 'set' replaces it
-     * (returning the previous one), 'reset' also drops the binding and buffer, 'ffi' resolves the
-     * binding and 'out' returns `[binding, buffer, capacity]` with room for at least $val words
-     * (null without the library).
-     */
-    private static function w66RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'reset':
-                $previous = $enabled;
-                [$enabled, $ffi, $out, $capacity] = [null, null, null, 0];
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w66', self::W66_COLLECTION_HANDLER_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w66RustFfiState('ffi');
-                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return [$ffi, $out, $capacity];
-            default:
-                return $enabled;
-        }
-    }
-
-    /** Routes w66CollectionHandlerPlanBatch() to Rust until reset. */
-    public static function enableW66RustFfi(): void
-    {
-        self::w66RustFfiState('set', true);
-    }
-
-    /** Routes w66CollectionHandlerPlanBatch() to PHP until reset. */
-    public static function disableW66RustFfi(): void
-    {
-        self::w66RustFfiState('set', false);
-    }
-
-    /** Restores W66_RUST_FFI_DEFAULT and drops the cached binding and buffer; earlier toggles are untouched. */
-    public static function resetW66RustFfi(): void
-    {
-        self::w66RustFfiState('reset');
-    }
-
-    public static function usesW66RustFfi(): bool
-    {
-        $enabled = self::w66RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W66_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with w66CollectionHandlerPlanBatch() routed to Rust ($enabled) or PHP, then restores the
-     * previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW66RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w66RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w66RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * @param  array<array-key, string>  $rows
-     * @return list<int>
-     */
-    public static function w66CollectionHandlerPlanBatch(array $rows): array
-    {
-        return self::usesW66RustFfi() ? self::w66CollectionHandlerPlanBatchNative($rows) : self::w66CollectionHandlerPlanBatchPhp($rows);
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, a row holds a NUL byte or the
-     * column is not a list.
-     *
-     * @param  array<array-key, string>  $rows
-     * @return list<int>
-     */
-    public static function w66CollectionHandlerPlanBatchNative(array $rows): array
-    {
-        $count = \count($rows);
-        $words = $count + self::W66_COLLECTION_HANDLER_TAIL;
-        /** @var array{FFI, CData, int}|null $state */
-        $state = $count === 0 ? null : self::w66RustFfiState('out', $words);
-        if ($state === null || ! array_is_list($rows)) {
-            return self::w66CollectionHandlerPlanBatchPhp($rows);
-        }
-        $blob = implode("\0", $rows);
-        [$ffi, $out, $cap] = $state;
-        try {
-            // @phpstan-ignore method.notFound (Declared by W66_COLLECTION_HANDLER_FFI_CDEF.)
-            $written = $ffi->nntmux_w662_collection_handler_plan_batch($blob, \strlen($blob), $count, $out, $cap);
-        } catch (Throwable) {
-            $written = -1;
-        }
-        /** @var array<int, int>|false $values */
-        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
-
-        return \is_array($values) ? array_values($values) : self::w66CollectionHandlerPlanBatchPhp($rows);
-    }
-
-    /** @param  list<int>  $out */
-    private static function w66Digest(array $out): int
-    {
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-
-        return $digest[1];
-    }
-
-    /** A trimmed field: null when empty, its value for 1 to $max ASCII digits, otherwise false. */
-    private static function w66Int(string $value, int $max): int|false|null
-    {
-        $value = trim($value);
-        if ($value === '') {
-            return null;
-        }
-        $length = \strlen($value);
-
-        return $length <= $max && strspn($value, '0123456789') === $length ? (int) $value : false;
-    }
-
-    /** CollectionFileCheckStatus value => tail slot. */
-    private const array W66_COLLECTION_STATUSES = [0 => 0, 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 5, 15 => 6, 16 => 7];
-
-    /**
-     * Wave 66.2 collection upsert plan. Per `name\tposter\tgroup_id\ttotalfiles\tseen\tfilecheck`
-     * row `action | next_filecheck << 2 | transitioned << 7 | gibberish << 8 | hex_name << 9 |
-     * zero_total << 10 | overflow << 11 | complete_pct << 12 | min(leader, 2^20 - 1) << 19 |
-     * key_hash << 39 | poster_empty << 62`. Name and poster are trimmed and lowercased; group,
-     * totalfiles, seen and filecheck are w66Int() fields of 9, 5, 5 and 2 digits. An empty name, no
-     * positive group, an unparsable count or an unknown CollectionFileCheckStatus is malformed
-     * (action 0, no transition). Otherwise a row with status Inserted or Delete is frozen (3);
-     * the first row of a `name:totalfiles` key inserts (1, leading itself) and later ones update
-     * (2, naming the leader row). The status moves to ZeroPart for a zero total, to
-     * CompleteCollection once seen reaches the total from Default or TempComplete, and otherwise
-     * stays. A hex name has at least 16 bytes of `[0-9a-f]`; a gibberish name is not hex and has
-     * at least eight ASCII letters with fewer than one vowel per eight. The key hash is
-     * `crc32(key) & 0x7FFFFF`. Then four action and eight next-status counts (in
-     * W66_COLLECTION_STATUSES order), gibberish, hex, zero-total, overflow, transitioned and
-     * malformed rows, distinct keys, posters and groups, total seen, total expected (inserting
-     * rows) and the XXH64 digest of all earlier words.
-     *
-     * @param  array<array-key, string>  $rows
-     * @return list<int>
-     */
-    public static function w66CollectionHandlerPlanBatchPhp(array $rows): array
-    {
-        $out = $keys = $posters = $groups = [];
-        $actions = array_fill(0, 4, 0);
-        $statuses = array_fill(0, 8, 0);
-        $gibberishRows = $hexRows = $zeroRows = $overflowRows = $transitionedRows = $malformedRows = $totalSeen = $totalExpected = $index = 0;
-        foreach ($rows as $row) {
-            [$name, $poster, $group, $total, $seen, $status] = explode("\t", (string) $row, 6) + ['', '', '', '', '', ''];
-            $name = strtolower(trim($name));
-            $poster = strtolower(trim($poster));
-            $group = self::w66Int($group, 9);
-            $gid = \is_int($group) && $group > 0 ? $group : 0;
-            $total = self::w66Int($total, 5);
-            $seen = self::w66Int($seen, 5);
-            $status = self::w66Int($status, 2);
-            $st = \is_int($status) ? $status : 0;
-            $malformed = $name === '' || $gid === 0 || $total === false || $seen === false || $status === false || ! isset(self::W66_COLLECTION_STATUSES[$st]);
-            $t = \is_int($total) ? $total : 0;
-            $s = \is_int($seen) ? $seen : 0;
-            $letters = $vowels = 0;
-            foreach (count_chars($name, 1) as $byte => $n) {
-                if ($byte >= 97 && $byte <= 122) {
-                    $letters += $n;
-                    if ($byte === 97 || $byte === 101 || $byte === 105 || $byte === 111 || $byte === 117) {
-                        $vowels += $n;
-                    }
-                }
-            }
-            $length = \strlen($name);
-            $hex = $length >= 16 && strspn($name, '0123456789abcdef') === $length;
-            $gibberish = ! $hex && $letters >= 8 && $vowels * 8 < $letters;
-            $action = $next = $leader = $hash = $pct = 0;
-            $zero = $overflow = $transitioned = false;
-            if (! $malformed) {
-                $zero = $t === 0;
-                $overflow = $t > 0 && $s > $t;
-                if ($st === 4 || $st === 5) {
-                    $next = $st;
-                } elseif ($zero) {
-                    $next = $st === 0 ? 16 : $st;
-                } elseif ($s >= $t && ($st === 0 || $st === 15)) {
-                    $next = 1;
-                } else {
-                    $next = $st;
-                }
-                $transitioned = $next !== $st;
-                $pct = $t > 0 ? min(intdiv($s * 100, $t), 100) : 0;
-                $key = $name.':'.$t;
-                $hash = crc32($key) & 0x7FFFFF;
-                if ($st === 4 || $st === 5) {
-                    $action = 3;
-                } elseif (isset($keys[$key])) {
-                    $leader = $keys[$key];
-                    $action = 2;
-                } else {
-                    $keys[$key] = $leader = $index;
-                    $totalExpected += $t;
-                    $action = 1;
-                }
-                if ($poster !== '') {
-                    $posters[$poster] = true;
-                }
-                $groups[$gid] = true;
-                $totalSeen += $s;
-                $statuses[self::W66_COLLECTION_STATUSES[$next]]++;
-            }
-            $actions[$action]++;
-            $gibberishRows += (int) $gibberish;
-            $hexRows += (int) $hex;
-            $zeroRows += (int) $zero;
-            $overflowRows += (int) $overflow;
-            $transitionedRows += (int) $transitioned;
-            $malformedRows += (int) $malformed;
-            $out[] = $action | $next << 2 | (int) $transitioned << 7 | (int) $gibberish << 8 | (int) $hex << 9 | (int) $zero << 10 | (int) $overflow << 11
-                | $pct << 12 | min($leader, 0xFFFFF) << 19 | $hash << 39 | (int) ($poster === '') << 62;
-            $index++;
-        }
-        array_push($out, ...$actions, ...$statuses);
-        array_push($out, $gibberishRows, $hexRows, $zeroRows, $overflowRows, $transitionedRows, $malformedRows, \count($keys), \count($posters), \count($groups),
-            $totalSeen, $totalExpected);
-        $out[] = self::w66Digest($out);
-
-        return $out;
     }
 }

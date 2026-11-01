@@ -4,9 +4,6 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
-use App\Support\RustPipelineLibrary;
-use FFI;
-use FFI\CData;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -23,18 +20,6 @@ use RuntimeException;
  */
 final class ManifestStore
 {
-    private static bool $useRustFfi = true;
-
-    /** Wave 39.6 paired benchmarks decide this default; see RustVerificationStorePrelockManifestResetW39ParityTest. */
-    public const bool W396_RUST_FFI_DEFAULT = false;
-
-    private static ?bool $w396UseRustFfi = null;
-
-    public static function setUseRustFfi(bool $enabled): void
-    {
-        self::$useRustFfi = $enabled;
-    }
-
     private const string TABLE = 'release_verification_manifests';
 
     /** Import chunk bounds: names per transaction, and file bytes held in memory at once. */
@@ -183,12 +168,7 @@ final class ManifestStore
      * The bounded decode establishes the first member's output; check complete consumption
      * without accepting trailing bytes or extra gzip members.
      */
-    public function consumesExactly(string $body, string $json): bool
-    {
-        return $this->consumesExactlyPhp($body, $json);
-    }
-
-    public function consumesExactlyPhp(string $body, string $json): bool
+    private function consumesExactly(string $body, string $json): bool
     {
         $inflater = inflate_init(ZLIB_ENCODING_GZIP);
 
@@ -367,16 +347,11 @@ final class ManifestStore
         }
     }
 
-    public function validBody(string $name, string $body): bool
-    {
-        return $this->validBodyPhp($name, $body);
-    }
-
-    public function validBodyPhp(string $name, string $body): bool
+    private function validBody(string $name, string $body): bool
     {
         $json = @gzdecode($body);
 
-        return $json !== false && hash('sha256', $json).'.json.gz' === $name && $this->consumesExactlyPhp($body, $json);
+        return $json !== false && hash('sha256', $json).'.json.gz' === $name && $this->consumesExactly($body, $json);
     }
 
     /**
@@ -463,317 +438,10 @@ final class ManifestStore
         return is_string($body) ? $body : null;
     }
 
-    public function assertName(string $name): void
-    {
-        $this->assertNamePhp($name);
-    }
-
-    public function assertNamePhp(string $name): void
+    private function assertName(string $name): void
     {
         if (preg_match('/\A[0-9a-f]{64}\.json\.gz\z/', $name) !== 1) {
             throw new RuntimeException('Invalid manifest reference.');
         }
-    }
-
-    /** True on success, null when the candidate is unavailable; invalid names still throw. */
-    public function assertNameNative(string $name): ?bool
-    {
-        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
-            return null;
-        }
-        // @phpstan-ignore method.notFound
-        $status = $ffi->nntmux_verification_manifest_name($name, strlen($name));
-        if ($status === 0) {
-            throw new RuntimeException('Invalid manifest reference.');
-        }
-
-        return $status === 1 ? true : null;
-    }
-
-    public function validBodyNative(string $name, string $body): ?bool
-    {
-        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
-            return null;
-        }
-        $json = @gzdecode($body);
-        if ($json === false) {
-            return false;
-        }
-        // @phpstan-ignore method.notFound
-        $status = $ffi->nntmux_verification_manifest_body($name, strlen($name), $body, strlen($body), $json, strlen($json));
-
-        return $status < 0 ? null : ($status === 1 && ($this->consumesExactlyNative($body, $json) ?? $this->consumesExactlyPhp($body, $json)));
-    }
-
-    public function consumesExactlyNative(string $body, string $json): ?bool
-    {
-        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
-            return null;
-        }
-        $inflater = inflate_init(ZLIB_ENCODING_GZIP);
-        if ($inflater === false || ($inflated = @inflate_add($inflater, $body, ZLIB_FINISH)) === false) {
-            return false;
-        }
-        // @phpstan-ignore method.notFound
-        $status = $ffi->nntmux_verification_manifest_consumes(strlen($body), $json, strlen($json), $inflated, strlen($inflated), inflate_get_read_len($inflater), inflate_get_status($inflater));
-
-        return $status >= 0 ? $status === 1 : null;
-    }
-
-    public static function useW396RustFfi(?bool $enabled): void
-    {
-        self::$w396UseRustFfi = $enabled;
-    }
-
-    public static function usesW396RustFfi(): bool
-    {
-        return self::$w396UseRustFfi ?? self::W396_RUST_FFI_DEFAULT;
-    }
-
-    public static function resetW396RustFfi(): void
-    {
-        self::$w396UseRustFfi = null;
-    }
-
-    /**
-     * Admit manifest bodies, in order, against a byte budget of max(0, $maxTotalBytes). Non-integer and
-     * non-positive sizes are empty and skipped; the first non-empty size that no longer fits records its
-     * position in exceeded_index (else -1) and closes admission for the rest of the batch.
-     *
-     * @param  array<array-key, mixed>  $byteSizes
-     * @return array{items: int, non_empty: int, empty: int, accepted_bytes: int, exceeded_index: int, accepted: int}
-     */
-    public static function summarizeManifestStorageBatch(array $byteSizes, int $maxTotalBytes = 67108864): array
-    {
-        return (self::usesW396RustFfi() ? self::summarizeManifestStorageBatchNative($byteSizes, $maxTotalBytes) : null)
-            ?? self::summarizeManifestStorageBatchPhp($byteSizes, $maxTotalBytes);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $byteSizes
-     * @return array{items: int, non_empty: int, empty: int, accepted_bytes: int, exceeded_index: int, accepted: int}
-     */
-    public static function summarizeManifestStorageBatchPhp(array $byteSizes, int $maxTotalBytes = 67108864): array
-    {
-        $budget = max(0, $maxTotalBytes);
-        $items = $nonEmpty = $empty = $bytes = $accepted = 0;
-        $exceeded = -1;
-        foreach ($byteSizes as $size) {
-            $index = $items++;
-            if (! \is_int($size) || $size <= 0) {
-                $empty++;
-
-                continue;
-            }
-            $nonEmpty++;
-            if ($exceeded < 0) {
-                // $bytes never exceeds $budget, so the difference cannot overflow.
-                if ($size <= $budget - $bytes) {
-                    $bytes += $size;
-                    $accepted++;
-                } else {
-                    $exceeded = $index;
-                }
-            }
-        }
-
-        return ['items' => $items, 'non_empty' => $nonEmpty, 'empty' => $empty, 'accepted_bytes' => $bytes, 'exceeded_index' => $exceeded, 'accepted' => $accepted];
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $byteSizes
-     * @return array{items: int, non_empty: int, empty: int, accepted_bytes: int, exceeded_index: int, accepted: int}|null
-     */
-    public static function summarizeManifestStorageBatchNative(array $byteSizes, int $maxTotalBytes = 67108864): ?array
-    {
-        $sizes = [];
-        foreach ($byteSizes as $size) {
-            $sizes[] = \is_int($size) ? $size : 0;
-        }
-        $slots = CollectionReleasePolicy::w396Slots(2, 0, pack('q2', $maxTotalBytes, \count($sizes)).($sizes === [] ? '' : pack('q*', ...$sizes)), 6);
-        if ($slots === null || $slots[0] !== \count($sizes) || $slots[1] < 0 || $slots[2] < 0 || $slots[0] !== $slots[1] + $slots[2]
-            || $slots[3] < 0 || $slots[4] < -1 || $slots[4] >= $slots[0] || $slots[5] < 0 || $slots[5] > $slots[1]) {
-            return null;
-        }
-
-        return ['items' => $slots[0], 'non_empty' => $slots[1], 'empty' => $slots[2], 'accepted_bytes' => $slots[3], 'exceeded_index' => $slots[4], 'accepted' => $slots[5]];
-    }
-
-    /** Wave 51.2 paired benchmarks decide this default; see RustVerificationManifestNntpReaderDeferralsPayloadW51ParityTest. */
-    private const bool W51_RUST_FFI_DEFAULT = true;
-
-    public const string W51_FFI_CDEF = <<<'C'
-        intptr_t nntmux_w512_manifest_import_plan_batch(const char *names, size_t names_len, const char *sizes, size_t sizes_len, size_t count, int64_t max_total_bytes, int64_t *out, size_t out_cap);
-        C;
-
-    /**
-     * Wave 51 routing, binding and output buffer, kept in function-local statics. Operations:
-     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
-     * resolves the binding and 'out' returns a buffer of at least $val words (its capacity
-     * through 'cap').
-     */
-    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
-    {
-        static $enabled = null;
-        static $ffi = null;
-        static $out = null;
-        static $capacity = 0;
-
-        switch ($op) {
-            case 'set':
-                $previous = $enabled;
-                $enabled = \is_bool($val) ? $val : null;
-
-                return $previous;
-            case 'ffi':
-                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w51', self::W51_FFI_CDEF) ?? false;
-
-                return $ffi === false ? null : $ffi;
-            case 'out':
-                $words = \is_int($val) ? $val : 0;
-                if (! $out instanceof CData || $capacity < $words) {
-                    $resolved = self::w51RustFfiState('ffi');
-                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
-                    if (! $buffer instanceof CData) {
-                        return null;
-                    }
-                    [$out, $capacity] = [$buffer, max(1024, $words)];
-                }
-
-                return $out;
-            case 'cap':
-                return $capacity;
-            default:
-                return $enabled;
-        }
-    }
-
-    public static function usesW51RustFfi(): bool
-    {
-        $enabled = self::w51RustFfiState();
-
-        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
-    }
-
-    /**
-     * Runs $callback with planManifestImport() routed to Rust ($enabled) or PHP, then restores the
-     * previous routing.
-     *
-     * @template T
-     *
-     * @param  callable(): T  $callback
-     * @return T
-     */
-    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
-    {
-        $previous = self::w51RustFfiState('set', $enabled);
-        try {
-            return $callback();
-        } finally {
-            self::w51RustFfiState('set', $previous);
-        }
-    }
-
-    /**
-     * Batch import plan for manifest references. One word per name: `flags | min(strlen, 0xFFFF)
-     * << 8 | crc32(name) << 32` (flags: 1 valid name, 2 repeated name, 4 non-positive size,
-     * 8 admitted, 16 first refusal). Valid first occurrences with a positive size are admitted in
-     * order against max(0, $maxTotalBytes) until one no longer fits, which closes admission.
-     * Valid, repeated and admitted counts, admitted bytes, the exceeded index (-1 for none) and
-     * the XXH64 digest of all earlier words follow.
-     *
-     * @param  list<string>  $names
-     * @param  list<int>  $byteSizes
-     * @return list<int>
-     */
-    public static function planManifestImport(array $names, array $byteSizes, int $maxTotalBytes = 67108864): array
-    {
-        return self::usesW51RustFfi()
-            ? self::planManifestImportNative($names, $byteSizes, $maxTotalBytes)
-            : self::planManifestImportPhp($names, $byteSizes, $maxTotalBytes);
-    }
-
-    /**
-     * @param  list<string>  $names
-     * @param  list<int>  $byteSizes
-     * @return list<int>
-     */
-    public static function planManifestImportPhp(array $names, array $byteSizes, int $maxTotalBytes = 67108864): array
-    {
-        $out = $seen = [];
-        $budget = max(0, $maxTotalBytes);
-        $valid = $repeated = $admitted = $bytes = 0;
-        $exceeded = -1;
-        foreach ($names as $i => $name) {
-            $size = $byteSizes[$i] ?? 0;
-            $flags = (int) (preg_match('/\A[0-9a-f]{64}\.json\.gz\z/', $name) === 1);
-            $valid += $flags;
-            if (isset($seen[$name])) {
-                $flags |= 2;
-                $repeated++;
-            } else {
-                $seen[$name] = true;
-            }
-            if ($size <= 0) {
-                $flags |= 4;
-            } elseif (($flags & 3) === 1 && $exceeded < 0) {
-                // $bytes never exceeds $budget, so the difference cannot overflow.
-                if ($size <= $budget - $bytes) {
-                    $bytes += $size;
-                    $admitted++;
-                    $flags |= 8;
-                } else {
-                    $exceeded = $i;
-                    $flags |= 16;
-                }
-            }
-            $out[] = $flags | min(\strlen($name), 0xFFFF) << 8 | crc32($name) << 32;
-        }
-        $out[] = $valid;
-        $out[] = $repeated;
-        $out[] = $admitted;
-        $out[] = $bytes;
-        $out[] = $exceeded;
-        /** @var array{1: int} $digest */
-        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
-        $out[] = $digest[1];
-
-        return $out;
-    }
-
-    /**
-     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
-     * are not lists, or a name holds a NUL byte.
-     *
-     * @param  list<string>  $names
-     * @param  list<int>  $byteSizes
-     * @return list<int>
-     */
-    public static function planManifestImportNative(array $names, array $byteSizes, int $maxTotalBytes = 67108864): array
-    {
-        $count = \count($names);
-        $ffi = $count === 0 ? null : self::w51RustFfiState('ffi');
-        if (! $ffi instanceof FFI || \count($byteSizes) !== $count || ! array_is_list($names) || ! array_is_list($byteSizes)) {
-            return self::planManifestImportPhp($names, $byteSizes, $maxTotalBytes);
-        }
-        $joined = implode("\0", $names);
-        $sizes = pack('P*', ...$byteSizes);
-        $words = $count + 6;
-        $values = false;
-        try {
-            $out = self::w51RustFfiState('out', $words);
-            if ($out instanceof CData) {
-                // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
-                $written = $ffi->nntmux_w512_manifest_import_plan_batch($joined, \strlen($joined), $sizes, \strlen($sizes), $count, $maxTotalBytes, $out, self::w51RustFfiState('cap'));
-                $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
-            }
-        } catch (\Throwable) {
-            $values = false;
-        }
-
-        /** @var list<int>|null $result */
-        $result = \is_array($values) ? array_values($values) : null;
-
-        return $result ?? self::planManifestImportPhp($names, $byteSizes, $maxTotalBytes);
     }
 }

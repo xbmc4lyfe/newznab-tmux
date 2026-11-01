@@ -15,8 +15,6 @@ use App\Models\UserRequest;
 use App\Rules\ValidEmailDomain;
 use App\Services\Gdpr\GdprErasureService;
 use App\Support\PermissionSyncHelper;
-use App\Support\RustPipelineLibrary;
-use FFI;
 use Illuminate\Contracts\View\Factory;
 use Illuminate\Contracts\View\View;
 use Illuminate\Foundation\Application;
@@ -27,69 +25,12 @@ use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Validator;
-use InvalidArgumentException;
 use PragmaRX\Google2FALaravel\Facade as Google2FA;
-use Throwable;
 
 class ProfileController extends BasePageController
 {
-    public const string FFI_CDEF = <<<'CDEF'
-    int32_t nntmux_profile_lookup_params(
-        const char *id,
-        size_t id_len,
-        const char *name,
-        size_t name_len,
-        int64_t *out_id
-    );
-    int32_t nntmux_profile_theme_allowed(uint32_t kind, const char *value, size_t value_len);
-    int32_t nntmux_profile_numeric_classify(
-        const char *payload,
-        size_t payload_len,
-        const size_t *lens,
-        size_t count,
-        uint8_t *out_kinds,
-        int64_t *out_values,
-        size_t out_cap
-    );
-    int32_t nntmux_profile_cache_key(uint32_t kind, int64_t user_id, char *out, size_t cap);
-    CDEF;
-
-    public const int LOOKUP_NONE = 0;
-
-    public const int LOOKUP_BY_ID = 1;
-
-    public const int LOOKUP_BY_NAME = 2;
-
-    public const int THEME_PREFERENCE = 0;
-
-    public const int COLOR_SCHEME = 1;
-
-    public const int CACHE_COMPOSER_USER = 0;
-
-    public const int CACHE_CATEGORY_EXCLUSIONS = 1;
-
-    private const array THEME_PREFERENCES = ['light', 'dark', 'system'];
-
-    private const array COLOR_SCHEMES = ['blue', 'indigo', 'cyan', 'teal', 'emerald', 'violet', 'pink', 'rose', 'red', 'orange', 'amber'];
-
-    private const array CACHE_PREFIXES = [self::CACHE_COMPOSER_USER => 'composer_user_', self::CACHE_CATEGORY_EXCLUSIONS => 'user_category_exclusions_'];
-
-    private const int NUMERIC_DROP = 0;
-
-    private const int NUMERIC_INT = 1;
-
-    private const int NUMERIC_DEFER = 2;
-
     /**
-     * Production default stays false until benchmark/parity sign-off; see
-     * tests/Unit/RustProfileSecurityPrivacyInviteControllersParityTest.php.
-     */
-    private static bool $useRustFfi = false;
-
-    private static FFI|false|null $ffi = null;
-
-    /**
-     * @throws Throwable
+     * @throws \Throwable
      */
     public function show(Request $request): mixed
     {
@@ -100,18 +41,20 @@ class ProfileController extends BasePageController
         $publicView = false;
 
         if ($privileged || ! $privateProfiles) {
+            $altIdInput = $this->scalarInput($request, 'id');
+            $altID = $altIdInput !== '' && preg_match('/^\d+$/', $altIdInput) === 1 ? (int) $altIdInput : false;
             $altUsername = $this->scalarInput($request, 'name');
-            $lookup = self::profileLookupParameters($this->scalarInput($request, 'id'), $altUsername);
+            $altUsername = $altUsername !== '' ? $altUsername : false;
 
             // If both 'id' and 'name' are specified, 'id' should take precedence.
-            if ($lookup['mode'] === self::LOOKUP_BY_NAME) {
+            if ($altID === false && $altUsername !== false) {
                 $user = User::findByUsername($altUsername);
                 if ($user) {
                     $this->userdata = $user;
-                    $userID = $user['id'];
+                    $altID = $user['id'];
+                    $userID = $altID;
                 }
-            } elseif ($lookup['mode'] === self::LOOKUP_BY_ID) {
-                $altID = (int) $lookup['id'];
+            } elseif ($altID !== false) {
                 $user = User::find($altID);
                 if ($user) {
                     $this->userdata = $user;
@@ -222,7 +165,7 @@ class ProfileController extends BasePageController
                     // Update theme preference
                     if ($request->has('theme_preference')) {
                         $themeValue = $request->input('theme_preference');
-                        if (self::isAllowedThemeValue(self::THEME_PREFERENCE, $themeValue)) {
+                        if (in_array($themeValue, ['light', 'dark', 'system'], true)) {
                             User::where('id', $userid)->update(['theme_preference' => $themeValue]);
                         }
                     }
@@ -230,14 +173,14 @@ class ProfileController extends BasePageController
                     // Update color scheme
                     if ($request->has('color_scheme')) {
                         $schemeValue = $request->input('color_scheme');
-                        if (self::isAllowedThemeValue(self::COLOR_SCHEME, $schemeValue)) {
+                        if (in_array($schemeValue, ['blue', 'indigo', 'cyan', 'teal', 'emerald', 'violet', 'pink', 'rose', 'red', 'orange', 'amber'], true)) {
                             User::where('id', $userid)->update(['color_scheme' => $schemeValue]);
                         }
                     }
 
                     // Keep the composer's cached per-user data in sync with theme changes
                     if ($request->hasAny(['theme_preference', 'color_scheme'])) {
-                        Cache::forget(self::cacheKey(self::CACHE_COMPOSER_USER, $userid));
+                        Cache::forget('composer_user_'.$userid);
                     }
 
                     // Update timezone preference
@@ -249,11 +192,13 @@ class ProfileController extends BasePageController
                         }
                     }
 
-                    // Update excluded subcategories; keep numeric values as integers
-                    $excludedCategories = self::excludedCategoryIds($request->input('excluded_categories', []));
+                    // Update excluded subcategories
+                    $excludedCategories = $request->input('excluded_categories', []);
+                    // Ensure all values are integers
+                    $excludedCategories = array_map('intval', array_filter($excludedCategories, 'is_numeric'));
                     $this->userdata->syncExcludedCategories($excludedCategories);
 
-                    Cache::forget(self::cacheKey(self::CACHE_CATEGORY_EXCLUSIONS, $userid));
+                    Cache::forget('user_category_exclusions_'.$userid);
 
                     PermissionSyncHelper::syncUserPermissions($this->userdata, $request);
 
@@ -363,265 +308,13 @@ class ProfileController extends BasePageController
         $user->save();
 
         // Keep the composer's cached per-user data in sync with theme changes
-        Cache::forget(self::cacheKey(self::CACHE_COMPOSER_USER, (int) $user->id));
+        Cache::forget('composer_user_'.$user->id);
 
         return response()->json([
             'success' => true,
             'theme_preference' => $user->theme_preference,
             'color_scheme' => $user->color_scheme,
         ]);
-    }
-
-    /**
-     * Overrides the base page toggle for this controller's helpers; `null` restores the PHP default.
-     */
-    public static function setUseRustFfi(?bool $useRustFfi): void
-    {
-        self::$useRustFfi = $useRustFfi ?? false;
-    }
-
-    public static function usesRustFfi(): bool
-    {
-        return self::$useRustFfi;
-    }
-
-    public static function setFfiForTesting(FFI|false|null $ffi): void
-    {
-        self::$ffi = $ffi;
-    }
-
-    /**
-     * Alternate profile lookup: a `/^\d+$/` id takes precedence over a non-empty name.
-     *
-     * @return array{mode: int, id: int|null}
-     */
-    public static function profileLookupParameters(string $id, string $name): array
-    {
-        return self::$useRustFfi
-            ? self::profileLookupParametersNative($id, $name)
-            : self::profileLookupParametersPhp($id, $name);
-    }
-
-    /**
-     * @return array{mode: int, id: int|null}
-     */
-    public static function profileLookupParametersPhp(string $id, string $name): array
-    {
-        if ($id !== '' && preg_match('/^\d+$/', $id) === 1) {
-            return ['mode' => self::LOOKUP_BY_ID, 'id' => (int) $id];
-        }
-
-        return ['mode' => $name !== '' ? self::LOOKUP_BY_NAME : self::LOOKUP_NONE, 'id' => null];
-    }
-
-    /**
-     * @return array{mode: int, id: int|null}
-     */
-    public static function profileLookupParametersNative(string $id, string $name): array
-    {
-        $ffi = self::ffi();
-        if ($ffi === null) {
-            return self::profileLookupParametersPhp($id, $name);
-        }
-
-        try {
-            $out = $ffi->new('int64_t[1]');
-            $mode = self::callFfi($ffi, 'nntmux_profile_lookup_params', $id, \strlen($id), $name, \strlen($name), $out);
-
-            return match ($mode) {
-                self::LOOKUP_BY_ID => ['mode' => self::LOOKUP_BY_ID, 'id' => (int) $out[0]],
-                self::LOOKUP_BY_NAME, self::LOOKUP_NONE => ['mode' => $mode, 'id' => null],
-                default => self::profileLookupParametersPhp($id, $name),
-            };
-        } catch (Throwable) {
-            return self::profileLookupParametersPhp($id, $name);
-        }
-    }
-
-    /**
-     * Theme preference (`light|dark|system`) or color scheme whitelist check; strict like `in_array(..., true)`.
-     */
-    public static function isAllowedThemeValue(int $kind, mixed $value): bool
-    {
-        return self::$useRustFfi
-            ? self::isAllowedThemeValueNative($kind, $value)
-            : self::isAllowedThemeValuePhp($kind, $value);
-    }
-
-    public static function isAllowedThemeValuePhp(int $kind, mixed $value): bool
-    {
-        return match ($kind) {
-            self::THEME_PREFERENCE => \in_array($value, self::THEME_PREFERENCES, true),
-            self::COLOR_SCHEME => \in_array($value, self::COLOR_SCHEMES, true),
-            default => false,
-        };
-    }
-
-    public static function isAllowedThemeValueNative(int $kind, mixed $value): bool
-    {
-        $ffi = self::ffi();
-        if ($ffi === null || ! \is_string($value) || ($kind !== self::THEME_PREFERENCE && $kind !== self::COLOR_SCHEME)) {
-            return self::isAllowedThemeValuePhp($kind, $value);
-        }
-
-        try {
-            $allowed = self::callFfi($ffi, 'nntmux_profile_theme_allowed', $kind, $value, \strlen($value));
-
-            return match ($allowed) {
-                0 => false,
-                1 => true,
-                default => self::isAllowedThemeValuePhp($kind, $value),
-            };
-        } catch (Throwable) {
-            return self::isAllowedThemeValuePhp($kind, $value);
-        }
-    }
-
-    /**
-     * Keep `is_numeric()` excluded category values as integers, preserving keys.
-     *
-     * @param  array<array-key, mixed>  $values
-     * @return array<array-key, int>
-     */
-    public static function excludedCategoryIds(array $values): array
-    {
-        return self::$useRustFfi
-            ? self::excludedCategoryIdsNative($values)
-            : self::excludedCategoryIdsPhp($values);
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $values
-     * @return array<array-key, int>
-     */
-    public static function excludedCategoryIdsPhp(array $values): array
-    {
-        return array_map('intval', array_filter($values, 'is_numeric'));
-    }
-
-    /**
-     * Strings are classified natively; integers and floats are numeric and other types are not.
-     *
-     * @param  array<array-key, mixed>  $values
-     * @return array<array-key, int>
-     */
-    public static function excludedCategoryIdsNative(array $values): array
-    {
-        $strings = array_values(array_filter($values, 'is_string'));
-        $count = \count($strings);
-        $ffi = self::ffi();
-        if ($ffi === null || $count === 0) {
-            return self::excludedCategoryIdsPhp($values);
-        }
-
-        try {
-            $lens = $ffi->new("size_t[{$count}]");
-            foreach ($strings as $index => $string) {
-                $lens[$index] = \strlen($string);
-            }
-            $payload = implode('', $strings);
-            $kinds = $ffi->new("uint8_t[{$count}]");
-            $integers = $ffi->new("int64_t[{$count}]");
-            $classified = self::callFfi($ffi, 'nntmux_profile_numeric_classify', $payload, \strlen($payload), $lens, $count, $kinds, $integers, $count);
-            if ($classified !== $count) {
-                return self::excludedCategoryIdsPhp($values);
-            }
-
-            $result = [];
-            $index = 0;
-            foreach ($values as $key => $value) {
-                if (\is_string($value)) {
-                    $kind = $kinds[$index];
-                    $integer = $integers[$index];
-                    $index++;
-                    if ($kind === self::NUMERIC_INT) {
-                        $result[$key] = (int) $integer;
-                    } elseif ($kind === self::NUMERIC_DEFER) {
-                        $result[$key] = (int) $value;
-                    } elseif ($kind !== self::NUMERIC_DROP) {
-                        return self::excludedCategoryIdsPhp($values);
-                    }
-                } elseif (\is_int($value) || \is_float($value)) {
-                    $result[$key] = (int) $value;
-                }
-            }
-
-            return $result;
-        } catch (Throwable) {
-            return self::excludedCategoryIdsPhp($values);
-        }
-    }
-
-    /**
-     * `composer_user_{id}` or `user_category_exclusions_{id}` cache key.
-     *
-     * @throws InvalidArgumentException for an unknown kind
-     */
-    public static function cacheKey(int $kind, int $userId): string
-    {
-        return self::$useRustFfi
-            ? self::cacheKeyNative($kind, $userId)
-            : self::cacheKeyPhp($kind, $userId);
-    }
-
-    /**
-     * @throws InvalidArgumentException for an unknown kind
-     */
-    public static function cacheKeyPhp(int $kind, int $userId): string
-    {
-        if (! isset(self::CACHE_PREFIXES[$kind])) {
-            throw new InvalidArgumentException("Unknown profile cache key kind {$kind}.");
-        }
-
-        return self::CACHE_PREFIXES[$kind].$userId;
-    }
-
-    /**
-     * @throws InvalidArgumentException for an unknown kind
-     */
-    public static function cacheKeyNative(int $kind, int $userId): string
-    {
-        $ffi = self::ffi();
-        if ($ffi === null || ! isset(self::CACHE_PREFIXES[$kind])) {
-            return self::cacheKeyPhp($kind, $userId);
-        }
-
-        try {
-            $capacity = 0;
-            $out = RustPipelineLibrary::obtainScratch($ffi, 64, $capacity);
-            if ($out === null) {
-                return self::cacheKeyPhp($kind, $userId);
-            }
-            $written = self::callFfi($ffi, 'nntmux_profile_cache_key', $kind, $userId, $out, $capacity);
-            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
-                return self::cacheKeyPhp($kind, $userId);
-            }
-
-            return FFI::string($out, $written);
-        } catch (Throwable) {
-            return self::cacheKeyPhp($kind, $userId);
-        }
-    }
-
-    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
-    {
-        return $ffi->$symbol(...$args);
-    }
-
-    private static function ffi(): ?FFI
-    {
-        if (self::$ffi === false) {
-            return null;
-        }
-
-        if (self::$ffi instanceof FFI) {
-            return self::$ffi;
-        }
-
-        $ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
-        self::$ffi = $ffi ?? false;
-
-        return $ffi;
     }
 
     /**
