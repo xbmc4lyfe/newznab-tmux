@@ -65,6 +65,18 @@ foreach (Fixture::unverifiableSinglePartBodies() as $name => [$corrupt]) {
 foreach (Fixture::invalidMultipartBodies() as $name => [$corrupt]) {
     $cases['multipart-'.$name] = [fixture('nzb', 3, 2, false), fn ($id) => $id === 'f1-s1@fixture' ? ['body' => $corrupt(fixture('segmentArticle', $id, 2)['body'])] + fixture('segmentArticle', $id, 2) : fixture('segmentArticle', $id, 2)];
 }
+foreach ([1, 2] as $segments) {
+    foreach (['line', 'size', 'name'] as $field) {
+        $cases['missing-ybegin-'.$field.'-'.$segments] = [fixture('nzb', 3, $segments, false), function ($id) use ($segments, $field) {
+            $a = fixture('segmentArticle', $id, $segments);
+            if ($id === 'f1-s1@fixture') {
+                $a['body'] = preg_replace_callback('/^=ybegin [^\r\n]*/m', static fn ($m) => preg_replace('/(?:^| )'.$field.'=[^ ]*/', '', $m[0]), $a['body']);
+            }
+
+            return $a;
+        }];
+    }
+}
 $cases['empty'] = [fixture('nzb', 3, 1, false), fn ($id) => ['body' => YencArticles::article('')] + fixture('article', $id)];
 $cases['par2'] = [fixture('par2Nzb', ['offline-0000.bin']), fn ($id) => ['body' => YencArticles::article($id === 'index@fixture' ? ArchiveParsingBenchmarkFixtures::par2(1) : 'payload')] + fixture('article', $id)];
 foreach (Fixture::invalidEmptyFileHeaders() as $name => [$header]) {

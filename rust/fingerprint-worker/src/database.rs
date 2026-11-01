@@ -11,14 +11,7 @@ use rand::RngCore;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{MySqlPool, Row};
-use std::{
-    io::Read,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
-    time::Duration,
-};
+use std::{io::Read, sync::Arc, time::Duration};
 
 pub const LEASE_SECONDS: u64 = 120;
 #[derive(Debug, Clone)]
@@ -29,7 +22,7 @@ pub struct Claim {
     pub token: String,
     pub body: Vec<u8>,
     pub attempts: u32,
-    pub held_slots: Arc<AtomicU32>,
+    pub held_slots: Arc<tokio::sync::Mutex<u32>>,
 }
 pub fn token() -> String {
     let mut bytes = [0u8; 16];
@@ -55,7 +48,7 @@ pub fn decode_nzb(claim: &Claim) -> Result<String> {
     if hex::encode(sha.finalize()) != claim.source_digest {
         bail!("NzbSourceDigestMismatch");
     }
-    Ok(String::from_utf8(body)?)
+    crate::manifest::decode_xml(&body)
 }
 pub async fn claim(pool: &MySqlPool, worker: &str) -> Result<Option<Claim>> {
     // One indexed range per state: an OR across both states forces a filesort of every pending row.
@@ -95,7 +88,7 @@ pub async fn claim(pool: &MySqlPool, worker: &str) -> Result<Option<Claim>> {
             continue;
         };
         let digest: String = source.try_get("source_digest")?;
-        let row=sqlx::query("SELECT source_digest, attempts FROM release_fingerprint_jobs WHERE release_id=? AND ((status='pending' AND available_at<=UTC_TIMESTAMP(6)) OR (status='processing' AND lease_until<UTC_TIMESTAMP(6))) FOR UPDATE").bind(id).fetch_optional(&mut *tx).await?;
+        let row=sqlx::query("SELECT source_digest, attempts, lease_token FROM release_fingerprint_jobs WHERE release_id=? AND ((status='pending' AND available_at<=UTC_TIMESTAMP(6)) OR (status='processing' AND lease_until<UTC_TIMESTAMP(6))) FOR UPDATE").bind(id).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             tx.rollback().await?;
             continue;
@@ -108,6 +101,8 @@ pub async fn claim(pool: &MySqlPool, worker: &str) -> Result<Option<Claim>> {
         }
         let attempts: u32 = row.try_get("attempts")?;
         if attempts >= 3 {
+            let old_token: Option<String> = row.try_get("lease_token")?;
+            persist_failure(&mut tx, id, old_token.as_deref(), "AttemptsExhausted").await?;
             sqlx::query("UPDATE release_fingerprint_jobs SET status='failed',lease_token=NULL,lease_until=NULL,worker_id=NULL,last_error='AttemptsExhausted',updated_at=UTC_TIMESTAMP(6) WHERE release_id=?").bind(id).execute(&mut *tx).await?;
             tx.commit().await?;
             continue;
@@ -123,33 +118,36 @@ pub async fn claim(pool: &MySqlPool, worker: &str) -> Result<Option<Claim>> {
             token,
             body,
             attempts: attempts + 1,
-            held_slots: Arc::new(AtomicU32::new(0)),
+            held_slots: Arc::new(tokio::sync::Mutex::new(0)),
         }));
     }
     Ok(None)
 }
 pub async fn renew(pool: &MySqlPool, c: &Claim) -> Result<bool> {
+    let expected = c.held_slots.lock().await;
     let updated=sqlx::query("UPDATE release_fingerprint_jobs SET lease_until=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)),updated_at=UTC_TIMESTAMP(6) WHERE release_id=? AND status='processing' AND lease_token=? AND source_digest=? AND lease_until>UTC_TIMESTAMP(6)").bind(LEASE_SECONDS).bind(c.release_id).bind(&c.token).bind(&c.source_digest).execute(pool).await?.rows_affected();
     if updated != 1 {
         return Ok(false);
     }
-    let expected = c.held_slots.load(Ordering::SeqCst);
     let renewed=sqlx::query("UPDATE release_fingerprint_connections SET lease_until=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)) WHERE lease_token=? AND lease_until>UTC_TIMESTAMP(6)").bind(LEASE_SECONDS).bind(&c.token).execute(pool).await?.rows_affected();
-    Ok(renewed == u64::from(expected))
+    Ok(renewed == u64::from(*expected))
 }
 pub async fn slot(pool: &MySqlPool, c: &Claim, provider: &str, worker: &str) -> Result<u32> {
     let started = std::time::Instant::now();
     loop {
+        // Keep the committed rows and local count indivisible to the heartbeat.
+        let mut held = c.held_slots.lock().await;
         let mut tx = pool.begin().await?;
         let row=sqlx::query("SELECT slot FROM release_fingerprint_connections WHERE provider=? AND (lease_token IS NULL OR lease_until<UTC_TIMESTAMP(6)) ORDER BY slot LIMIT 1 FOR UPDATE SKIP LOCKED").bind(provider).fetch_optional(&mut *tx).await?;
         if let Some(row) = row {
             let slot: u32 = row.try_get("slot")?;
             sqlx::query("UPDATE release_fingerprint_connections SET lease_token=?,lease_until=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)),worker_id=? WHERE provider=? AND slot=?").bind(&c.token).bind(LEASE_SECONDS).bind(worker).bind(provider).bind(slot).execute(&mut *tx).await?;
             tx.commit().await?;
-            c.held_slots.fetch_add(1, Ordering::SeqCst);
+            *held += 1;
             return Ok(slot);
         }
         tx.rollback().await?;
+        drop(held);
         if started.elapsed() > Duration::from_secs(90) {
             bail!("ProviderConnectionBudgetExhausted");
         }
@@ -157,7 +155,9 @@ pub async fn slot(pool: &MySqlPool, c: &Claim, provider: &str, worker: &str) -> 
     }
 }
 pub async fn release_slots(pool: &MySqlPool, c: &Claim) -> Result<()> {
+    let mut held = c.held_slots.lock().await;
     sqlx::query("UPDATE release_fingerprint_connections SET lease_token=NULL,lease_until=NULL,worker_id=NULL WHERE lease_token=?").bind(&c.token).execute(pool).await?;
+    *held = 0;
     Ok(())
 }
 pub async fn finish(pool: &MySqlPool, c: &Claim, status: &str, metadata: &Value) -> Result<bool> {
@@ -201,8 +201,50 @@ pub async fn finish(pool: &MySqlPool, c: &Claim, status: &str, metadata: &Value)
     tx.commit().await?;
     Ok(true)
 }
+async fn persist_failure(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    release_id: u64,
+    token: Option<&str>,
+    kind: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO release_fingerprint_metadata (releases_id,status,metadata,last_error,collected_at,run_token,created_at,updated_at) VALUES (?,'failed',NULL,?,UTC_TIMESTAMP(),?,UTC_TIMESTAMP(),UTC_TIMESTAMP()) ON DUPLICATE KEY UPDATE status='failed',metadata=NULL,last_error=VALUES(last_error),collected_at=VALUES(collected_at),run_token=VALUES(run_token),updated_at=VALUES(updated_at)")
+        .bind(release_id).bind(kind).bind(token.map(|s| &s[..s.len().min(16)]))
+        .execute(&mut **tx).await?;
+    Ok(())
+}
 pub async fn fail(pool: &MySqlPool, c: &Claim, kind: &str) -> Result<()> {
-    let final_attempt = c.attempts >= 3;
-    sqlx::query("UPDATE release_fingerprint_jobs SET status=?,available_at=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)),lease_token=NULL,lease_until=NULL,worker_id=NULL,last_error=?,updated_at=UTC_TIMESTAMP(6) WHERE release_id=? AND status='processing' AND lease_token=? AND source_digest=? AND lease_until>UTC_TIMESTAMP(6)").bind(if final_attempt{"failed"}else{"pending"}).bind(30*c.attempts).bind(kind).bind(c.release_id).bind(&c.token).bind(&c.source_digest).execute(pool).await?;
+    let mut tx = pool.begin().await?;
+    let release = sqlx::query("SELECT guid FROM releases WHERE id=? FOR UPDATE")
+        .bind(c.release_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(release) = release else {
+        return Ok(());
+    };
+    let guid: String = release.try_get("guid")?;
+    let source =
+        sqlx::query("SELECT source_digest FROM release_nzb_contents WHERE guid=? FOR UPDATE")
+            .bind(&guid)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(source) = source else {
+        return Ok(());
+    };
+    if source.try_get::<String, _>("source_digest")? != c.source_digest {
+        return Ok(());
+    }
+    let job = sqlx::query("SELECT attempts FROM release_fingerprint_jobs WHERE release_id=? AND status='processing' AND lease_token=? AND source_digest=? AND lease_until>UTC_TIMESTAMP(6) FOR UPDATE")
+        .bind(c.release_id).bind(&c.token).bind(&c.source_digest).fetch_optional(&mut *tx).await?;
+    let Some(job) = job else {
+        return Ok(());
+    };
+    let attempts: u32 = job.try_get("attempts")?;
+    let final_attempt = attempts >= 3;
+    if final_attempt {
+        persist_failure(&mut tx, c.release_id, Some(&c.token), kind).await?;
+    }
+    sqlx::query("UPDATE release_fingerprint_jobs SET status=?,available_at=TIMESTAMPADD(SECOND,?,UTC_TIMESTAMP(6)),lease_token=NULL,lease_until=NULL,worker_id=NULL,last_error=?,updated_at=UTC_TIMESTAMP(6) WHERE release_id=?")
+        .bind(if final_attempt {"failed"} else {"pending"}).bind(30*attempts).bind(kind).bind(c.release_id).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }

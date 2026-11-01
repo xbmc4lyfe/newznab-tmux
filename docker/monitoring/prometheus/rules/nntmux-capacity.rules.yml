@@ -97,6 +97,13 @@ groups:
         expr: nntmux_queue_wait_seconds > 600
         for: 15m
         annotations: {summary: "A Horizon queue's estimated wait exceeds 10m."}
+      # Rust workers run independently of Horizon and must be installed before cutover.
+      - alert: NntmuxRustFingerprintWorkersMissing
+        expr: |
+          sum(nntmux_fingerprint_jobs{status=~"pending|processing"}) > 0
+            and on() sum(nntmux_fingerprint_live_claims) == 0
+        for: 5m
+        annotations: {summary: "Database fingerprint jobs have waited without a live Rust claim for 5m; start or repair the standalone workers."}
       - alert: NntmuxHorizonDown
         expr: nntmux_horizon_up == 0
         for: 2m

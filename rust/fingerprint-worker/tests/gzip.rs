@@ -1,12 +1,11 @@
 use flate2::{Compression, write::GzEncoder};
 use nntmux_fingerprint_worker::database::{self, Claim};
 use sha2::{Digest, Sha256};
-use std::{
-    io::Write,
-    sync::{Arc, atomic::AtomicU32},
-};
+use std::{io::Write, sync::Arc};
 fn claim() -> Claim {
-    let xml = b"<nzb>fixture</nzb>";
+    claim_bytes(b"<nzb>fixture</nzb>")
+}
+fn claim_bytes(xml: &[u8]) -> Claim {
     let mut encoder = GzEncoder::new(vec![], Compression::default());
     encoder.write_all(xml).unwrap();
     let mut sha = Sha256::new();
@@ -19,7 +18,7 @@ fn claim() -> Claim {
         source_digest: hex::encode(sha.finalize()),
         token: database::token(),
         attempts: 1,
-        held_slots: Arc::new(AtomicU32::new(0)),
+        held_slots: Arc::new(tokio::sync::Mutex::new(0)),
     }
 }
 #[test]
@@ -59,4 +58,57 @@ fn wrong_source_digest_rejected() {
     let mut c = claim();
     c.source_digest = "0".repeat(64);
     assert!(database::decode_nzb(&c).is_err());
+}
+
+#[test]
+fn declared_xml_encodings_preserve_manifest_and_original_digest() {
+    use nntmux_fingerprint_worker::manifest;
+    let template = r#"<?xml version="1.0" encoding="ENCODING"?><nzb><file subject="café.rar" poster="Müller"><groups><group>a.b</group></groups><segments><segment bytes="3" number="1">x@y</segment></segments></file></nzb>"#;
+    let latin = template
+        .replace("ENCODING", "ISO-8859-1")
+        .chars()
+        .map(|c| c as u8)
+        .collect::<Vec<_>>();
+    let mut sources = vec![latin];
+    for little in [true, false] {
+        let mut bytes = if little {
+            vec![0xff, 0xfe]
+        } else {
+            vec![0xfe, 0xff]
+        };
+        for unit in template.replace("ENCODING", "UTF-16").encode_utf16() {
+            bytes.extend(if little {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            });
+        }
+        sources.push(bytes);
+    }
+    for source in sources {
+        let mut claim = claim_bytes(&source);
+        let xml = database::decode_nzb(&claim).unwrap();
+        let files = manifest::parse(&xml).unwrap();
+        assert_eq!(files[0].subject, "café.rar");
+        assert_eq!(files[0].poster, "Müller");
+        assert_eq!(files[0].segments[0].messageid, "x@y");
+        claim.source_digest = "0".repeat(64);
+        assert!(
+            database::decode_nzb(&claim)
+                .unwrap_err()
+                .to_string()
+                .contains("NzbSourceDigestMismatch")
+        );
+    }
+}
+#[test]
+fn invalid_xml_encoding_is_rejected_without_replacement() {
+    for source in [
+        b"<?xml version='1.0' encoding='unknown'?><nzb/>".as_slice(),
+        b"<?xml version='1.0' encoding='UTF-8'?><nzb>\xff</nzb>",
+        b"\xff\xfe<\0?",
+        b"\xff\xfe\x00\xd8",
+    ] {
+        assert!(database::decode_nzb(&claim_bytes(source)).is_err());
+    }
 }

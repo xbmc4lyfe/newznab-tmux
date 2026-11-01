@@ -7,10 +7,13 @@ namespace Tests\Feature;
 use App\Facades\Search;
 use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Models\Release;
+use App\Services\AdditionalProcessing\NzbContentParser;
 use App\Services\Monitoring\Collectors\DatabaseFingerprintCollector;
 use App\Services\Monitoring\Prometheus\TextFormatter;
 use App\Services\Monitoring\PrometheusMetricsExporter;
 use App\Services\Nzb\DatabaseNzbStore;
+use App\Services\Nzb\NzbImportService;
+use App\Services\Nzb\NzbParserService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\ReleaseImageService;
@@ -21,6 +24,7 @@ use App\Services\Releases\Verification\VerifiedNzbWriter;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Redis\Connections\PhpRedisConnection;
 use Illuminate\Redis\RedisManager;
+use Illuminate\Support\Env;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Schema;
@@ -34,7 +38,7 @@ final class DatabaseNzbStorageTest extends TestCase
     protected function setUp(): void
     {
         parent::setUp();
-        config(['nntmux.nzb_storage' => 'database', 'nntmux.fingerprint_worker' => 'rust']);
+        config(['nntmux.nzb_storage' => 'database', 'nntmux.fingerprint_worker' => 'rust', 'nntmux.nzb_legacy_reads' => false]);
         Schema::create('releases', static function (Blueprint $table): void {
             $table->increments('id');
             $table->string('guid', 40)->unique();
@@ -129,6 +133,108 @@ final class DatabaseNzbStorageTest extends TestCase
         } catch (RuntimeException) {
             self::assertSame('<nzb>new</nzb>', app(DatabaseNzbStore::class)->read('db-nzb-one'));
         }
+    }
+
+    public function test_default_cutover_reads_legacy_archives_while_new_writes_use_the_database(): void
+    {
+        $environment = Env::getRepository();
+        $key = 'NZB_DATABASE_LEGACY_READS';
+        $original = $environment->get($key);
+        $environment->clear($key);
+        $path = tempnam(sys_get_temp_dir(), 'legacy-nzb-');
+        file_put_contents($path, gzencode('<nzb>legacy archive</nzb>'));
+        try {
+            $defaults = require config_path('nntmux.php');
+            self::assertTrue($defaults['nzb_legacy_reads']);
+            config(['nntmux.nzb_legacy_reads' => $defaults['nzb_legacy_reads']]);
+            app(NzbService::class)->shouldReceive('nzbPathCandidates')->with('db-nzb-one')->andReturn([$path]);
+            self::assertSame('<nzb>legacy archive</nzb>', app(NzbService::class)->readNzbContents('db-nzb-one'));
+            self::assertTrue(app(NzbService::class)->hasNzb('db-nzb-one'));
+            self::assertTrue($this->importer()->store('<nzb>new upload</nzb>')[0]);
+            self::assertSame('<nzb>new upload</nzb>', app(NzbService::class)->readNzbContents('db-nzb-one'));
+            self::assertSame('<nzb>legacy archive</nzb>', gzdecode(file_get_contents($path)));
+        } finally {
+            unlink($path);
+            if ($original !== null) {
+                $environment->set($key, $original);
+            }
+        }
+    }
+
+    private function importer(): object
+    {
+        return new class(app(NzbService::class)) extends NzbImportService
+        {
+            public function __construct(NzbService $nzb)
+            {
+                $this->nzb = $nzb;
+                $this->relId = 1;
+                $this->relGuid = 'db-nzb-one';
+            }
+
+            public function store(string $xml): array
+            {
+                return $this->storeImportedNzb($xml);
+            }
+        };
+    }
+
+    public function test_database_storage_failure_removes_only_the_release_without_a_source(): void
+    {
+        DB::statement("CREATE TRIGGER reject_source BEFORE INSERT ON release_nzb_contents BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END");
+        $importer = $this->importer();
+        self::assertFalse($importer->store('<nzb>valid</nzb>')[0]);
+        self::assertFalse(DB::table('releases')->where('id', 1)->exists());
+        self::assertSame(0, DB::table('release_nzb_contents')->count());
+        self::assertSame(0, DB::table('release_fingerprint_jobs')->count());
+        self::assertSame(0, DB::table('release_archive_naming_evidence')->count());
+    }
+
+    public function test_database_storage_failure_preserves_an_existing_generation(): void
+    {
+        app(DatabaseNzbStore::class)->put($this->release(), '<nzb>retained</nzb>');
+        DB::statement("CREATE TRIGGER reject_source BEFORE UPDATE ON release_nzb_contents BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END");
+        self::assertFalse($this->importer()->store('<nzb>replacement</nzb>')[0]);
+        self::assertTrue(DB::table('releases')->where('id', 1)->exists());
+        self::assertSame('<nzb>retained</nzb>', app(DatabaseNzbStore::class)->read('db-nzb-one'));
+        self::assertSame(NzbSourceGuard::digest('<nzb>retained</nzb>'), DB::table('release_fingerprint_jobs')->value('source_digest'));
+    }
+
+    private function repairLegacy(string $raw, string $current): ?string
+    {
+        config(['nntmux.nzb_legacy_reads' => true]);
+        app(NzbService::class)->shouldReceive('readLegacyNzbContents')->with('db-nzb-one')->andReturn($current);
+        $parser = new NzbContentParser(app(NzbService::class), app(NzbParserService::class));
+
+        return $parser->repairNzb($raw, 'database-nzb:db-nzb-one', 'db-nzb-one');
+    }
+
+    public function test_legacy_repair_imports_and_replaces_the_validated_generation_atomically(): void
+    {
+        $raw = '<nzb><file subject="test.bin"><segments><segment bytes="1" number="1">one@test</segment></segments></file>';
+        $fixed = $this->repairLegacy($raw, $raw);
+        self::assertNotNull($fixed);
+        self::assertSame($fixed, app(DatabaseNzbStore::class)->read('db-nzb-one'));
+        self::assertSame(NzbSourceGuard::digest($fixed), DB::table('release_fingerprint_jobs')->value('source_digest'));
+        self::assertSame(1, DB::table('release_nzb_contents')->count());
+    }
+
+    public function test_legacy_repair_rejects_a_changed_fallback_without_importing_it(): void
+    {
+        $raw = '<nzb><file subject="test.bin"/>';
+        self::assertNull($this->repairLegacy($raw, '<nzb>new source</nzb>'));
+        self::assertSame(0, DB::table('release_nzb_contents')->count());
+        self::assertSame(0, DB::table('release_fingerprint_jobs')->count());
+    }
+
+    public function test_failed_legacy_repair_rolls_back_the_initial_import_too(): void
+    {
+        $raw = '<nzb><file subject="test.bin"/>';
+        DB::statement("CREATE TRIGGER reject_repair BEFORE UPDATE ON release_nzb_contents BEGIN SELECT RAISE(ABORT, 'replacement unavailable'); END");
+        self::assertNull($this->repairLegacy($raw, $raw));
+        self::assertSame(0, DB::table('release_nzb_contents')->count());
+        self::assertSame(0, DB::table('release_fingerprint_jobs')->count());
+        self::assertSame(0, DB::table('release_archive_naming_evidence')->count());
     }
 
     public function test_bounded_reader_and_integrity_validation_reject_bad_sources(): void
