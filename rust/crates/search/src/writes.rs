@@ -312,10 +312,7 @@ impl SearchClient {
             let statement = format!("TRUNCATE TABLE {}", safe_table(table)?);
             match self.sql(&statement).await {
                 Ok(_) => info!(table, "truncated the index"),
-                Err(error)
-                    if error.to_string().contains("does not exist")
-                        || error.to_string().contains("unknown") =>
-                {
+                Err(error) if error.to_string().contains("does not exist") => {
                     self.create_index_if_missing(table).await;
                 }
                 Err(error) => {

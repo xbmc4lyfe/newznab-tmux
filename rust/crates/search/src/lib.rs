@@ -25,10 +25,12 @@ mod release_query;
 mod repair;
 mod writes;
 
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::Result;
 use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
+use sqlx::MySqlPool;
 use tracing::{info, warn};
 
 /// What the PHP scheduler passed to `nntmux:search-repair` each minute.
@@ -60,25 +62,49 @@ pub use writes::{MovieDocument, TvShowDocument};
 /// Retries due index failures until told to stop. Holds off while processing is paused.
 pub async fn run_sync(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let client = SearchClient::from_ctx(&ctx)?;
+    sync_loop(&client, &ctx.db, || ctx.paused(), &args, &stop).await
+}
+
+/// A database or Manticore failure waits for the next pass, since the failure rows are durable
+/// and the old schedule simply ran again a minute later. With `--once` it's the exit code.
+#[doc(hidden)]
+pub async fn sync_loop<P, F>(
+    client: &SearchClient,
+    db: &MySqlPool,
+    paused: P,
+    args: &RoleArgs,
+    stop: &Shutdown,
+) -> Result<()>
+where
+    P: Fn() -> F,
+    F: Future<Output = Result<bool>>,
+{
     let idle = Duration::from_secs(args.idle_seconds);
     while !stop.requested() {
-        if !ctx.paused().await? {
-            match client.repair(&ctx.db, SYNC_BATCH).await {
-                Ok(report) if report.due > 0 => {
-                    info!(
-                        due = report.due,
-                        repaired = report.repaired,
-                        "repaired the search index"
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => warn!(%error, "search repair failed"),
-            }
-        }
+        let pass = sync_pass(client, db, paused().await).await;
         if args.once {
-            break;
+            return pass;
+        }
+        if let Err(error) = pass {
+            warn!(error = %format!("{error:#}"), "search repair failed");
         }
         stop.sleep(idle).await;
+    }
+    Ok(())
+}
+
+async fn sync_pass(client: &SearchClient, db: &MySqlPool, paused: Result<bool>) -> Result<()> {
+    // Unknown state: claim nothing until the database answers.
+    if paused? {
+        return Ok(());
+    }
+    let report = client.repair(db, SYNC_BATCH).await?;
+    if report.due > 0 {
+        info!(
+            due = report.due,
+            repaired = report.repaired,
+            "repaired the search index"
+        );
     }
     Ok(())
 }

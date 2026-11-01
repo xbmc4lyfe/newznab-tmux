@@ -1,10 +1,11 @@
 //! Repair, reconcile and table commands against real services. Skips unless
 //! `TEST_DATABASE_URL` and `TEST_MANTICORE_HTTP` are set.
 
+use nntmux_runtime::{RoleArgs, Shutdown};
 use nntmux_search::config::{IndexNames, LOGICAL_INDEXES};
 use nntmux_search::{
     Command, PredbHit, ReconcileOptions, ReleaseDocument, ReleaseSearchQuery, SearchClient,
-    SearchConfig, run_command,
+    SearchConfig, run_command, sync_loop,
 };
 use nntmux_testkit::TestDb;
 use sqlx::MySqlPool;
@@ -462,4 +463,112 @@ async fn every_command_runs_against_real_services() {
     assert!(run_command(&client, pool, unknown).await.is_err());
 
     finish(db, client).await;
+}
+
+fn role_args(once: bool) -> RoleArgs {
+    RoleArgs {
+        concurrency: 1,
+        idle_seconds: 0,
+        once,
+    }
+}
+
+#[tokio::test]
+async fn the_sync_role_repairs_and_holds_off_while_paused() {
+    let Some((db, client)) = live().await else {
+        return;
+    };
+    let pool = &db.pool;
+    seed_release(pool, 31).await;
+    failure(pool, 31, "upsert", 1, "insertRelease", true).await;
+    let stop = Shutdown::default();
+
+    sync_loop(
+        &client,
+        pool,
+        || async { Ok(true) },
+        &role_args(true),
+        &stop,
+    )
+    .await
+    .unwrap();
+    assert!(
+        indexed_ids(&client).await.is_empty(),
+        "paused means no repair"
+    );
+
+    sync_loop(
+        &client,
+        pool,
+        || async { Ok(false) },
+        &role_args(true),
+        &stop,
+    )
+    .await
+    .unwrap();
+    assert_eq!(indexed_ids(&client).await, [31]);
+
+    finish(db, client).await;
+}
+
+#[tokio::test]
+async fn the_sync_role_reports_failures_once_and_survives_them_otherwise() {
+    let Some(db) = TestDb::create().await.unwrap() else {
+        return;
+    };
+    let pool = &db.pool;
+    let client = SearchClient::new(SearchConfig::new("http://127.0.0.1:9"), None).unwrap();
+    let stop = Shutdown::default();
+
+    let paused_failed = sync_loop(
+        &client,
+        pool,
+        || async { Err(anyhow::anyhow!("the database went away")) },
+        &role_args(true),
+        &stop,
+    )
+    .await;
+    assert!(paused_failed.is_err());
+
+    sqlx::query("DROP TABLE search_index_failures")
+        .execute(pool)
+        .await
+        .unwrap();
+    let repair_failed = sync_loop(
+        &client,
+        pool,
+        || async { Ok(false) },
+        &role_args(true),
+        &stop,
+    )
+    .await;
+    assert!(repair_failed.is_err());
+
+    // A long-running role keeps going through both kinds of failure until told to stop.
+    let calls = std::sync::atomic::AtomicU32::new(0);
+    let looping = sync_loop(
+        &client,
+        pool,
+        || {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let stop = stop.clone();
+            async move {
+                match call {
+                    0 => Err(anyhow::anyhow!("the database went away")),
+                    1 => Ok(false),
+                    _ => {
+                        stop.request();
+                        Ok(true)
+                    }
+                }
+            }
+        },
+        &role_args(false),
+        &stop,
+    )
+    .await;
+    assert!(looping.is_ok());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    db.drop_database().await.unwrap();
 }
