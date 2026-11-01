@@ -2368,12 +2368,17 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "nntmux-core",
  "nntmux-runtime",
  "nntmux-testkit",
+ "redis",
+ "reqwest",
  "serde_json",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2545,7 +2550,6 @@ dependencies = [
  "metrics",
  "nntmux-core",
  "nntmux-ops",
- "nntmux-predb",
  "nntmux-runtime",
  "nntmux-testkit",
  "redis",

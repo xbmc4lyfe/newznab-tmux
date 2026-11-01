@@ -6,12 +6,10 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::Utc;
 use nntmux_core::parsed_or;
+use nntmux_ops::runtime_state::heartbeat_key;
 use nntmux_runtime::{Ctx, Shutdown, downtime};
 use redis::AsyncCommands;
 use tracing::{info, warn};
-
-/// When the monitor last ran, for `nntmux-ctl ops health-check`.
-pub const HEARTBEAT_KEY: &str = "nntmux:supervisor:heartbeat";
 
 const DEFAULT_DELAY_HOURS: i64 = 2;
 
@@ -44,9 +42,19 @@ pub async fn compensate_on_start(ctx: &Ctx, stop: &Shutdown) -> Result<()> {
 }
 
 /// Runs beside the schedule, because the compensation lock can be held for a long time. A failed
-/// compensation only warns: the next activity recorded claims the same outage.
+/// compensation only warns: the next activity recorded claims the same outage. The heartbeat has its
+/// own task, so a held lock can't make a live supervisor look dead.
 pub async fn run(ctx: Ctx, stop: Shutdown) {
-    let delay = parsed_or("TMUX_MONITOR_DELAY", 10u64).unwrap_or(10).max(1);
+    let delay = Duration::from_secs(parsed_or("TMUX_MONITOR_DELAY", 10u64).unwrap_or(10).max(1));
+    let heartbeat = tokio::spawn({
+        let (ctx, stop) = (ctx.clone(), stop.clone());
+        async move {
+            while !stop.requested() {
+                beat(&ctx).await;
+                stop.sleep(delay).await;
+            }
+        }
+    });
     if let Err(failure) = compensate_on_start(&ctx, &stop).await {
         warn!(
             error = format!("{failure:#}"),
@@ -54,19 +62,24 @@ pub async fn run(ctx: Ctx, stop: Shutdown) {
         );
     }
     while !stop.requested() {
-        beat(&ctx, &stop).await;
-        stop.sleep(Duration::from_secs(delay)).await;
+        mark_activity(&ctx, &stop).await;
+        stop.sleep(delay).await;
+    }
+    let _ = heartbeat.await;
+}
+
+async fn beat(ctx: &Ctx) {
+    let mut redis = ctx.redis.clone();
+    let heartbeat: redis::RedisResult<()> =
+        redis.set(heartbeat_key(ctx), Utc::now().timestamp()).await;
+    if let Err(failure) = heartbeat {
+        warn!(error = %failure, "unable to record the supervisor heartbeat");
     }
 }
 
 /// Monitoring must never stop the supervisor, so failures only warn. A pause stops the activity
 /// marker, so the paused time counts as downtime, as it did when the monitor exited on the flag.
-async fn beat(ctx: &Ctx, stop: &Shutdown) {
-    let mut redis = ctx.redis.clone();
-    let heartbeat: redis::RedisResult<()> = redis.set(HEARTBEAT_KEY, Utc::now().timestamp()).await;
-    if let Err(failure) = heartbeat {
-        warn!(error = %failure, "unable to record the supervisor heartbeat");
-    }
+async fn mark_activity(ctx: &Ctx, stop: &Shutdown) {
     match ctx.paused().await {
         Ok(true) => return,
         Ok(false) => {}
