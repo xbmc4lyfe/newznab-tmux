@@ -154,10 +154,6 @@ pub async fn work_once(pool: &MySqlPool, settings: &Settings) -> Result<bool> {
     Ok(true)
 }
 
-async fn ctx_paused(ctx: &Ctx) -> bool {
-    ctx.paused().await.unwrap_or(true)
-}
-
 pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
     let settings = Arc::new(Settings::from_env(&NntpConfig::from_env())?);
     let failed = Arc::new(AtomicBool::new(false));
@@ -223,11 +219,25 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
                     dry_run: false,
                     stale: true,
                 };
-                if ctx_paused(&sweep_ctx).await {
-                    stop.sleep(STALE_SWEEP_EVERY).await;
-                    continue;
-                }
-                match backfill::backfill(&db, &options).await {
+                // Held across the sweep, so a drain waits for its writes.
+                let busy = match busy::enter(&sweep_ctx, "fingerprint").await {
+                    Ok(Some(busy)) => busy,
+                    Ok(None) => {
+                        stop.sleep(STALE_SWEEP_EVERY).await;
+                        continue;
+                    }
+                    Err(failure) => {
+                        warn!(
+                            error = format!("{failure:#}"),
+                            "can't mark the stale sweep busy"
+                        );
+                        stop.sleep(STALE_SWEEP_EVERY).await;
+                        continue;
+                    }
+                };
+                let swept = backfill::backfill(&db, &options).await;
+                drop(busy);
+                match swept {
                     Ok(ids) if !ids.is_empty() => {
                         info!(count = ids.len(), "stale fingerprints requeued")
                     }
