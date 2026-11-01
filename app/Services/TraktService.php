@@ -346,28 +346,6 @@ class TraktService
     }
 
     /**
-     * Get show summary with all external IDs.
-     * This enriches the response with IDs from all supported providers.
-     *
-     * @param  int|string  $showId  Show ID
-     * @param  string  $idType  The ID type: 'trakt', 'imdb', 'tmdb', 'tvdb'
-     * @return array<string, mixed>|null Show data with all IDs or null on failure
-     */
-    public function getShowWithAllIds(int|string $showId, string $idType = 'trakt'): ?array
-    {
-        $formattedId = $this->formatShowIdForApi($showId, $idType);
-        if ($formattedId === null) {
-            return null;
-        }
-
-        $cacheKey = "trakt_show_ids_{$idType}_{$showId}";
-
-        return Cache::remember($cacheKey, now()->addHours(self::CACHE_TTL_HOURS), function () use ($formattedId) {
-            return $this->get("shows/{$formattedId}", ['extended' => 'full']);
-        });
-    }
-
-    /**
      * Look up a show by external ID and return all available IDs.
      * Useful for cross-referencing between TMDB, TVDB, Trakt, and IMDB.
      *
@@ -405,44 +383,6 @@ class TraktService
     }
 
     /**
-     * Get current box office movies.
-     *
-     * @return array<string, mixed>|null Box office data or null on failure
-     */
-    public function getBoxOffice(): ?array
-    {
-        $cacheKey = 'trakt_boxoffice_'.date('Y-m-d');
-
-        return Cache::remember($cacheKey, now()->addHours(6), function () {
-            return $this->get('movies/boxoffice');
-        });
-    }
-
-    /**
-     * Get TV show calendar.
-     *
-     * @param  string  $startDate  Start date (YYYY-MM-DD format, defaults to today)
-     * @param  int  $days  Number of days to retrieve (default: 7)
-     * @return array<string, mixed>|null Calendar data or null on failure
-     */
-    public function getCalendar(string $startDate = '', int $days = 7): ?array
-    {
-        if (empty($startDate)) {
-            $startDate = date('Y-m-d');
-        } elseif (! preg_match('/^\d{4}-\d{2}-\d{2}$/', $startDate)) {
-            return null;
-        }
-
-        $days = max(1, min($days, 33));
-
-        $cacheKey = "trakt_calendar_{$startDate}_{$days}";
-
-        return Cache::remember($cacheKey, now()->addHours(6), function () use ($startDate, $days) {
-            return $this->get("calendars/all/shows/{$startDate}/{$days}");
-        });
-    }
-
-    /**
      * Get movie summary.
      *
      * @param  string  $movie  Movie slug or ID
@@ -466,19 +406,6 @@ class TraktService
         return Cache::remember($cacheKey, now()->addHours(self::CACHE_TTL_HOURS), function () use ($movieId, $extended) {
             return $this->get("movies/{$movieId}", ['extended' => $extended]);
         });
-    }
-
-    /**
-     * Get IMDB ID for a movie.
-     *
-     * @param  string  $movie  Movie slug or ID
-     * @return string|null IMDB ID or null on failure
-     */
-    public function getMovieImdbId(string $movie): ?string
-    {
-        $data = $this->getMovieSummary($movie, 'min');
-
-        return $data['ids']['imdb'] ?? null;
     }
 
     /**
@@ -602,151 +529,6 @@ class TraktService
     }
 
     /**
-     * Get season episodes.
-     *
-     * @param  string  $show  Show slug or ID
-     * @param  int  $season  Season number
-     * @param  string  $extended  Extended info level
-     * @return array<string, mixed>|null Episodes data or null on failure
-     */
-    public function getSeasonEpisodes(string $show, int $season, string $extended = 'full'): ?array
-    {
-        $showId = $this->formatMediaId($show);
-        if ($showId === null || $season < 0) {
-            return null;
-        }
-
-        $extended = $this->normalizeExtended($extended, ['min', 'full']);
-        $cacheKey = 'trakt_season_episodes_'.md5($showId)."_{$season}_{$extended}";
-
-        return Cache::remember($cacheKey, now()->addHours(self::CACHE_TTL_HOURS), function () use ($showId, $season, $extended) {
-            return $this->get("shows/{$showId}/seasons/{$season}", ['extended' => $extended]);
-        });
-    }
-
-    /**
-     * Get trending shows.
-     *
-     * @param  int  $limit  Number of results to return
-     * @param  string  $extended  Extended info level
-     * @return array<string, mixed>|null Trending shows or null on failure
-     */
-    public function getTrendingShows(int $limit = 10, string $extended = 'full'): ?array
-    {
-        $limit = $this->normalizeLimit($limit);
-        $extended = $this->normalizeExtended($extended, ['min', 'full']);
-        $cacheKey = "trakt_trending_shows_{$limit}_{$extended}";
-
-        return Cache::remember($cacheKey, now()->addHours(1), function () use ($limit, $extended) {
-            return $this->get('shows/trending', [
-                'limit' => $limit,
-                'extended' => $extended,
-            ]);
-        });
-    }
-
-    /**
-     * Get trending movies.
-     *
-     * @param  int  $limit  Number of results to return
-     * @param  string  $extended  Extended info level
-     * @return array<string, mixed>|null Trending movies or null on failure
-     */
-    public function getTrendingMovies(int $limit = 10, string $extended = 'full'): ?array
-    {
-        $limit = $this->normalizeLimit($limit);
-        $extended = $this->normalizeExtended($extended, ['min', 'full']);
-        $cacheKey = "trakt_trending_movies_{$limit}_{$extended}";
-
-        return Cache::remember($cacheKey, now()->addHours(1), function () use ($limit, $extended) {
-            return $this->get('movies/trending', [
-                'limit' => $limit,
-                'extended' => $extended,
-            ]);
-        });
-    }
-
-    /**
-     * Get popular shows.
-     *
-     * @param  int  $limit  Number of results to return
-     * @param  string  $extended  Extended info level
-     * @return array<string, mixed>|null Popular shows or null on failure
-     */
-    public function getPopularShows(int $limit = 10, string $extended = 'full'): ?array
-    {
-        $limit = $this->normalizeLimit($limit);
-        $extended = $this->normalizeExtended($extended, ['min', 'full']);
-        $cacheKey = "trakt_popular_shows_{$limit}_{$extended}";
-
-        return Cache::remember($cacheKey, now()->addHours(6), function () use ($limit, $extended) {
-            return $this->get('shows/popular', [
-                'limit' => $limit,
-                'extended' => $extended,
-            ]);
-        });
-    }
-
-    /**
-     * Get popular movies.
-     *
-     * @param  int  $limit  Number of results to return
-     * @param  string  $extended  Extended info level
-     * @return array<string, mixed>|null Popular movies or null on failure
-     */
-    public function getPopularMovies(int $limit = 10, string $extended = 'full'): ?array
-    {
-        $limit = $this->normalizeLimit($limit);
-        $extended = $this->normalizeExtended($extended, ['min', 'full']);
-        $cacheKey = "trakt_popular_movies_{$limit}_{$extended}";
-
-        return Cache::remember($cacheKey, now()->addHours(6), function () use ($limit, $extended) {
-            return $this->get('movies/popular', [
-                'limit' => $limit,
-                'extended' => $extended,
-            ]);
-        });
-    }
-
-    /**
-     * Clear cached data for a specific show.
-     */
-    public function clearShowCache(string $show): void
-    {
-        $slug = Str::slug($show);
-        Cache::forget("trakt_show_{$slug}_min");
-        Cache::forget("trakt_show_{$slug}_full");
-        Cache::forget("trakt_seasons_{$slug}_full");
-        Cache::forget("trakt_seasons_{$slug}_min");
-
-        $showId = $this->formatMediaId($show);
-        if ($showId !== null) {
-            Cache::forget('trakt_show_'.md5($showId).'_min');
-            Cache::forget('trakt_show_'.md5($showId).'_full');
-            Cache::forget('trakt_seasons_'.md5($showId).'_min');
-            Cache::forget('trakt_seasons_'.md5($showId).'_full');
-            Cache::forget('trakt_seasons_'.md5($showId).'_episodes');
-            Cache::forget('trakt_seasons_'.md5($showId).'_full,episodes');
-        }
-    }
-
-    /**
-     * Clear cached data for a specific movie.
-     */
-    public function clearMovieCache(string $movie): void
-    {
-        $slug = Str::slug($movie);
-        Cache::forget("trakt_movie_{$slug}_min");
-        Cache::forget("trakt_movie_{$slug}_full");
-
-        $movieId = $this->formatMediaId($movie);
-        if ($movieId !== null) {
-            Cache::forget('trakt_movie_'.md5($movieId).'_min');
-            Cache::forget('trakt_movie_'.md5($movieId).'_full');
-        }
-    }
-
-    /**
      * Normalize IMDb IDs for Trakt endpoints without padding away meaningful
      * leading zeroes (for example, tt0137523 must stay tt0137523).
      */
@@ -777,11 +559,6 @@ class TraktService
     protected function normalizeExtended(string $extended, array $allowed): string
     {
         return in_array($extended, $allowed, true) ? $extended : $allowed[0];
-    }
-
-    protected function normalizeLimit(int $limit): int
-    {
-        return max(1, min($limit, 100));
     }
 
     protected function isUsableExternalId(mixed $id, string $idType): bool

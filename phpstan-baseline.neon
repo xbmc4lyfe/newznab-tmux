@@ -836,18 +836,6 @@ parameters:
 			path: app/Support/SecondaryIndexDocuments.php
 
 		-
-			message: '#^Method App\\Support\\UpdatePerformanceHelper\:\:getSystemMemoryInfo\(\) should return list\<string\>\|null but returns array\{total\: int, available\: int, used\: int, usage_percent\: \(float\|int\)\}\.$#'
-			identifier: return.type
-			count: 1
-			path: app/Support/UpdatePerformanceHelper.php
-
-		-
-			message: '#^PHPDoc tag @return with type array\<string, float\|int\> is incompatible with native type int\.$#'
-			identifier: return.phpDocType
-			count: 1
-			path: app/Support/UpdatePerformanceHelper.php
-
-		-
 			message: '#^Parameter \#1 \$view of function view expects view\-string\|null, string given\.$#'
 			identifier: argument.type
 			count: 1
