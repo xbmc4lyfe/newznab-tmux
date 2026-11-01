@@ -1061,3 +1061,33 @@ kind = "route"
 id = "PUT /admin/status/{incident}"
 source = "App\\Http\\Controllers\\Admin\\AdminStatusController@update"
 status = "todo"
+
+[[entry]]
+kind = "route"
+id = "DELETE /profile_delete"
+source = "App\\Http\\Controllers\\ProfileController@destroy"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /privacy-center"
+source = "App\\Http\\Controllers\\PrivacyCenterController@index"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "GET|HEAD /privacy-center/export/{gdprRequest}/download"
+source = "App\\Http\\Controllers\\PrivacyCenterController@downloadExport"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /privacy-center/erasure"
+source = "App\\Http\\Controllers\\PrivacyCenterController@requestErasure"
+status = "todo"
+
+[[entry]]
+kind = "route"
+id = "POST /privacy-center/export"
+source = "App\\Http\\Controllers\\PrivacyCenterController@requestExport"
+status = "todo"
