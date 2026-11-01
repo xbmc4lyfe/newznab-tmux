@@ -7,13 +7,17 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 chrono.workspace = true
 clap.workspace = true
+ipnet.workspace = true
 nntmux-categorize.workspace = true
 nntmux-core.workspace = true
 nntmux-ingest.workspace = true
 nntmux-runtime.workspace = true
+nntmux-predb.workspace = true
 nntmux-verify.workspace = true
+nntmux-webkit.workspace = true
 flate2.workspace = true
 hex.workspace = true
 rand.workspace = true
@@ -28,9 +32,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 nntmux-api.workspace = true
-nntmux-predb.workspace = true
 nntmux-testkit.workspace = true
 redis.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true
