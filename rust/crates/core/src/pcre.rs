@@ -113,6 +113,29 @@ impl Pcre {
         Some(Match { groups, names })
     }
 
+    /// `preg_match_all`: every match in order. A failed match ends the list.
+    pub fn captures_all(&self, subject: &[u8]) -> Vec<Match> {
+        let Some(text) = self.haystack(subject) else {
+            return Vec::new();
+        };
+        let names: Vec<(String, usize)> = self
+            .regex
+            .capture_names()
+            .enumerate()
+            .filter_map(|(index, name)| Some((name?.to_owned(), index)))
+            .collect();
+        self.regex
+            .captures_iter(&text)
+            .map_while(Result::ok)
+            .map(|captures| Match {
+                groups: (0..captures.len())
+                    .map(|index| captures.get(index).map(|m| self.bytes(m.as_str())))
+                    .collect(),
+                names: names.clone(),
+            })
+            .collect()
+    }
+
     /// `preg_replace` with a literal replacement. A failed match leaves the rest unchanged.
     pub fn replace_all(&self, subject: &[u8], replacement: &[u8]) -> Vec<u8> {
         let Some(text) = self.haystack(subject) else {

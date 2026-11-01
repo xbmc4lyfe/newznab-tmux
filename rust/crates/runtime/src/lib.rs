@@ -165,7 +165,10 @@ where
                 let outcome = AssertUnwindSafe({
                     let (work, ctx) = (work.clone(), ctx.clone());
                     async move {
-                        let _busy = busy::mark(&ctx, role).await;
+                        // A pause that lands here reads as nothing to claim this time.
+                        let Some(_busy) = busy::enter(&ctx, role).await? else {
+                            return Ok(false);
+                        };
                         work(ctx, slot).await
                     }
                 })

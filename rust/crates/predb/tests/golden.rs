@@ -45,6 +45,7 @@ fn matches_the_php() {
             ("scene", json!(looks_like_scene_release(name))),
             ("tech", json!(is_literal_technical_scene_title(name))),
             ("title", json!(clean_for_title_match(name))),
+            ("fixer", json!(fixer_cleaner(name))),
             ("payload", json!(literal_payload(name))),
             ("trail", json!(strip_literal_subject_trailer(name))),
             ("base", json!(evidence.basename)),

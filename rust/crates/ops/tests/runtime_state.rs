@@ -171,6 +171,50 @@ async fn stop_lasts_until_start_and_clears_a_drain() -> Result<()> {
 }
 
 #[tokio::test]
+async fn work_entering_after_a_pause_is_turned_away() -> Result<()> {
+    let Some(test) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let Some(ctx) = context(&test).await? else {
+        return Ok(());
+    };
+    runtime_state::start(&ctx).await?;
+    let held = busy::enter(&ctx, "releases").await?;
+    assert!(held.is_some());
+    assert_eq!(busy::active_roles(&ctx).await?, ["releases"]);
+    drop(held);
+    idle(&ctx).await?;
+
+    runtime_state::drain(&ctx, 5, None, &Shutdown::default()).await?;
+    assert!(busy::enter(&ctx, "releases").await?.is_none());
+    idle(&ctx).await?;
+    test.drop_database().await
+}
+
+#[tokio::test]
+async fn a_drain_left_behind_by_a_started_stack_doesnt_keep_its_owner() -> Result<()> {
+    let Some(test) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let Some(ctx) = context(&test).await? else {
+        return Ok(());
+    };
+    let signals = Shutdown::default();
+    runtime_state::start(&ctx).await?;
+    runtime_state::drain(&ctx, 5, Some("deploy-1"), &signals).await?;
+    // The pause ended some other way, and the saved state stayed behind.
+    sqlx::query(
+        "UPDATE processing_runtime_states SET stop_requested = 0, tmux_running = 1 WHERE id = 1",
+    )
+    .execute(&ctx.db)
+    .await?;
+    runtime_state::drain(&ctx, 5, Some("deploy-2"), &signals).await?;
+    runtime_state::resume(&ctx, Some("deploy-2")).await?;
+    assert_eq!(flags(&ctx).await?, (true, false));
+    test.drop_database().await
+}
+
+#[tokio::test]
 async fn a_bad_token_changes_nothing() -> Result<()> {
     let Some(test) = TestDb::create().await? else {
         return Ok(());
