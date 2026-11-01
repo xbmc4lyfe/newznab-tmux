@@ -29,12 +29,16 @@ pub fn connect_options(config: &DatabaseConfig) -> MySqlConnectOptions {
 
 /// Every connection uses the SQL mode Laravel set (`strict => false`). Real Usenet data
 /// overflows columns such as `collections.fromname`, where PHP stored a truncated value and
-/// the server's strict default would raise an error.
+/// the server's strict default would raise an error. They also use READ COMMITTED, as
+/// production's MariaDB config sets, so tests and any other server behave the same.
 fn pool_options() -> MySqlPoolOptions {
     MySqlPoolOptions::new().after_connect(|connection, _| {
         Box::pin(async move {
             sqlx::query("SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'")
-                .execute(connection)
+                .execute(&mut *connection)
+                .await?;
+            sqlx::query("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut *connection)
                 .await?;
             Ok(())
         })

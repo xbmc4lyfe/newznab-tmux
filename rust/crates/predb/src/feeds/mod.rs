@@ -3,7 +3,7 @@
 pub mod command;
 pub mod http;
 pub mod importer;
-pub mod index;
+
 pub mod sources;
 
 use async_trait::async_trait;

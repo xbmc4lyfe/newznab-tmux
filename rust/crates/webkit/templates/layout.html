@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en" class="app-shell">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="csrf-token" content="{{ layout.csrf }}">
+    {% include "theme_init.html" %}
+    <title>{{ layout.full_title() }}</title>
+    <meta name="keywords" content="{{ layout.meta_keywords }}">
+    <meta name="description" content="{{ layout.meta_description }}">
+    <meta name="theme-preference" content="{{ layout.theme }}">
+    <meta name="color-scheme-preference" content="{{ layout.scheme }}">
+    <meta name="csp-nonce" content="{{ layout.nonce }}">
+    {% if layout.signed_in %}
+    <meta name="user-authenticated" content="true">
+    <meta name="update-theme-url" content="/profile/update-theme">
+    {% endif %}
+    {% for href in layout.assets.styles %}<link rel="stylesheet" href="{{ href }}" nonce="{{ layout.nonce }}">
+    {% endfor %}
+    {% for src in layout.assets.scripts %}<script type="module" src="{{ src }}" nonce="{{ layout.nonce }}"></script>
+    {% endfor %}
+    {% block head %}{% endblock %}
+</head>
+<body class="app-shell font-sans antialiased">
+    <a href="#main-content" class="skip-link">Skip to content</a>
+    <div class="layout-shell h-screen flex">
+        {% if layout.signed_in %}
+        <aside id="sidebar" class="layout-sidebar fixed inset-y-0 left-0 z-50 hidden h-full w-72 shrink-0 flex-col overflow-y-auto text-white md:static md:z-auto md:flex md:w-64" aria-label="Account navigation">
+            <div class="layout-sidebar__brand flex items-center justify-between gap-3 p-4">
+                <a href="{{ layout.site.home_link }}" class="flex min-w-0 items-center gap-3 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400">
+                    <span class="layout-sidebar__logo flex h-11 w-11 shrink-0 items-center justify-center rounded-xl">
+                        {% if let Some(logo) = layout.logo_url %}<img src="{{ logo }}" alt="" class="h-full w-full object-contain p-1.5">{% else %}<i class="fas fa-layer-group text-lg text-primary-300" aria-hidden="true"></i>{% endif %}
+                    </span>
+                    <span class="min-w-0 truncate text-lg font-semibold">{{ layout.app_name }}</span>
+                </a>
+                <button type="button" id="mobile-sidebar-close" class="touch-target inline-flex items-center justify-center rounded-xl text-white/70 hover:bg-white/10 hover:text-white md:hidden" aria-label="Close navigation">
+                    <i class="fas fa-xmark" aria-hidden="true"></i>
+                </button>
+            </div>
+            <nav class="layout-sidebar__nav flex-1 overflow-y-auto py-3" aria-label="User">
+                {% include "sidebar.html" %}
+            </nav>
+        </aside>
+        <button type="button" id="mobile-sidebar-backdrop" class="layout-sidebar-backdrop fixed inset-0 z-40 hidden bg-slate-950/60 backdrop-blur-sm md:hidden" aria-label="Close navigation" tabindex="-1"></button>
+        {% endif %}
+        <div class="layout-content flex h-full min-w-0 flex-1 flex-col overflow-hidden">
+            {% if layout.signed_in %}
+            <header class="layout-topbar surface-header z-30 shrink-0 text-white">
+                {% include "header_menu.html" %}
+            </header>
+            {% endif %}
+            <main id="main-content" class="layout-main flex-1 overflow-y-auto" data-scroll-container tabindex="-1">
+                <div class="app-view-stack layout-page-container container mx-auto max-w-[1600px] px-3 py-5 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:px-5 sm:py-6 lg:px-8">
+                    {% if let Some(success) = layout.flash_success %}
+                    <div class="layout-flash layout-flash--success mb-5" role="status">
+                        <i class="fas fa-circle-check" aria-hidden="true"></i>
+                        <div>{{ success }}</div>
+                    </div>
+                    {% endif %}
+                    {% if !layout.flash_errors.is_empty() %}
+                    <div class="layout-flash layout-flash--error mb-5" role="alert">
+                        <i class="fas fa-circle-exclamation" aria-hidden="true"></i>
+                        <div>{% for error in layout.flash_errors %}<div>{{ error }}</div>{% endfor %}</div>
+                    </div>
+                    {% endif %}
+                    {% block content %}{% endblock %}
+                </div>
+            </main>
+            <footer class="shrink-0">
+                <div class="container mx-auto px-4 py-3">
+                    <div class="flex flex-wrap items-center justify-between gap-2 text-sm">
+                        <p class="text-gray-300 dark:text-gray-400">&copy; {{ layout.year }} <a href="https://github.com/NNTmux/newznab-tmux" class="text-primary-400 hover:text-primary-300 transition">NNTmux</a></p>
+                        <div class="flex items-center gap-4">
+                            <a href="/terms-and-conditions" class="text-gray-300 dark:text-gray-400 hover:text-white transition">Terms</a>
+                            <a href="/privacy-policy" class="text-gray-300 dark:text-gray-400 hover:text-white transition">Privacy</a>
+                            <a href="/contact-us" class="text-gray-300 dark:text-gray-400 hover:text-white transition">Contact</a>
+                        </div>
+                        <div class="flex items-center gap-3">
+                            <a href="https://github.com/NNTmux/newznab-tmux" class="text-gray-300 dark:text-gray-400 hover:text-white transition" title="GitHub"><i class="fab fa-github text-lg"></i></a>
+                            <a href="/rss" class="text-gray-300 dark:text-gray-400 hover:text-white transition" title="RSS Feeds"><i class="fas fa-rss text-lg"></i></a>
+                        </div>
+                    </div>
+                </div>
+            </footer>
+        </div>
+    </div>
+    {% if layout.signed_in %}
+    <button type="button" id="mobile-sidebar-toggle" class="layout-mobile-sidebar-toggle touch-target fixed z-30 inline-flex items-center gap-2 rounded-full bg-primary-600 px-4 py-3 text-sm font-semibold text-white shadow-lg transition hover:bg-primary-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 focus-visible:ring-offset-2 dark:bg-primary-700 dark:hover:bg-primary-600 md:hidden bottom-[max(5rem,calc(env(safe-area-inset-bottom)+4rem))] right-[max(1rem,env(safe-area-inset-right))]" aria-label="Open account navigation" aria-controls="sidebar" aria-expanded="false">
+        <i class="fas fa-compass" aria-hidden="true"></i>
+        <span>Navigate</span>
+    </button>
+    {% else %}
+    <button id="theme-toggle" class="fixed z-50 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 px-4 py-3 rounded-full shadow-lg hover:bg-gray-300 dark:hover:bg-gray-600 transition-all duration-200 flex items-center gap-2 touch-target bottom-[max(1rem,env(safe-area-inset-bottom))] right-[max(1rem,env(safe-area-inset-right))]" title="{{ layout.theme_title() }} Mode" aria-label="Change theme. Current theme: {{ layout.theme }}">
+        <i id="theme-icon" class="fas {{ layout.theme_icon() }}"></i>
+        <span id="theme-label" class="text-xs font-medium hidden sm:inline">{{ layout.theme_title() }}</span>
+    </button>
+    {% endif %}
+    {% include "chrome_widgets.html" %}
+    {% block modals %}{% endblock %}
+    {% block scripts %}{% endblock %}
+    <div id="current-theme-data" data-theme="{{ layout.theme }}" data-color-scheme="{{ layout.scheme }}" data-authenticated="{{ layout.authenticated_attr() }}" data-update-url="/profile/update-theme" class="hidden"></div>
+    <div id="flash-messages-data" data-messages="{{ layout.flash_json }}" class="hidden"></div>
+</body>
+</html>
