@@ -16,6 +16,7 @@ use nntmux_core::var_or;
 use nntmux_runtime::Ctx;
 use nntmux_webkit::auth::{Auth, verify_password};
 use nntmux_webkit::session::random_string;
+use nntmux_webkit::throttle;
 use nntmux_webkit::user::{Access, USER_MODEL};
 use nntmux_webkit::{
     CurrentUser, Input, Layout, MaybeUser, Session, User, WebResult, auth, config, guard,
@@ -63,10 +64,12 @@ pub fn router() -> Router<Ctx> {
         .route_layer(from_fn(guard::two_factor))
         .route_layer(from_fn(guard::verified))
         .route_layer(from_fn(guard::authenticated));
-    let two_factor = Router::new()
-        .route("/2fa", get(two_factor_form).post(enable_two_factor))
+    let two_factor_forms = Router::new()
+        .route("/2fa", get(two_factor_form))
         .route("/2fa/enable", get(two_factor_form))
-        .route("/2fa/disable", get(two_factor_form))
+        .route("/2fa/disable", get(two_factor_form));
+    let two_factor_changes = Router::new()
+        .route("/2fa", post(enable_two_factor))
         .route("/generate2faSecret", post(generate_secret))
         .route("/profileedit/enable2fa", post(enable_two_factor))
         .route("/disable2fa", post(delete_two_factor))
@@ -77,6 +80,12 @@ pub fn router() -> Router<Ctx> {
             "/profile-security/disable-2fa",
             post(security_disable_two_factor),
         )
+        // These all take a code or a password, so guesses share one budget.
+        .route_layer(from_fn(|request, next| {
+            throttle::limit(request, next, "2fa-setup", 6, 60)
+        }));
+    let two_factor = two_factor_forms
+        .merge(two_factor_changes)
         .route_layer(from_fn(guard::verified))
         .route_layer(from_fn(guard::authenticated));
     pages.merge(two_factor)
@@ -102,6 +111,7 @@ struct ProfilePage {
     header_title: String,
     user: User,
     is_admin: bool,
+    can_see_private: bool,
     public_view: bool,
     gravatar: String,
     joined_date: String,
@@ -202,12 +212,13 @@ async fn show(
             .and_then(|id| id.parse().ok());
         if let Some(id) = id {
             if let Some(found) = User::find(&ctx.db, id).await? {
+                public_view = found.id != signed_in.user.id;
                 user = found;
-                public_view = true;
             }
         } else if let Some(name) = input.get("name")
             && let Some(found) = User::find_by(&ctx.db, "username", &name).await?
         {
+            public_view = found.id != signed_in.user.id;
             user = found;
         }
     }
@@ -281,6 +292,9 @@ async fn show(
             "Your profile".to_owned()
         },
         is_admin: access.has_role("Admin"),
+        // Laravel checked the viewed account's role here, so a moderator opening an admin's
+        // profile saw that admin's API token. Only the owner and admins see these now.
+        can_see_private: !public_view || signed_in.access.has_role("Admin"),
         public_view,
         gravatar: gravatar_url(&user.email),
         joined_date: user
@@ -435,7 +449,7 @@ async fn profile_errors(ctx: &Ctx, input: &Input, user: &User) -> Result<String>
 }
 
 /// What the save does besides the columns: exclusions, direct view permissions, the password.
-async fn save_profile(ctx: &Ctx, input: &Input, auth: &Auth) -> Result<()> {
+async fn save_profile(ctx: &Ctx, input: &Input, auth: &Auth, unverify: bool) -> Result<()> {
     let user = &auth.user;
     let on = |name: &str| i32::from(input.has(name));
     let email = input.get("email");
@@ -465,6 +479,12 @@ async fn save_profile(ctx: &Ctx, input: &Input, auth: &Auth) -> Result<()> {
     .bind(user.id)
     .execute(&mut *tx)
     .await?;
+    if unverify {
+        sqlx::query("UPDATE users SET email_verified_at = NULL, verified = 0, verification_token = NULL WHERE id = ?")
+            .bind(user.id)
+            .execute(&mut *tx)
+            .await?;
+    }
     sqlx::query("DELETE FROM user_excluded_categories WHERE users_id = ?")
         .bind(user.id)
         .execute(&mut *tx)
@@ -617,15 +637,11 @@ async fn edit(
         "submit" => {
             error = profile_errors(&ctx, &input, user).await?;
             if error.is_empty() {
-                let new_email = input.get("email").filter(|email| *email != user.email);
-                save_profile(&ctx, &input, &signed_in).await?;
-                if !signed_in.access.has_role("Admin")
-                    && let Some(email) = new_email
-                {
-                    sqlx::query("UPDATE users SET email_verified_at = NULL, verified = 0, verification_token = NULL WHERE id = ?")
-                        .bind(user.id)
-                        .execute(&ctx.db)
-                        .await?;
+                let new_email = input
+                    .get("email")
+                    .filter(|email| *email != user.email && !signed_in.access.has_role("Admin"));
+                save_profile(&ctx, &input, &signed_in, new_email.is_some()).await?;
+                if let Some(email) = new_email {
                     send_verification(&ctx, user.id, &email, &user.username).await?;
                     auth::logout(&session);
                     session.flash(
@@ -840,7 +856,9 @@ async fn enable_two_factor(
     input: Input,
     CurrentUser(signed_in): CurrentUser,
 ) -> WebResult {
-    let Some((_, secret)) = two_factor_row(&ctx, signed_in.user.id).await? else {
+    // Only a setup can be enabled. Answering codes for a live secret here would be a second,
+    // cheaper way past the challenge.
+    let Some((false, secret)) = two_factor_row(&ctx, signed_in.user.id).await? else {
         return Ok(security_flash(
             &session,
             "error_2fa",

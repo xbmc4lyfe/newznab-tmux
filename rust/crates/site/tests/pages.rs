@@ -463,6 +463,9 @@ async fn two_factor_setup_round_trip_from_settings() {
         .await;
     assert_eq!(enabled(db.pool.clone()).await, 1);
 
+    // A live secret can't be answered here, which would dodge the challenge's throttle.
+    auth_passed_not_marked(&mut browser).await;
+
     // Disabling needs the password, then removes the row.
     browser
         .post_authed("/profileedit/disable2fa", &[("current-password", "wrong")])
@@ -501,5 +504,67 @@ async fn the_theme_endpoint_validates() {
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(body.contains(r#""theme_preference":"dark""#));
+    db.drop_database().await.unwrap();
+}
+
+async fn auth_passed_not_marked(browser: &mut Browser) {
+    let (response, _) = browser
+        .post_authed("/2fa", &[("verify-code", "000000")])
+        .await;
+    assert_eq!(location(&response), "/profileedit#security");
+    let (_, html) = browser.get("/profileedit").await;
+    assert!(html.contains("Invalid Verification Code"));
+}
+
+#[tokio::test]
+async fn profile_privacy_follows_the_viewer_not_the_viewed() {
+    let Some((db, ctx)) = fixture().await else {
+        return;
+    };
+    let moderator = unique("sam");
+    let id = add_user(&db.pool, &moderator, true, 1).await;
+    sqlx::query("INSERT INTO model_has_roles (role_id, model_type, model_id) SELECT id, ?, ? FROM roles WHERE name = 'Moderator'")
+        .bind(nntmux_webkit::user::USER_MODEL)
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let admin = unique("tina");
+    let admin_id = add_user(&db.pool, &admin, true, 1).await;
+    sqlx::query("INSERT INTO model_has_roles (role_id, model_type, model_id) SELECT id, ?, ? FROM roles WHERE name = 'Admin'")
+        .bind(nntmux_webkit::user::USER_MODEL)
+        .bind(admin_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut browser = Browser::new(&ctx);
+    browser
+        .post(
+            "/login",
+            &[("username", &moderator), ("password", PASSWORD)],
+        )
+        .await;
+    for path in [
+        format!("/profile?id={admin_id}"),
+        format!("/profile?name={admin}"),
+    ] {
+        let (response, html) = browser.get(&path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(html.contains(&admin));
+        assert!(
+            !html.contains(&format!("token-{admin}")),
+            "{path} must not show the token"
+        );
+        assert!(
+            !html.contains(&format!("{admin}@example.com")),
+            "{path} must not show the email"
+        );
+    }
+    let mut owner = Browser::new(&ctx);
+    owner
+        .post("/login", &[("username", &admin), ("password", PASSWORD)])
+        .await;
+    let (_, html) = owner.get("/profile").await;
+    assert!(html.contains(&format!("token-{admin}")));
     db.drop_database().await.unwrap();
 }

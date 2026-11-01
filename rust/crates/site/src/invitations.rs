@@ -477,7 +477,12 @@ async fn resend(
         session.flash("error", "Cannot resend an invalid invitation.");
         return Ok(back(&headers, "/invitations"));
     }
-    send_invitation(&ctx, &email, &signed_in.user.username, &token, expires).await?;
+    if let Err(failure) =
+        send_invitation(&ctx, &email, &signed_in.user.username, &token, expires).await
+    {
+        session.flash("error", failure.to_string());
+        return Ok(back(&headers, "/invitations"));
+    }
     session.flash("success", "Invitation resent successfully");
     Ok(Redirect::to("/invitations").into_response())
 }
@@ -579,7 +584,7 @@ async fn show(State(ctx): State<Ctx>, layout: Layout, Path(token): Path<String>)
     Ok(Html(page.render()?).into_response())
 }
 
-/// The old AJAX form's plain-text answer. PHP's route skipped the invite count and mode checks.
+/// The old AJAX form, with its plain-text answer.
 async fn ajax_invite(
     State(ctx): State<Ctx>,
     input: Input,
@@ -589,20 +594,23 @@ async fn ajax_invite(
     if input.int("action", 0) != 1 || !validate::valid_email(&email) {
         return Ok("Invite not sent.".into_response());
     }
-    let email = email.trim().to_lowercase();
-    let token = random_string(64);
-    let expires = Utc::now() + Duration::days(DEFAULT_EXPIRY_DAYS);
-    sqlx::query(
-        "INSERT INTO invitations (token, email, invited_by, expires_at, is_active, metadata, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 1, '[]', NOW(), NOW())",
-    )
-    .bind(&token)
-    .bind(&email)
+    // Laravel skipped the quota here, which let anyone mint links. The same rules apply now.
+    if create_and_send(&ctx, &signed_in.user, &email, DEFAULT_EXPIRY_DAYS)
+        .await
+        .is_err()
+    {
+        return Ok("Invite not sent.".into_response());
+    }
+    let token: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT token FROM invitations WHERE email = ? AND invited_by = ? AND {VALID} ORDER BY id DESC LIMIT 1"
+    )))
+    .bind(email.trim().to_lowercase())
     .bind(signed_in.user.id)
-    .bind(expires)
-    .execute(&ctx.db)
+    .fetch_optional(&ctx.db)
     .await?;
-    send_invitation(&ctx, &email, &signed_in.user.username, &token, expires).await?;
+    let Some(token) = token else {
+        return Ok("Invite not sent.".into_response());
+    };
     let url = format!("{}/register?token={token}", config::app_url());
     Ok(
         format!("Invite sent. Alternatively paste them following link to register - {url}")
