@@ -273,18 +273,6 @@ class TmuxPaneManager
     }
 
     /**
-     * Kill a specific pane
-     */
-    public function killPane(string $target): bool
-    {
-        $result = Process::timeout(5)->run(
-            TmuxCommand::arguments(['kill-pane', '-t', $this->target($target)])
-        );
-
-        return $this->recordResult($result);
-    }
-
-    /**
      * Set pane title
      */
     public function setPaneTitle(string $target, string $title): bool
@@ -294,30 +282,6 @@ class TmuxPaneManager
         );
 
         return $this->recordResult($result);
-    }
-
-    /**
-     * Get pane title
-     */
-    public function getPaneTitle(string $target): ?string
-    {
-        $result = Process::timeout(5)->run(
-            TmuxCommand::arguments(['display-message', '-p', '-t', $this->target($target), '#{pane_title}'])
-        );
-
-        return $result->successful() ? trim($result->output()) : null;
-    }
-
-    /**
-     * Capture pane content
-     */
-    public function capturePane(string $target, int $lines = 100): string
-    {
-        $result = Process::timeout(10)->run(
-            TmuxCommand::arguments(['capture-pane', '-p', '-t', $this->target($target), '-S', "-{$lines}"])
-        );
-
-        return $result->successful() ? $result->output() : '';
     }
 
     public function setPaneRole(string $target, TmuxPaneRole $role): bool

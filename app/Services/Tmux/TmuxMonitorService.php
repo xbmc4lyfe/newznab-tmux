@@ -602,22 +602,6 @@ class TmuxMonitorService
     }
 
     /**
-     * Update the monitor display
-     */
-    public function updateDisplay(): void
-    {
-        // This would output to terminal - implementation depends on TmuxOutput
-        // For now, we'll just log basic info
-        if ($this->iterations % 10 === 0) {
-            logger()->info('Tmux Monitor', [
-                'iteration' => $this->iterations,
-                'total_work' => $this->runVar['counts']['now']['total_work'] ?? 0,
-                'collections' => $this->runVar['counts']['now']['collections_table'] ?? 0,
-            ]);
-        }
-    }
-
-    /**
      * Increment iteration counter
      */
     public function incrementIteration(): void
@@ -640,15 +624,5 @@ class TmuxMonitorService
         $this->shouldContinue = false;
 
         return false;
-    }
-
-    /**
-     * Get current run variables
-     *
-     * @return array<string, mixed>
-     */
-    public function getRunVar(): array
-    {
-        return $this->runVar;
     }
 }
