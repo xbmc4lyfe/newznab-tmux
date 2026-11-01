@@ -86,7 +86,13 @@ impl Endpoint {
                 query: QueryRule::V1,
                 token_limit: false,
             },
-            Self::V2Movies | Self::V2Audio | Self::V2Books | Self::V2Anime | Self::V2Search | Self::V2Tv | Self::V2Details => SEARCH_ROUTE,
+            Self::V2Movies
+            | Self::V2Audio
+            | Self::V2Books
+            | Self::V2Anime
+            | Self::V2Search
+            | Self::V2Tv
+            | Self::V2Details => SEARCH_ROUTE,
             Self::V2GetNzb => RouteSpec {
                 query: QueryRule::V2,
                 token_limit: true,
@@ -101,13 +107,12 @@ impl Endpoint {
                 query: QueryRule::None,
                 token_limit: false,
             },
-            Self::V2Capabilities | Self::Inform | Self::MediaInfo | Self::Fallback | Self::RssHealth => READ_ROUTE,
+            Self::V2Capabilities
+            | Self::Inform
+            | Self::MediaInfo
+            | Self::Fallback
+            | Self::RssHealth => READ_ROUTE,
         }
-    }
-
-    /// The route in Laravel's `api` middleware group, with its 60-a-minute throttle.
-    fn in_api_group(self) -> bool {
-        true
     }
 
     fn accepts_query(self) -> bool {
@@ -167,7 +172,7 @@ async fn respond(
     mut endpoint: Endpoint,
     request: Request,
     ctx: &Ctx,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     route_id: Option<String>,
 ) -> anyhow::Result<Reply> {
     let method = request.method().as_str().to_owned();
@@ -175,7 +180,12 @@ async fn respond(
     let is_api = path.starts_with("/api/");
 
     // `HandleCors` answers preflights before routing.
-    if is_api && method == "OPTIONS" && request.headers().contains_key("access-control-request-method") {
+    if is_api
+        && method == "OPTIONS"
+        && request
+            .headers()
+            .contains_key("access-control-request-method")
+    {
         return Ok(preflight(&request));
     }
 
@@ -214,21 +224,18 @@ async fn respond(
     }
 
     let mut api = ApiRequest::read(request).await?;
-    let limited = endpoint.in_api_group().then(|| ());
-    let group = if limited.is_some() {
-        match hit_group(ctx, settings, &api).await {
-            Ok(group) => Some(group),
-            Err(reply) => return Ok(reply),
-        }
-    } else {
-        None
+    let group = match hit_group(ctx, settings, &api).await {
+        Ok(group) => group,
+        Err(reply) => return Ok(reply),
     };
 
     let mut token_headers = None;
     let handled = 'handled: {
         if spec.query != QueryRule::None {
             let strict = spec.query == QueryRule::V2;
-            if let Err((status, message)) = api.validate_query(settings.query_max_body_bytes, strict) {
+            if let Err((status, message)) =
+                api.validate_query(settings.query_max_body_bytes, strict)
+            {
                 let mut reply = if spec.query == QueryRule::V1 {
                     xml_error(201, &message)
                 } else {
@@ -242,7 +249,11 @@ async fn respond(
         if spec.token_limit {
             resolved = resolve_for_limit(ctx, settings, &api).await?;
             if let Some(user) = &resolved {
-                let max = if user.rate_limit == 0 { DEFAULT_RATE_LIMIT } else { user.rate_limit.max(1) };
+                let max = if user.rate_limit == 0 {
+                    DEFAULT_RATE_LIMIT
+                } else {
+                    user.rate_limit.max(1)
+                };
                 let name = format!("api-rate-limit:user:{}", user.id);
                 let attempt = cache::hit(ctx, settings, &name, max, 60).await;
                 if !attempt.allowed {
@@ -255,10 +266,9 @@ async fn respond(
     };
 
     let mut reply = handled;
-    if let Some((limit, remaining)) = token_headers {
-        reply.set_header("x-ratelimit-limit", limit.to_string());
-        reply.set_header("x-ratelimit-remaining", remaining.to_string());
-    } else if let Some((limit, remaining)) = group {
+    // Inner limits win: Laravel's group throttle leaves headers already set alone.
+    let (limit, remaining) = token_headers.unwrap_or(group);
+    if !reply.has_header("x-ratelimit-limit") {
         reply.set_header("x-ratelimit-limit", limit.to_string());
         reply.set_header("x-ratelimit-remaining", remaining.to_string());
     }
@@ -266,7 +276,7 @@ async fn respond(
         reply.set_header("accept-query", "application/json");
     }
     if api.is_query_method() && is_api {
-        reply.set_header("cache-control", "private, no-store");
+        reply.set_header("cache-control", "no-store, private");
     }
     Ok(reply)
 }
@@ -274,7 +284,7 @@ async fn respond(
 async fn handle(
     endpoint: Endpoint,
     ctx: &Ctx,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     api: &ApiRequest,
     resolved: Option<User>,
     route_id: Option<String>,
@@ -284,14 +294,18 @@ async fn handle(
         Endpoint::V2Capabilities => caps::v2(ctx, settings, api).await,
         Endpoint::V2NzbAdd => v2::nzb_add(ctx, settings, api, resolved).await,
         Endpoint::V2Movies => v2::movies(ctx, settings, api, resolved).await,
-        Endpoint::V2Audio => v2::music_or_books(ctx, settings, api, resolved, v2::Media::Audio).await,
-        Endpoint::V2Books => v2::music_or_books(ctx, settings, api, resolved, v2::Media::Books).await,
+        Endpoint::V2Audio => {
+            v2::music_or_books(ctx, settings, api, resolved, v2::Media::Audio).await
+        }
+        Endpoint::V2Books => {
+            v2::music_or_books(ctx, settings, api, resolved, v2::Media::Books).await
+        }
         Endpoint::V2Anime => v2::anime(ctx, settings, api, resolved).await,
         Endpoint::V2Search => v2::search(ctx, settings, api, resolved).await,
         Endpoint::V2Tv => v2::tv(ctx, settings, api, resolved).await,
         Endpoint::V2Details => v2::details(ctx, settings, api, resolved).await,
         Endpoint::V2GetNzb => v2::get_nzb(ctx, settings, api, resolved).await,
-        Endpoint::Inform => misc::inform(ctx, settings, api).await,
+        Endpoint::Inform => misc::inform(ctx, api).await,
         Endpoint::MediaInfo => misc::media_info(ctx, route_id.as_deref().unwrap_or_default()).await,
         Endpoint::Fallback => Ok(misc::fallback()),
         Endpoint::RssHealth => Ok(misc::rss_health()),
@@ -299,7 +313,11 @@ async fn handle(
 }
 
 /// `ThrottleApiRequestsByToken::resolveUser`.
-async fn resolve_for_limit(ctx: &Ctx, settings: &Settings, api: &ApiRequest) -> anyhow::Result<Option<User>> {
+async fn resolve_for_limit(
+    ctx: &Ctx,
+    settings: &Settings,
+    api: &ApiRequest,
+) -> anyhow::Result<Option<User>> {
     let input = &api.input;
     let (token, verified_only) = match input.str("api_token") {
         Some(token) if !token.is_empty() => (token, false),
@@ -333,7 +351,10 @@ async fn hit_group(ctx: &Ctx, settings: &Settings, api: &ApiRequest) -> Result<(
     const LIMIT: i64 = 60;
     let host = api.header("host").unwrap_or_default();
     let ip = api.client_ip().unwrap_or_default();
-    let name = format!("throttle:{}", hex::encode(Sha1::digest(format!("{host}|{ip}"))));
+    let name = format!(
+        "throttle:{}",
+        hex::encode(Sha1::digest(format!("{host}|{ip}")))
+    );
     let attempt = cache::hit(ctx, settings, &name, LIMIT, 60).await;
     if !attempt.allowed {
         let reset = chrono::Utc::now().timestamp() + attempt.retry_after;
@@ -346,7 +367,12 @@ async fn hit_group(ctx: &Ctx, settings: &Settings, api: &ApiRequest) -> Result<(
     Ok((LIMIT, (LIMIT - attempt.attempts).max(0)))
 }
 
-async fn throttle_group(ctx: &Ctx, settings: &Settings, api: &ApiRequest, mut reply: Reply) -> anyhow::Result<Reply> {
+async fn throttle_group(
+    ctx: &Ctx,
+    settings: &Settings,
+    api: &ApiRequest,
+    mut reply: Reply,
+) -> anyhow::Result<Reply> {
     match hit_group(ctx, settings, api).await {
         Ok((limit, remaining)) => {
             reply.set_header("x-ratelimit-limit", limit.to_string());
@@ -368,9 +394,18 @@ fn preflight(request: &Request) -> Reply {
     };
     Reply::empty(204)
         .header("access-control-allow-origin", "*")
-        .header("vary", "Access-Control-Request-Method, Access-Control-Request-Headers")
-        .header("access-control-allow-methods", echo("access-control-request-method"))
-        .header("access-control-allow-headers", echo("access-control-request-headers"))
+        .header(
+            "vary",
+            "Access-Control-Request-Method, Access-Control-Request-Headers",
+        )
+        .header(
+            "access-control-allow-methods",
+            echo("access-control-request-method"),
+        )
+        .header(
+            "access-control-allow-headers",
+            echo("access-control-request-headers"),
+        )
         .header("access-control-max-age", "0")
 }
 

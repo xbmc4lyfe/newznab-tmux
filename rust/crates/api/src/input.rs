@@ -76,7 +76,9 @@ impl Input {
 }
 
 fn find<'a>(bag: &'a Bag, key: &str) -> Option<&'a Value> {
-    bag.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+    bag.iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
 }
 
 fn set(bag: &mut Bag, key: String, value: Value) {
@@ -132,8 +134,13 @@ fn decode(raw: &str) -> String {
     while index < bytes.len() {
         match bytes[index] {
             b'+' => out.push(b' '),
-            b'%' if index + 2 < bytes.len() && hex(bytes[index + 1]).is_some() && hex(bytes[index + 2]).is_some() => {
-                out.push(hex(bytes[index + 1]).unwrap_or(0) * 16 + hex(bytes[index + 2]).unwrap_or(0));
+            b'%' if index + 2 < bytes.len()
+                && hex(bytes[index + 1]).is_some()
+                && hex(bytes[index + 2]).is_some() =>
+            {
+                out.push(
+                    hex(bytes[index + 1]).unwrap_or(0) * 16 + hex(bytes[index + 2]).unwrap_or(0),
+                );
                 index += 2;
             }
             byte => out.push(byte),
@@ -144,12 +151,16 @@ fn decode(raw: &str) -> String {
 }
 
 fn hex(byte: u8) -> Option<u8> {
-    (byte as char).to_digit(16).and_then(|digit| u8::try_from(digit).ok())
+    (byte as char)
+        .to_digit(16)
+        .and_then(|digit| u8::try_from(digit).ok())
 }
 
 /// `Str::trim` strips Unicode whitespace plus BOM, ZWSP and LRM.
 pub fn trim(value: &str) -> &str {
-    value.trim_matches(|c: char| c.is_whitespace() || matches!(c, '\u{FEFF}' | '\u{200B}' | '\u{200E}'))
+    value.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '\u{FEFF}' | '\u{200B}' | '\u{200E}')
+    })
 }
 
 fn clean(value: &str) -> Value {
@@ -243,8 +254,12 @@ fn canonical_value(value: &Value) -> Value {
 
 /// PHP's `is_numeric`: optional surrounding whitespace, sign, digits, fraction, exponent.
 pub fn is_numeric(value: &str) -> bool {
-    numeric_prefix(value.trim_start_matches([' ', '\t', '\n', '\r', '\u{b}', '\u{c}']))
-        .is_some_and(|(_, rest)| rest.trim_end_matches([' ', '\t', '\n', '\r', '\u{b}', '\u{c}']).is_empty())
+    numeric_prefix(value.trim_start_matches([' ', '\t', '\n', '\r', '\u{b}', '\u{c}'])).is_some_and(
+        |(_, rest)| {
+            rest.trim_end_matches([' ', '\t', '\n', '\r', '\u{b}', '\u{c}'])
+                .is_empty()
+        },
+    )
 }
 
 /// The numeric prefix of a string and what follows it. `None` when it has no digits.
@@ -310,8 +325,14 @@ mod tests {
             vec![
                 ("a".to_owned(), Value::Str("2".to_owned())),
                 ("b_c".to_owned(), Value::Str("x y".to_owned())),
-                ("d".to_owned(), Value::List(vec![Value::Str("1".to_owned()), Value::Null])),
-                ("e".to_owned(), Value::Map(vec![("k".to_owned(), Value::Str("v".to_owned()))])),
+                (
+                    "d".to_owned(),
+                    Value::List(vec![Value::Str("1".to_owned()), Value::Null])
+                ),
+                (
+                    "e".to_owned(),
+                    Value::Map(vec![("k".to_owned(), Value::Str("v".to_owned()))])
+                ),
                 ("f".to_owned(), Value::Null),
                 ("g".to_owned(), Value::Null),
                 ("".to_owned(), Value::Str("skip".to_owned())),
@@ -322,7 +343,18 @@ mod tests {
 
     #[test]
     fn numbers_cast_like_php() {
-        for (text, expected) in [("12", 12), ("-3", -3), ("1.9", 1), ("1e3", 1000), ("5x", 5), ("abc", 0), ("", 0), (" 7", 7), (".5", 0), ("+4", 4)] {
+        for (text, expected) in [
+            ("12", 12),
+            ("-3", -3),
+            ("1.9", 1),
+            ("1e3", 1000),
+            ("5x", 5),
+            ("abc", 0),
+            ("", 0),
+            (" 7", 7),
+            (".5", 0),
+            ("+4", 4),
+        ] {
             assert_eq!(php_int(text), expected, "{text}");
         }
         for text in ["1", "-1", "1.5", ".5", "1e3", " 1", "1 "] {

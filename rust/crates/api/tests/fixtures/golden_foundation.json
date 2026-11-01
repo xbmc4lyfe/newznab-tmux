@@ -4338,7 +4338,7 @@
   "path": "/api/release/7/mediainfo",
   "setup": [
    "INSERT INTO video_data (releases_id, containerformat, overallbitrate, videoduration, videoformat, videocodec, videowidth, videoheight, videoaspect, videoframerate, videolibrary) VALUES (7, 'MPEG-4', '5000', '60/1', 'AVC', 'h264', 1920, 1080, '16:9', 23.976, 'x264/lib');",
-   "INSERT INTO audio_data (releases_id, audioid, audioformat, audiomode, audiobitratemode, audiobitrate, audiochannels, audiosamplerate, audiolibrary, audiolanguage, audiotitle) VALUES (7, 2, 'AC-3', 'CBR', 'CBR', '640', '6', '48000', 'lib', 'Français', NULL), (7, 1, 'DTS', NULL, NULL, NULL, NULL, NULL, NULL, 'en', 'x');",
+   "INSERT INTO audio_data (id, releases_id, audioid, audioformat, audiomode, audiobitratemode, audiobitrate, audiochannels, audiosamplerate, audiolibrary, audiolanguage, audiotitle) VALUES (11, 7, 2, 'AC-3', 'CBR', 'CBR', '640', '6', '48000', 'lib', 'Français', NULL), (12, 7, 1, 'DTS', NULL, NULL, NULL, NULL, NULL, NULL, 'en', 'x');",
    "INSERT INTO release_subtitles (releases_id, subsid, subslanguage) VALUES (7, 2, 'de'), (7, 1, 'en');"
   ],
   "expect": {
@@ -4369,7 +4369,7 @@
      "59"
     ]
    ],
-   "body": "{\"video\":{\"releases_id\":7,\"containerformat\":\"MPEG-4\",\"overallbitrate\":\"5000\",\"videoduration\":\"60\\/1\",\"videoformat\":\"AVC\",\"videocodec\":\"h264\",\"videowidth\":1920,\"videoheight\":1080,\"videoaspect\":\"16:9\",\"videoframerate\":23.976,\"videolibrary\":\"x264\\/lib\"},\"audio\":[{\"id\":2,\"releases_id\":7,\"audioid\":1,\"audioformat\":\"DTS\",\"audiomode\":null,\"audiobitratemode\":null,\"audiobitrate\":null,\"audiochannels\":null,\"audiosamplerate\":null,\"audiolibrary\":null,\"audiolanguage\":\"en\",\"audiotitle\":\"x\"},{\"id\":1,\"releases_id\":7,\"audioid\":2,\"audioformat\":\"AC-3\",\"audiomode\":\"CBR\",\"audiobitratemode\":\"CBR\",\"audiobitrate\":\"640\",\"audiochannels\":\"6\",\"audiosamplerate\":\"48000\",\"audiolibrary\":\"lib\",\"audiolanguage\":\"Fran\\u00e7ais\",\"audiotitle\":null}],\"subs\":\"en, de\"}",
+   "body": "{\"video\":{\"releases_id\":7,\"containerformat\":\"MPEG-4\",\"overallbitrate\":\"5000\",\"videoduration\":\"60\\/1\",\"videoformat\":\"AVC\",\"videocodec\":\"h264\",\"videowidth\":1920,\"videoheight\":1080,\"videoaspect\":\"16:9\",\"videoframerate\":23.976,\"videolibrary\":\"x264\\/lib\"},\"audio\":[{\"id\":12,\"releases_id\":7,\"audioid\":1,\"audioformat\":\"DTS\",\"audiomode\":null,\"audiobitratemode\":null,\"audiobitrate\":null,\"audiochannels\":null,\"audiosamplerate\":null,\"audiolibrary\":null,\"audiolanguage\":\"en\",\"audiotitle\":\"x\"},{\"id\":11,\"releases_id\":7,\"audioid\":2,\"audioformat\":\"AC-3\",\"audiomode\":\"CBR\",\"audiobitratemode\":\"CBR\",\"audiobitrate\":\"640\",\"audiochannels\":\"6\",\"audiosamplerate\":\"48000\",\"audiolibrary\":\"lib\",\"audiolanguage\":\"Fran\\u00e7ais\",\"audiotitle\":null}],\"subs\":\"en, de\"}",
    "audit": []
   }
  },
@@ -4438,6 +4438,47 @@
    ],
    "body": "{\n    \"message\": \"The POST method is not supported for route api/release/1/mediainfo. Supported methods: GET, HEAD.\"\n}",
    "audit": []
+  }
+ },
+ {
+  "name": "v2_token_limit_headers",
+  "path": "/api/v2/movies?api_token=tokenposter",
+  "expect": {
+   "status": 400,
+   "headers": [
+    [
+     "accept-query",
+     "application/json"
+    ],
+    [
+     "access-control-allow-origin",
+     "*"
+    ],
+    [
+     "access-control-expose-headers",
+     "Accept-Query, Allow"
+    ],
+    [
+     "cache-control",
+     "no-cache, private"
+    ],
+    [
+     "content-type",
+     "application/json"
+    ],
+    [
+     "x-ratelimit-limit",
+     "2"
+    ],
+    [
+     "x-ratelimit-remaining",
+     "1"
+    ]
+   ],
+   "body": "{\"error\":\"Specify id (query), imdbid, tmdbid, or traktid\"}",
+   "audit": [
+    "/api/v2/movies"
+   ]
   }
  }
 ]

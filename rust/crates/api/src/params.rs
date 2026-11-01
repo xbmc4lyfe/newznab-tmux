@@ -37,11 +37,15 @@ pub fn sort(input: &Input) -> Result<String, &'static str> {
         return Err("Incorrect parameter (sort must not be empty)");
     }
     let valid = sort.split_once('_').is_some_and(|(field, direction)| {
-        matches!(field, "cat" | "name" | "size" | "files" | "stats" | "posted")
-            && matches!(direction, "asc" | "desc")
+        matches!(
+            field,
+            "cat" | "name" | "size" | "files" | "stats" | "posted"
+        ) && matches!(direction, "asc" | "desc")
     });
     if !valid {
-        return Err("Incorrect parameter (sort must be one of: cat_asc/desc, name_asc/desc, size_asc/desc, files_asc/desc, stats_asc/desc, posted_asc/desc)");
+        return Err(
+            "Incorrect parameter (sort must be one of: cat_asc/desc, name_asc/desc, size_asc/desc, files_asc/desc, stats_asc/desc, posted_asc/desc)",
+        );
     }
     Ok(sort)
 }

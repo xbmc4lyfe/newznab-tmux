@@ -557,7 +557,7 @@
   "path": "/api/release/7/mediainfo",
   "setup": [
    "INSERT INTO video_data (releases_id, containerformat, overallbitrate, videoduration, videoformat, videocodec, videowidth, videoheight, videoaspect, videoframerate, videolibrary) VALUES (7, 'MPEG-4', '5000', '60/1', 'AVC', 'h264', 1920, 1080, '16:9', 23.976, 'x264/lib');",
-   "INSERT INTO audio_data (releases_id, audioid, audioformat, audiomode, audiobitratemode, audiobitrate, audiochannels, audiosamplerate, audiolibrary, audiolanguage, audiotitle) VALUES (7, 2, 'AC-3', 'CBR', 'CBR', '640', '6', '48000', 'lib', 'Français', NULL), (7, 1, 'DTS', NULL, NULL, NULL, NULL, NULL, NULL, 'en', 'x');",
+   "INSERT INTO audio_data (id, releases_id, audioid, audioformat, audiomode, audiobitratemode, audiobitrate, audiochannels, audiosamplerate, audiolibrary, audiolanguage, audiotitle) VALUES (11, 7, 2, 'AC-3', 'CBR', 'CBR', '640', '6', '48000', 'lib', 'Français', NULL), (12, 7, 1, 'DTS', NULL, NULL, NULL, NULL, NULL, NULL, 'en', 'x');",
    "INSERT INTO release_subtitles (releases_id, subsid, subslanguage) VALUES (7, 2, 'de'), (7, 1, 'en');"
   ]
  },
@@ -569,5 +569,9 @@
   "name": "mediainfo_post",
   "method": "POST",
   "path": "/api/release/1/mediainfo"
+ },
+ {
+  "name": "v2_token_limit_headers",
+  "path": "/api/v2/movies?api_token=tokenposter"
  }
 ]

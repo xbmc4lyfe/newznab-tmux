@@ -1,5 +1,6 @@
 //! Request accounting: quotas, the redacted audit entry and the access metadata update.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,9 +17,32 @@ use crate::settings::Settings;
 /// Only these filters reach `user_requests.request`. Credentials and unknown fields never do,
 /// because the column ends up in GDPR exports.
 const AUDITED_PARAMETERS: [&str; 26] = [
-    "t", "q", "id", "cat", "imdbid", "tmdbid", "traktid", "vid", "tvdbid", "rid", "tvmazeid",
-    "anidbid", "anilistid", "season", "ep", "group", "limit", "offset", "maxage", "minsize", "sort",
-    "o", "extended", "num", "dl", "del",
+    "t",
+    "q",
+    "id",
+    "cat",
+    "imdbid",
+    "tmdbid",
+    "traktid",
+    "vid",
+    "tvdbid",
+    "rid",
+    "tvmazeid",
+    "anidbid",
+    "anilistid",
+    "season",
+    "ep",
+    "group",
+    "limit",
+    "offset",
+    "maxage",
+    "minsize",
+    "sort",
+    "o",
+    "extended",
+    "num",
+    "dl",
+    "del",
 ];
 const AUDIT_VALUE_MAX_LENGTH: usize = 64;
 const AUDIT_MAX_LENGTH: usize = 255;
@@ -97,13 +121,15 @@ pub enum Reservation {
 /// the last slot. With Redis down it fails closed as busy, since nothing could hold the line.
 pub async fn reserve(
     ctx: &Ctx,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     user: &User,
     audit: &str,
     ip: Option<&str>,
 ) -> Result<Reservation> {
     let name = format!("api_quota:{}", user.id);
-    let Ok(Some(lock)) = cache::lock(ctx, settings, &name, QUOTA_LOCK_SECONDS, QUOTA_LOCK_WAIT).await else {
+    let Ok(Some(lock)) =
+        cache::lock(ctx, settings, &name, QUOTA_LOCK_SECONDS, QUOTA_LOCK_WAIT).await
+    else {
         return Ok(Reservation::Busy);
     };
     let outcome = reserve_locked(ctx, settings, user, audit, ip).await;
@@ -113,17 +139,18 @@ pub async fn reserve(
 
 async fn reserve_locked(
     ctx: &Ctx,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     user: &User,
     audit: &str,
     ip: Option<&str>,
 ) -> Result<Reservation> {
-    let used: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM user_requests WHERE users_id = ? AND timestamp > ?")
-            .bind(user.id)
-            .bind(day_ago_string())
-            .fetch_one(&ctx.db)
-            .await?;
+    let used: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_requests WHERE users_id = ? AND timestamp > ?",
+    )
+    .bind(user.id)
+    .bind(day_ago_string())
+    .fetch_one(&ctx.db)
+    .await?;
     if used >= user.api_requests {
         return Ok(Reservation::Exhausted);
     }
@@ -134,7 +161,7 @@ async fn reserve_locked(
 /// Writes the durable request row, then updates access metadata in the background.
 pub async fn record(
     ctx: &Ctx,
-    settings: &Settings,
+    settings: &Arc<Settings>,
     user_id: i64,
     audit: &str,
     ip: Option<&str>,
@@ -147,17 +174,16 @@ pub async fn record(
         .execute(&ctx.db)
         .await
         .context("recording an API request")?;
-    let (ctx, interval, prefix, ip) = (
-        ctx.clone(),
-        settings.access_update_interval,
-        settings.redis_prefix.clone(),
-        ip.map(str::to_owned),
-    );
+    let (ctx, settings, ip) = (ctx.clone(), settings.clone(), ip.map(str::to_owned));
     tokio::spawn(async move {
         if let Err(failure) =
-            update_user_api_access(&ctx, &prefix, interval, user_id, ip.as_deref(), &occurred_at).await
+            update_user_api_access(&ctx, &settings, user_id, ip.as_deref(), &occurred_at).await
         {
-            warn!(user_id, error = format!("{failure:#}"), "updating API access failed");
+            warn!(
+                user_id,
+                error = format!("{failure:#}"),
+                "updating API access failed"
+            );
         }
     });
     Ok(())
@@ -167,23 +193,14 @@ pub async fn record(
 /// failure must not prevent the update.
 pub async fn update_user_api_access(
     ctx: &Ctx,
-    redis_prefix: &str,
-    interval: u64,
+    settings: &Settings,
     user_id: i64,
     ip: Option<&str>,
     occurred_at: &str,
 ) -> Result<()> {
-    let settings = Settings::new(
-        String::new(),
-        String::new(),
-        1,
-        1,
-        0,
-        interval,
-        redis_prefix.to_owned(),
-    );
     let name = format!("api_access_update:{user_id}");
-    if cache::add(ctx, &settings, &name, interval.max(1)).await == Some(false) {
+    if cache::add(ctx, settings, &name, settings.access_update_interval.max(1)).await == Some(false)
+    {
         return Ok(());
     }
     match ip {
@@ -239,7 +256,9 @@ pub fn raw_url_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }

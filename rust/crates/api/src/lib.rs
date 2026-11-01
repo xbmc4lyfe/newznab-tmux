@@ -2,6 +2,9 @@
 //!
 //! Owner: ws-api. See `rust/WORKSTREAMS.md`.
 
+// Helpers the release, RSS and download endpoints use arrive in the next PRs of this workstream.
+#![allow(dead_code)]
+
 mod auth;
 mod cache;
 mod caps;
@@ -30,7 +33,8 @@ pub use crate::settings::Settings;
 
 pub fn router() -> Router<Ctx> {
     // A malformed limit fails the same way on every request, so it can't start half-configured.
-    let settings = Settings::from_env().unwrap_or_else(|failure| panic!("API settings: {failure:#}"));
+    let settings =
+        Settings::from_env().unwrap_or_else(|failure| panic!("API settings: {failure:#}"));
     router_with(settings)
 }
 

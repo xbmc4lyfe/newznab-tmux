@@ -56,8 +56,7 @@ pub async fn add(ctx: &Ctx, settings: &Settings, name: &str, ttl: u64) -> Option
     }
 }
 
-const RELEASE_LOCK: &str =
-    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+const RELEASE_LOCK: &str = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
 
 /// A held Redis lock. Release it with [`Lock::release`]; otherwise it expires on its own.
 pub struct Lock {

@@ -28,7 +28,10 @@ impl ApiRequest {
         let mut this = Self {
             method,
             path: parts.uri.path().to_owned(),
-            input: Input { query, body: Bag::new() },
+            input: Input {
+                query,
+                body: Bag::new(),
+            },
             headers: parts.headers,
             raw_body,
         };
@@ -40,7 +43,10 @@ impl ApiRequest {
     }
 
     fn parse_body(&self) -> Bag {
-        let content_type = self.header("content-type").unwrap_or_default().to_ascii_lowercase();
+        let content_type = self
+            .header("content-type")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         if content_type.contains("json") {
             return match serde_json::from_slice::<Json>(&self.raw_body) {
                 Ok(json) => match from_json(&json) {
@@ -80,13 +86,17 @@ impl ApiRequest {
     /// isn't a private proxy hop.
     pub fn client_ip(&self) -> Option<String> {
         let forwarded = self.header("x-forwarded-for").unwrap_or_default();
-        let hops: Vec<&str> = forwarded.split(',').map(str::trim).filter(|hop| !hop.is_empty()).collect();
+        let hops: Vec<&str> = forwarded
+            .split(',')
+            .map(str::trim)
+            .filter(|hop| !hop.is_empty())
+            .collect();
         let parsed = |hop: &&str| hop.parse::<std::net::IpAddr>().ok();
         hops.iter()
             .rev()
-            .filter_map(|hop| parsed(hop))
+            .filter_map(parsed)
             .find(|ip| !is_private(ip))
-            .or_else(|| hops.first().and_then(|hop| parsed(hop)))
+            .or_else(|| hops.first().and_then(parsed))
             .map(|ip| ip.to_string())
     }
 
@@ -101,7 +111,11 @@ impl ApiRequest {
 
     /// `ValidateHttpQueryInput`: `Ok` when the request may continue. An `Err` carries the HTTP status
     /// and message. A valid QUERY request's body is canonicalized into the input.
-    pub fn validate_query(&mut self, max_body: usize, strict_url_values: bool) -> Result<(), (u16, String)> {
+    pub fn validate_query(
+        &mut self,
+        max_body: usize,
+        strict_url_values: bool,
+    ) -> Result<(), (u16, String)> {
         if !self.is_query_method() {
             return if strict_url_values {
                 validate_url_values(&self.input.query)
@@ -110,41 +124,75 @@ impl ApiRequest {
             };
         }
         if !is_json_media_type(self.header("content-type")) {
-            return Err((415, "QUERY requests must use Content-Type: application/json".to_owned()));
+            return Err((
+                415,
+                "QUERY requests must use Content-Type: application/json".to_owned(),
+            ));
         }
         if self.raw_body.len() > max_body {
             return Err((413, "QUERY body exceeds the maximum size".to_owned()));
         }
-        let invalid = || (400, "QUERY body must be valid JSON without nested values".to_owned());
+        let invalid = || {
+            (
+                400,
+                "QUERY body must be valid JSON without nested values".to_owned(),
+            )
+        };
         let decoded: Json = serde_json::from_slice(&self.raw_body).map_err(|_| invalid())?;
-        if depth(&decoded) > 3 {
+        if depth(&decoded) >= 3 {
             return Err(invalid());
         }
         let Json::Object(body) = decoded else {
             return Err((400, "QUERY body must be a JSON object".to_owned()));
         };
 
-        let mut keys: Vec<&str> = self.input.query.iter().map(|(key, _)| key.as_str()).collect();
+        let mut keys: Vec<&str> = self
+            .input
+            .query
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect();
         for key in body.keys() {
             if !keys.contains(&key.as_str()) {
                 keys.push(key);
             }
         }
         if keys.iter().any(|key| !valid_key(key)) {
-            return Err((400, "Parameter names may only contain letters, digits and underscores (max 32)".to_owned()));
+            return Err((
+                400,
+                "Parameter names may only contain letters, digits and underscores (max 32)"
+                    .to_owned(),
+            ));
         }
         if keys.len() > MAX_QUERY_PARAMETERS {
-            return Err((400, format!("QUERY requests accept at most {MAX_QUERY_PARAMETERS} parameters")));
+            return Err((
+                400,
+                format!("QUERY requests accept at most {MAX_QUERY_PARAMETERS} parameters"),
+            ));
         }
-        if let Some((key, _)) = self.input.query.iter().find(|(key, _)| body.contains_key(key)) {
-            return Err((400, format!("Parameter {key} must not be sent in both the URL and the body")));
+        if let Some((key, _)) = self
+            .input
+            .query
+            .iter()
+            .find(|(key, _)| body.contains_key(key))
+        {
+            return Err((
+                400,
+                format!("Parameter {key} must not be sent in both the URL and the body"),
+            ));
         }
-        if let Some((key, _)) = body.iter().find(|(key, value)| !valid_body_value(key, value)) {
+        if let Some((key, _)) = body
+            .iter()
+            .find(|(key, value)| !valid_body_value(key, value))
+        {
             return Err((400, format!("Parameter {key} has an unsupported type")));
         }
         validate_url_values(&self.input.query)?;
 
-        let parsed: Bag = body.iter().map(|(key, value)| (key.clone(), from_json(value))).collect();
+        let parsed: Bag = body
+            .iter()
+            .map(|(key, value)| (key.clone(), from_json(value)))
+            .collect();
         self.input.body = canonicalize(&parsed);
         self.input.query = canonicalize(&self.input.query);
         Ok(())
@@ -160,7 +208,8 @@ fn is_private(ip: &std::net::IpAddr) -> bool {
     }
 }
 
-/// `json_decode($raw, false, 3)` depth: an object holding a list of scalars is as deep as allowed.
+/// Container nesting. `json_decode($raw, false, 3)` accepts an object holding a list of scalars and
+/// refuses anything deeper, which probing PHP shows means fewer than three levels.
 fn depth(value: &Json) -> usize {
     match value {
         Json::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
@@ -170,14 +219,21 @@ fn depth(value: &Json) -> usize {
 }
 
 fn valid_key(key: &str) -> bool {
-    !key.is_empty() && key.len() <= 32 && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    !key.is_empty()
+        && key.len() <= 32
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn valid_body_value(key: &str, value: &Json) -> bool {
     match value {
         Json::String(_) | Json::Number(_) => true,
         Json::Array(items) => {
-            key == "cat" && items.iter().all(|item| matches!(item, Json::String(_) | Json::Number(_)))
+            key == "cat"
+                && items
+                    .iter()
+                    .all(|item| matches!(item, Json::String(_) | Json::Number(_)))
         }
         _ => false,
     }
@@ -190,12 +246,19 @@ fn validate_url_values(query: &Bag) -> Result<(), (u16, String)> {
         let valid = match value {
             Value::Null | Value::Str(_) => true,
             Value::List(items) => {
-                key == "cat" && items.iter().all(|item| matches!(item, Value::Null | Value::Str(_)))
+                key == "cat"
+                    && items
+                        .iter()
+                        .all(|item| matches!(item, Value::Null | Value::Str(_)))
             }
             Value::Map(_) => false,
         };
         if !valid {
-            let name = if valid_key(key) { key.as_str() } else { "value" };
+            let name = if valid_key(key) {
+                key.as_str()
+            } else {
+                "value"
+            };
             return Err((400, format!("Parameter {name} has an unsupported type")));
         }
     }
@@ -207,12 +270,18 @@ fn is_json_media_type(content_type: Option<&str>) -> bool {
         return false;
     };
     let mut parts = content_type.split(';').map(str::trim);
-    if !parts.next().unwrap_or_default().eq_ignore_ascii_case("application/json") {
+    if !parts
+        .next()
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("application/json")
+    {
         return false;
     }
-    parts.filter(|parameter| !parameter.is_empty()).all(|parameter| {
-        let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
-        name.trim().eq_ignore_ascii_case("charset")
-            && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
-    })
+    parts
+        .filter(|parameter| !parameter.is_empty())
+        .all(|parameter| {
+            let (name, value) = parameter.split_once('=').unwrap_or((parameter, ""));
+            name.trim().eq_ignore_ascii_case("charset")
+                && value.trim().trim_matches('"').eq_ignore_ascii_case("utf-8")
+        })
 }

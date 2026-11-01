@@ -1,5 +1,7 @@
 //! The newznab API at `/api/v1/api`, dispatched on `t`.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use nntmux_runtime::Ctx;
 
@@ -60,7 +62,10 @@ pub struct Account {
 }
 
 fn empty_error(parameter: &str) -> Reply {
-    xml_error(201, &format!("Incorrect parameter ({parameter} must not be empty)"))
+    xml_error(
+        201,
+        &format!("Incorrect parameter ({parameter} must not be empty)"),
+    )
 }
 
 /// `verifyEmptyParameter`: present but blank is an error, absent is fine.
@@ -68,7 +73,7 @@ fn require_filled(input: &Input, parameter: &str) -> Option<Reply> {
     (input.has(parameter) && !input.filled(parameter)).then(|| empty_error(parameter))
 }
 
-pub async fn api(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Result<Reply> {
+pub async fn api(ctx: &Ctx, settings: &Arc<Settings>, request: &ApiRequest) -> Result<Reply> {
     let input = &request.input;
     if !input.has("t") {
         return Ok(xml_error(200, "Missing parameter (t)"));
@@ -86,7 +91,8 @@ pub async fn api(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Result
         return caps::v1(ctx, settings, request, xml).await;
     }
 
-    if !input.filled("apikey") && input.str("apikey").is_none_or(|key| key.is_empty() || key == "0") {
+    // PHP's `empty` also refuses "0".
+    if input.str("apikey").is_none_or(|key| key == "0") {
         return Ok(xml_error(200, "Missing parameter (apikey)"));
     }
     let token = input.string("apikey");
@@ -100,7 +106,10 @@ pub async fn api(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Result
     let stats = usage::statistics(ctx, settings, user.id).await?;
     if stats.api_count >= user.api_requests {
         let (used, max) = (stats.api_count, user.api_requests);
-        return Ok(xml_error(500, &format!("Request limit reached ({used}/{max})")));
+        return Ok(xml_error(
+            500,
+            &format!("Request limit reached ({used}/{max})"),
+        ));
     }
 
     let account = Account {
@@ -123,16 +132,21 @@ pub async fn api(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Result
     }
 }
 
-fn audit(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> impl Future<Output = Result<()>> {
+async fn audit(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<()> {
     let entry = usage::audit_entry(request.laravel_path(), &request.input);
-    let ip = request.client_ip();
-    let (ctx, user_id) = (ctx.clone(), account.user.id);
-    let prefix = settings.redis_prefix.clone();
-    let interval = settings.access_update_interval;
-    async move {
-        let settings = Settings::new(String::new(), String::new(), 1, 1, 0, interval, prefix);
-        usage::record(&ctx, &settings, user_id, &entry, ip.as_deref()).await
-    }
+    usage::record(
+        ctx,
+        settings,
+        account.user.id,
+        &entry,
+        request.client_ip().as_deref(),
+    )
+    .await
 }
 
 /// Shared request validation for the release-listing functions.
@@ -146,7 +160,12 @@ fn not_ported() -> Reply {
     Reply::message(501, "Not ported yet")
 }
 
-async fn search(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn search(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     let input = &request.input;
     if let Some(error) = require_filled(input, "q") {
         return Ok(error);
@@ -158,9 +177,16 @@ async fn search(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &
     Ok(not_ported())
 }
 
-async fn tv(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn tv(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     let input = &request.input;
-    for parameter in ["q", "vid", "tvdbid", "traktid", "rid", "tvmazeid", "imdbid", "tmdbid", "season", "ep"] {
+    for parameter in [
+        "q", "vid", "tvdbid", "traktid", "rid", "tvmazeid", "imdbid", "tmdbid", "season", "ep",
+    ] {
         if let Some(error) = require_filled(input, parameter) {
             return Ok(error);
         }
@@ -172,7 +198,12 @@ async fn tv(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Acco
     Ok(not_ported())
 }
 
-async fn movie(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn movie(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     let input = &request.input;
     for parameter in ["q", "imdbid", "tmdbid", "traktid"] {
         if let Some(error) = require_filled(input, parameter) {
@@ -186,7 +217,12 @@ async fn movie(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &A
     Ok(not_ported())
 }
 
-async fn media(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn media(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     let input = &request.input;
     if let Some(error) = require_filled(input, "q") {
         return Ok(error);
@@ -198,7 +234,12 @@ async fn media(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &A
     Ok(not_ported())
 }
 
-async fn anime(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn anime(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     let input = &request.input;
     let filled_int = |key: &str| {
         if input.filled(key) {
@@ -208,7 +249,10 @@ async fn anime(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &A
         }
     };
     if input.string("q").is_empty() && filled_int("anidbid") <= 0 && filled_int("anilistid") <= 0 {
-        return Ok(xml_error(200, "Missing parameter (specify q, anidbid, or anilistid)"));
+        return Ok(xml_error(
+            200,
+            "Missing parameter (specify q, anidbid, or anilistid)",
+        ));
     }
     if let Err(error) = sort_and_age(input) {
         return Ok(error);
@@ -217,7 +261,12 @@ async fn anime(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &A
     Ok(not_ported())
 }
 
-async fn get(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn get(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     if let Some(error) = require_filled(&request.input, "g") {
         return Ok(error);
     }
@@ -225,23 +274,44 @@ async fn get(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Acc
     Ok(not_ported())
 }
 
-async fn details(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn details(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     if !request.input.has("id") {
-        return Ok(xml_error(200, "Missing parameter (guid is required for single release details)"));
+        return Ok(xml_error(
+            200,
+            "Missing parameter (guid is required for single release details)",
+        ));
     }
     audit(ctx, settings, request, account).await?;
     Ok(not_ported())
 }
 
-async fn nfo(ctx: &Ctx, settings: &Settings, request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn nfo(
+    ctx: &Ctx,
+    settings: &Arc<Settings>,
+    request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     if !request.input.has("id") {
-        return Ok(xml_error(200, "Missing parameter (id is required for retrieving an NFO)"));
+        return Ok(xml_error(
+            200,
+            "Missing parameter (id is required for retrieving an NFO)",
+        ));
     }
     audit(ctx, settings, request, account).await?;
     Ok(not_ported())
 }
 
-async fn nzb_add(_ctx: &Ctx, _settings: &Settings, _request: &ApiRequest, account: &Account) -> Result<Reply> {
+async fn nzb_add(
+    _ctx: &Ctx,
+    _settings: &Settings,
+    _request: &ApiRequest,
+    account: &Account,
+) -> Result<Reply> {
     if !account.user.can_post {
         return Ok(xml_error(102, "Insufficient privileges/not authorized"));
     }

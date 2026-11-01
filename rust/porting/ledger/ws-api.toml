@@ -4,13 +4,14 @@
 kind = "job"
 id = "RecordApiUsage"
 source = "app/Jobs/RecordApiUsage.php"
-status = "todo"
+status = "dropped"
+note = "Legacy job kept only to drain the PHP queue; requests are recorded inline before the response."
 
 [[entry]]
 kind = "job"
 id = "UpdateUserApiAccess"
 source = "app/Jobs/UpdateUserApiAccess.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -28,7 +29,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /api/release/{id}/mediainfo"
 source = "Closure"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -52,7 +53,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /api/v2/capabilities"
 source = "App\\Http\\Controllers\\Api\\ApiV2Controller@capabilities"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -64,7 +65,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /api/{fallbackPlaceholder}"
 source = "Closure"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -88,7 +89,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /rss/health"
 source = "App\\Http\\Controllers\\RssHealthController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -190,49 +191,49 @@ status = "todo"
 kind = "route"
 id = "OPTIONS /api/v1/api"
 source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "OPTIONS /api/v2/anime"
 source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "OPTIONS /api/v2/audio"
 source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "OPTIONS /api/v2/books"
 source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "OPTIONS /api/v2/details"
 source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "OPTIONS /api/v2/movies"
 source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "OPTIONS /api/v2/search"
 source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
 id = "OPTIONS /api/v2/tv"
 source = "App\\Http\\Controllers\\Api\\ApiQueryOptionsController"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"

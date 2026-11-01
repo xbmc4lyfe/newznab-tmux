@@ -67,20 +67,24 @@ pub async fn resolve(ctx: &Ctx, settings: &Settings, token: &str) -> Result<Opti
 /// `User::findVerifiedByApiToken` behind the same cache. Laravel shared one key between its verified
 /// and unverified lookups, so a cached unverified user could pass here; this checks every time.
 pub async fn resolve_verified(ctx: &Ctx, settings: &Settings, token: &str) -> Result<Option<User>> {
-    Ok(resolve(ctx, settings, token).await?.filter(|user| user.verified))
+    Ok(resolve(ctx, settings, token)
+        .await?
+        .filter(|user| user.verified))
 }
 
 /// `findVerifiedByApiToken` without a cache, as RSS and getnzb use it.
 pub async fn find_verified(ctx: &Ctx, token: &str) -> Result<Option<User>> {
-    Ok(find_by_token(ctx, token).await?.filter(|user| user.verified))
+    Ok(find_by_token(ctx, token)
+        .await?
+        .filter(|user| user.verified))
 }
 
 async fn find_by_token(ctx: &Ctx, token: &str) -> Result<Option<User>> {
     let row = sqlx::query(
         "SELECT u.id, u.username, u.api_token, u.roles_id, u.rate_limit, u.can_post,
                 (u.verified = 1 OR u.email_verified_at IS NOT NULL) AS is_verified,
-                COALESCE(r.apirequests, 0) AS apirequests,
-                COALESCE(r.downloadrequests, 0) AS downloadrequests,
+                CAST(COALESCE(r.apirequests, 0) AS SIGNED) AS apirequests,
+                CAST(COALESCE(r.downloadrequests, 0) AS SIGNED) AS downloadrequests,
                 EXISTS (SELECT 1 FROM model_has_roles mhr
                         INNER JOIN roles dr ON dr.id = mhr.role_id
                         WHERE mhr.model_id = u.id AND mhr.model_type = 'App\\\\Models\\\\User'
@@ -105,8 +109,8 @@ async fn find_by_token(ctx: &Ctx, token: &str) -> Result<Option<User>> {
         can_post: row.try_get("can_post")?,
         verified: row.try_get::<i64, _>("is_verified")? == 1,
         has_disabled_role: row.try_get::<i64, _>("has_disabled_role")? == 1,
-        api_requests: i64::try_from(row.try_get::<u64, _>("apirequests")?)?,
-        download_requests: i64::try_from(row.try_get::<u64, _>("downloadrequests")?)?,
+        api_requests: row.try_get("apirequests")?,
+        download_requests: row.try_get("downloadrequests")?,
     }))
 }
 
@@ -152,7 +156,10 @@ async fn load_exclusions(ctx: &Ctx, user_id: i64) -> Result<Vec<i64>> {
     let not_in_excluded_root = if excluded_roots.is_empty() {
         String::new()
     } else {
-        format!(" AND c.root_categories_id NOT IN ({})", join_ids(&excluded_roots))
+        format!(
+            " AND c.root_categories_id NOT IN ({})",
+            join_ids(&excluded_roots)
+        )
     };
     let own: Vec<i32> = sqlx::query_scalar(AssertSqlSafe(format!(
         "SELECT c.id FROM categories c

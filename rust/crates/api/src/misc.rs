@@ -8,7 +8,6 @@ use crate::db::row_json;
 use crate::json::{J, Style};
 use crate::reply::{Reply, json_error};
 use crate::request::ApiRequest;
-use crate::settings::Settings;
 
 pub fn rss_health() -> Reply {
     Reply::json(
@@ -51,13 +50,17 @@ pub async fn media_info(ctx: &Ctx, id: &str) -> Result<Reply> {
     };
     Ok(Reply::json(
         200,
-        &J::obj([("video", video), ("audio", audio), ("subs", J::opt_str(subs))]),
+        &J::obj([
+            ("video", video),
+            ("audio", audio),
+            ("subs", J::opt_str(subs)),
+        ]),
         Style::Plain,
     ))
 }
 
 /// `GET /api/inform/release`: a client reports the proper name for an obfuscated one.
-pub async fn inform(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Result<Reply> {
+pub async fn inform(ctx: &Ctx, request: &ApiRequest) -> Result<Reply> {
     let input = &request.input;
     let token = input.string("api_token");
     let Some(user) = auth::find_verified(ctx, &token).await? else {
@@ -67,12 +70,23 @@ pub async fn inform(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Res
         return Ok(json_error(101, ""));
     }
     // PHP's `empty` also rejects "0".
-    let given = |key: &str| input.str(key).filter(|value| *value != "0").map(str::to_owned);
+    let given = |key: &str| {
+        input
+            .str(key)
+            .filter(|value| *value != "0")
+            .map(str::to_owned)
+    };
     let (Some(original), Some(proper)) = (given("relo"), given("relp")) else {
-        return Ok(Reply::message(404, "Indexer inform error, wrong data supplied!"));
+        return Ok(Reply::message(
+            404,
+            "Indexer inform error, wrong data supplied!",
+        ));
     };
     if token == "0" {
-        return Ok(Reply::message(404, "Indexer inform error, wrong data supplied!"));
+        return Ok(Reply::message(
+            404,
+            "Indexer inform error, wrong data supplied!",
+        ));
     }
     let now = crate::usage::now_string();
     sqlx::query(
@@ -86,6 +100,5 @@ pub async fn inform(ctx: &Ctx, settings: &Settings, request: &ApiRequest) -> Res
     .bind(&now)
     .execute(&ctx.db)
     .await?;
-    let _ = settings;
     Ok(Reply::message(200, "Release Information Added!"))
 }

@@ -16,18 +16,22 @@ pub fn column_json(row: &MySqlRow, index: usize) -> Result<J> {
     Ok(match kind.as_str() {
         "BOOLEAN" => J::Int(i64::from(row.try_get::<bool, _>(index)?)),
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" => J::Int(row.try_get(index)?),
-        "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" | "BIGINT UNSIGNED" => {
-            J::Int(i64::try_from(row.try_get::<u64, _>(index)?)?)
-        }
+        "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED"
+        | "BIGINT UNSIGNED" => J::Int(i64::try_from(row.try_get::<u64, _>(index)?)?),
         "FLOAT" => J::Float(f64::from(row.try_get::<f32, _>(index)?)),
         "DOUBLE" => J::Float(row.try_get(index)?),
-        "DATETIME" | "TIMESTAMP" => {
-            J::Str(row.try_get::<NaiveDateTime, _>(index)?.format("%Y-%m-%d %H:%M:%S").to_string())
-        }
-        "DATE" => J::Str(row.try_get::<NaiveDate, _>(index)?.format("%Y-%m-%d").to_string()),
-        "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM" | "DECIMAL" => {
-            J::Str(row.try_get(index)?)
-        }
+        "DATETIME" | "TIMESTAMP" => J::Str(
+            row.try_get::<NaiveDateTime, _>(index)?
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string(),
+        ),
+        "DATE" => J::Str(
+            row.try_get::<NaiveDate, _>(index)?
+                .format("%Y-%m-%d")
+                .to_string(),
+        ),
+        "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "ENUM"
+        | "DECIMAL" => J::Str(row.try_get(index)?),
         other => bail!("no JSON form for column type {other}"),
     })
 }

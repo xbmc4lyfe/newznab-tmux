@@ -16,28 +16,77 @@ use crate::usage::rfc2822;
 use crate::xml::XmlWriter;
 
 fn search_entry(params: &str) -> J {
-    J::obj([("available", J::str("yes")), ("supportedParams", J::str(params))])
+    J::obj([
+        ("available", J::str("yes")),
+        ("supportedParams", J::str(params)),
+    ])
 }
 
 fn v1_searching() -> J {
     J::obj([
-        ("search", search_entry("q,group,minsize,maxsize,maxage,cat,limit,offset,attrs,extended,del,sort")),
-        ("tv-search", search_entry("q,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort")),
-        ("movie-search", search_entry("q,imdbid,tmdbid,traktid,genre,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort")),
-        ("audio-search", search_entry("q,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort")),
-        ("book-search", search_entry("q,title,author,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort")),
-        ("anime-search", search_entry("q,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort")),
+        (
+            "search",
+            search_entry("q,group,minsize,maxsize,maxage,cat,limit,offset,attrs,extended,del,sort"),
+        ),
+        (
+            "tv-search",
+            search_entry(
+                "q,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+            ),
+        ),
+        (
+            "movie-search",
+            search_entry(
+                "q,imdbid,tmdbid,traktid,genre,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+            ),
+        ),
+        (
+            "audio-search",
+            search_entry("q,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort"),
+        ),
+        (
+            "book-search",
+            search_entry(
+                "q,title,author,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort",
+            ),
+        ),
+        (
+            "anime-search",
+            search_entry(
+                "q,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+            ),
+        ),
     ])
 }
 
 fn v2_searching() -> J {
     J::obj([
-        ("search", search_entry("id,group,minsize,maxage,cat,limit,offset,cursor,sort")),
-        ("tv-search", search_entry("id,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxage,limit,offset,cursor,sort")),
-        ("movie-search", search_entry("id,imdbid,tmdbid,traktid,cat,minsize,maxage,limit,offset,cursor,sort")),
-        ("audio-search", search_entry("id,cat,minsize,maxage,group,limit,offset,cursor,sort")),
-        ("book-search", search_entry("id,cat,minsize,maxage,group,limit,offset,cursor,sort")),
-        ("anime-search", search_entry("id,anidbid,anilistid,cat,minsize,maxage,limit,offset,cursor,sort")),
+        (
+            "search",
+            search_entry("id,group,minsize,maxage,cat,limit,offset,cursor,sort"),
+        ),
+        (
+            "tv-search",
+            search_entry(
+                "id,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxage,limit,offset,cursor,sort",
+            ),
+        ),
+        (
+            "movie-search",
+            search_entry("id,imdbid,tmdbid,traktid,cat,minsize,maxage,limit,offset,cursor,sort"),
+        ),
+        (
+            "audio-search",
+            search_entry("id,cat,minsize,maxage,group,limit,offset,cursor,sort"),
+        ),
+        (
+            "book-search",
+            search_entry("id,cat,minsize,maxage,group,limit,offset,cursor,sort"),
+        ),
+        (
+            "anime-search",
+            search_entry("id,anidbid,anilistid,cat,minsize,maxage,limit,offset,cursor,sort"),
+        ),
     ])
 }
 
@@ -54,7 +103,10 @@ async fn site_text(ctx: &Ctx, settings: &Settings) -> Result<(String, String)> {
             .fetch_optional(&ctx.db)
             .await?;
     let (strapline, keywords) = row.unwrap_or_else(|| {
-        ("A great usenet indexer".to_owned(), "usenet,nzbs,cms,community".to_owned())
+        (
+            "A great usenet indexer".to_owned(),
+            "usenet,nzbs,cms,community".to_owned(),
+        )
     });
     settings.local_put(
         KEY,
@@ -67,9 +119,10 @@ async fn site_text(ctx: &Ctx, settings: &Settings) -> Result<(String, String)> {
 /// `RegistrationStatusService::resolve`: an active period opens registration whatever the manual
 /// status says. Returns `(available, is_open)`.
 async fn registration(ctx: &Ctx) -> Result<(bool, bool)> {
-    let manual: Option<u8> = sqlx::query_scalar("SELECT status FROM registration_configurations LIMIT 1")
-        .fetch_optional(&ctx.db)
-        .await?;
+    let manual: Option<u8> =
+        sqlx::query_scalar("SELECT status FROM registration_configurations LIMIT 1")
+            .fetch_optional(&ctx.db)
+            .await?;
     // Unknown stored values count as open, as getManualStatus does.
     let manual = manual.filter(|status| *status <= 2).unwrap_or(0);
     let now = crate::usage::now_string();
@@ -97,9 +150,11 @@ fn limits(settings: &Settings) -> J {
 }
 
 async fn groups(ctx: &Ctx) -> Result<J> {
-    let rows = sqlx::query("SELECT name, description, last_updated FROM usenet_groups WHERE active = 1 ORDER BY name")
-        .fetch_all(&ctx.db)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT name, description, last_updated FROM usenet_groups WHERE active = 1 ORDER BY name",
+    )
+    .fetch_all(&ctx.db)
+    .await?;
     let mut groups = Vec::with_capacity(rows.len());
     for row in rows {
         let description: Option<String> = row.try_get("description")?;
@@ -107,7 +162,10 @@ async fn groups(ctx: &Ctx) -> Result<J> {
         groups.push(J::obj([
             ("name", J::str(row.try_get::<String, _>("name")?)),
             ("description", J::str(description.unwrap_or_default())),
-            ("lastupdate", J::str(updated.map(rfc2822).unwrap_or_default())),
+            (
+                "lastupdate",
+                J::str(updated.map(rfc2822).unwrap_or_default()),
+            ),
         ]));
     }
     Ok(J::Arr(groups))
@@ -164,9 +222,10 @@ async fn menu_categories(ctx: &Ctx) -> Result<J> {
 
 /// The v2 form: active roots with `{id: title}` maps of their categories.
 async fn api_categories(ctx: &Ctx) -> Result<J> {
-    let roots: Vec<(u64, String)> = sqlx::query_as("SELECT id, title FROM root_categories WHERE status = 1")
-        .fetch_all(&ctx.db)
-        .await?;
+    let roots: Vec<(u64, String)> =
+        sqlx::query_as("SELECT id, title FROM root_categories WHERE status = 1")
+            .fetch_all(&ctx.db)
+            .await?;
     let mut out = Vec::with_capacity(roots.len());
     for (id, title) in roots {
         let children: Vec<(u32, String)> =
@@ -221,7 +280,10 @@ impl Server {
             ("email", J::str(self.email.clone())),
             ("meta", J::str(self.meta.clone())),
             ("url", J::str(self.url.clone())),
-            ("image", J::str(format!("{}/assets/images/tmux_logo.png", self.url))),
+            (
+                "image",
+                J::str(format!("{}/assets/images/tmux_logo.png", self.url)),
+            ),
         ])
     }
 }
@@ -249,7 +311,10 @@ fn items(value: &J) -> &[J] {
 }
 
 fn field<'a>(value: &'a J, name: &str) -> Option<&'a J> {
-    entries(value).iter().find(|(key, _)| key == name).map(|(_, value)| value)
+    entries(value)
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
 }
 
 fn write_attrs(writer: &mut XmlWriter, name: &str, value: &J) {
@@ -276,8 +341,13 @@ fn decode_entities(text: &str) -> String {
 fn write_category(writer: &mut XmlWriter, tag: &str, category: &J) {
     writer.start(tag);
     writer.attr("id", &field(category, "id").map(scalar).unwrap_or_default());
-    writer.attr("name", &decode_entities(&field(category, "title").map(scalar).unwrap_or_default()));
-    let description = field(category, "description").map(scalar).unwrap_or_default();
+    writer.attr(
+        "name",
+        &decode_entities(&field(category, "title").map(scalar).unwrap_or_default()),
+    );
+    let description = field(category, "description")
+        .map(scalar)
+        .unwrap_or_default();
     // PHP's `empty` treats "0" as empty too.
     if !description.is_empty() && description != "0" {
         writer.attr("description", &decode_entities(&description));
@@ -326,8 +396,14 @@ pub async fn v1(ctx: &Ctx, settings: &Settings, request: &ApiRequest, xml: bool)
     writer.start("groups");
     for group in items(&groups) {
         writer.start("group");
-        writer.attr("name", &field(group, "name").map(scalar).unwrap_or_default());
-        writer.attr("description", &field(group, "description").map(scalar).unwrap_or_default());
+        writer.attr(
+            "name",
+            &field(group, "name").map(scalar).unwrap_or_default(),
+        );
+        writer.attr(
+            "description",
+            &field(group, "description").map(scalar).unwrap_or_default(),
+        );
         let updated = field(group, "lastupdate").map(scalar).unwrap_or_default();
         if !updated.is_empty() {
             writer.attr("lastupdate", &updated);
@@ -339,8 +415,14 @@ pub async fn v1(ctx: &Ctx, settings: &Settings, request: &ApiRequest, xml: bool)
     for genre in items(&genres) {
         writer.start("genre");
         writer.attr("id", &field(genre, "id").map(scalar).unwrap_or_default());
-        writer.attr("name", &field(genre, "name").map(scalar).unwrap_or_default());
-        writer.attr("categoryid", &field(genre, "categoryid").map(scalar).unwrap_or_default());
+        writer.attr(
+            "name",
+            &field(genre, "name").map(scalar).unwrap_or_default(),
+        );
+        writer.attr(
+            "categoryid",
+            &field(genre, "categoryid").map(scalar).unwrap_or_default(),
+        );
         writer.end();
     }
     writer.end();

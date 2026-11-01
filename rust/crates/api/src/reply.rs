@@ -37,19 +37,27 @@ impl Reply {
 
     /// `response()->json()` with no flags.
     pub fn message(status: u16, message: &str) -> Self {
-        Self::json(status, &J::obj([("message", J::str(message))]), Style::Plain)
+        Self::json(
+            status,
+            &J::obj([("message", J::str(message))]),
+            Style::Plain,
+        )
     }
 
     /// The v2 presenter's `{"error": ...}` for validation failures, which sets no X-NNTmux.
     pub fn v2_error(status: u16, message: &str) -> Self {
-        Self::json(status, &J::obj([("error", J::str(message))]), Style::Unescaped)
+        Self::json(
+            status,
+            &J::obj([("error", J::str(message))]),
+            Style::Unescaped,
+        )
     }
 
     /// How Laravel renders an HTTP exception to a client wanting JSON: pretty-printed.
     pub fn exception(status: u16, message: &str) -> Self {
         let body = format!(
             "{{\n    \"message\": {}\n}}",
-            J::str(message).encode(Style::Plain)
+            J::str(message).encode(Style::Unescaped)
         );
         Self::new(status, "application/json", body)
     }
@@ -74,10 +82,14 @@ impl Reply {
 
     pub fn into_response(self) -> Response {
         let mut response = Response::new(Body::from(self.body));
-        *response.status_mut() = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        *response.status_mut() =
+            StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         for (name, value) in self.headers {
             // Values that can't be headers come from client input, such as a `t` with a newline.
-            if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(&value)) {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(&value),
+            ) {
                 response.headers_mut().append(name, value);
             }
         }
@@ -152,12 +164,20 @@ pub fn xml_error(code: u16, text: &str) -> Reply {
 /// `apiJsonError`: the same error for API v2 and RSS.
 pub fn json_error(code: u16, text: &str) -> Reply {
     let (message, status) = message_for(code, text);
-    Reply::json(status, &J::obj([("error", J::str(message.clone()))]), Style::Plain)
-        .header("x-nntmux", format!("API ERROR [{code}] {message}"))
+    Reply::json(
+        status,
+        &J::obj([("error", J::str(message.clone()))]),
+        Style::Plain,
+    )
+    .header("x-nntmux", format!("API ERROR [{code}] {message}"))
 }
 
 impl Reply {
     pub fn header_if(self, condition: bool, name: &'static str, value: impl Into<String>) -> Self {
-        if condition { self.header(name, value) } else { self }
+        if condition {
+            self.header(name, value)
+        } else {
+            self
+        }
     }
 }

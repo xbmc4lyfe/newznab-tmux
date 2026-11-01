@@ -51,7 +51,10 @@ fn test_config() -> Config {
 }
 
 async fn run_sql(pool: &MySqlPool, sql: &str) -> Result<()> {
-    sqlx::raw_sql(AssertSqlSafe(sql.to_owned())).execute(pool).await.with_context(|| sql.to_owned())?;
+    sqlx::raw_sql(AssertSqlSafe(sql.to_owned()))
+        .execute(pool)
+        .await
+        .with_context(|| sql.to_owned())?;
     Ok(())
 }
 
@@ -74,7 +77,8 @@ fn app(ctx: &Ctx) -> Router {
 
 /// Volatile response parts become placeholders on both sides before comparing.
 fn mask(value: &str) -> String {
-    let date = regex::Regex::new(r#"("api(?:Oldest|oldest)Time":|apioldesttime=)"[^"]*""#).expect("static regex");
+    let date = regex::Regex::new(r#"("api(?:Oldest|oldest)Time":|apioldesttime=)"[^"]*""#)
+        .expect("static regex");
     date.replace_all(value, "$1\"<now>\"").into_owned()
 }
 
@@ -96,7 +100,9 @@ fn headers_of(value: &Value) -> Vec<(String, String)> {
 }
 
 async fn replay(file: &str, skip: &[&str]) -> Result<()> {
-    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL")) else {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
         eprintln!("test services unset, skipping");
         return Ok(());
     };
@@ -121,9 +127,11 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
         let mut builder = Request::builder()
             .method(case["method"].as_str().unwrap_or("GET"))
             .uri(case["path"].as_str().context("path")?)
-            .header("host", "127.0.0.1:8765")
             .header("accept", "*/*")
             .header("user-agent", "golden");
+        if case["headers"]["Host"].is_null() {
+            builder = builder.header("host", "127.0.0.1:8765");
+        }
         if let Some(headers) = case["headers"].as_object() {
             for (header, value) in headers {
                 builder = builder.header(header.to_lowercase(), value.as_str().context("header")?);
@@ -131,7 +139,9 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
         }
         let body = match (case["body"].as_str(), case["body_b64"].as_str()) {
             (Some(text), _) => Body::from(text.to_owned()),
-            (_, Some(encoded)) => Body::from(base64::engine::general_purpose::STANDARD.decode(encoded)?),
+            (_, Some(encoded)) => {
+                Body::from(base64::engine::general_purpose::STANDARD.decode(encoded)?)
+            }
             _ => Body::empty(),
         };
         let response = app(&ctx).oneshot(builder.body(body)?).await?;
@@ -139,7 +149,12 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
         let mut got_headers: Vec<(String, String)> = response
             .headers()
             .iter()
-            .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or_default().to_owned()))
+            .map(|(name, value)| {
+                (
+                    name.to_string(),
+                    value.to_str().unwrap_or_default().to_owned(),
+                )
+            })
             .filter(|(name, _)| !IGNORED_HEADERS.contains(&name.as_str()))
             .collect();
         got_headers.sort();
@@ -153,8 +168,16 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
             want_headers.retain(|(name, _)| name != "content-type");
         }
         // HEAD went over a real socket for PHP and an in-process call here.
-        let want_body = if case["method"] == "HEAD" { String::new() } else { expect["body"].as_str().unwrap_or_default().to_owned() };
-        let got_body = if case["method"] == "HEAD" { String::new() } else { got_body };
+        let want_body = if case["method"] == "HEAD" {
+            String::new()
+        } else {
+            expect["body"].as_str().unwrap_or_default().to_owned()
+        };
+        let got_body = if case["method"] == "HEAD" {
+            String::new()
+        } else {
+            got_body
+        };
 
         let mut problems = Vec::new();
         if i64::from(status) != expect["status"].as_i64().unwrap_or_default() {
@@ -163,15 +186,28 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
         if case["ignore_body"] != Value::Bool(true) && mask(&got_body) != mask(&want_body) {
             problems.push(first_difference(&mask(&want_body), &mask(&got_body)));
         }
-        let got_cmp: Vec<_> = got_headers.iter().filter(|(name, _)| case["ignore_body"] != Value::Bool(true) || name != "content-type").collect();
-        let want_cmp: Vec<_> = want_headers.iter().filter(|(name, _)| case["ignore_body"] != Value::Bool(true) || name != "content-type").collect();
+        let got_cmp: Vec<_> = got_headers
+            .iter()
+            .filter(|(name, _)| case["ignore_body"] != Value::Bool(true) || name != "content-type")
+            .collect();
+        let want_cmp: Vec<_> = want_headers
+            .iter()
+            .filter(|(name, _)| case["ignore_body"] != Value::Bool(true) || name != "content-type")
+            .collect();
         if got_cmp != want_cmp {
             problems.push(format!("headers\n  want {want_cmp:?}\n  got  {got_cmp:?}"));
         }
-        let audit: Vec<String> = sqlx::query_scalar("SELECT request FROM user_requests WHERE request <> 'x' ORDER BY id")
-            .fetch_all(&db.pool)
-            .await?;
-        let want_audit: Vec<String> = expect["audit"].as_array().into_iter().flatten().map(|entry| entry.as_str().unwrap_or_default().to_owned()).collect();
+        let audit: Vec<String> = sqlx::query_scalar(
+            "SELECT request FROM user_requests WHERE request <> 'x' ORDER BY id",
+        )
+        .fetch_all(&db.pool)
+        .await?;
+        let want_audit: Vec<String> = expect["audit"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.as_str().unwrap_or_default().to_owned())
+            .collect();
         if audit != want_audit {
             problems.push(format!("audit\n  want {want_audit:?}\n  got  {audit:?}"));
         }
@@ -180,7 +216,13 @@ async fn replay(file: &str, skip: &[&str]) -> Result<()> {
         }
     }
     db.drop_database().await?;
-    assert!(failures.is_empty(), "{} of {} cases differ:\n{}", failures.len(), cases.len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} of {} cases differ:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
     Ok(())
 }
 
@@ -196,7 +238,110 @@ fn first_difference(want: &str, got: &str) -> String {
         let end = (at + 100).min(bytes.len());
         String::from_utf8_lossy(&bytes[start.min(end)..end]).into_owned()
     };
-    format!("body differs at byte {at}\n  want …{}\n  got  …{}", around(want), around(got))
+    format!(
+        "body differs at byte {at}\n  want …{}\n  got  …{}",
+        around(want),
+        around(got)
+    )
+}
+
+/// The token limiter's 429 can't be recorded: the reference runs on a per-request array cache.
+/// `poster` has a rate limit of 2 in the seed. Shape from `ThrottleApiRequestsByToken`.
+#[tokio::test]
+async fn token_rate_limit_answers_429() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let app = app(&ctx);
+    let call = || {
+        let request = Request::builder()
+            .uri("/api/v2/movies?api_token=tokenposter")
+            .header("host", "x.test")
+            .body(Body::empty());
+        app.clone().oneshot(request.expect("static request"))
+    };
+    for remaining in ["1", "0"] {
+        let response = call().await?;
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.headers()["x-ratelimit-limit"], "2");
+        assert_eq!(response.headers()["x-ratelimit-remaining"], remaining);
+    }
+    let response = call().await?;
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.headers()["x-ratelimit-remaining"], "0");
+    assert_eq!(
+        response.headers()["x-nntmux"],
+        "API ERROR [500] Request limit reached"
+    );
+    let retry = response.headers()["retry-after"].to_str()?.to_owned();
+    let body = to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(
+        String::from_utf8(body.to_vec())?,
+        format!(r#"{{"error":"Request limit reached","retry_after":{retry}}}"#)
+    );
+    db.drop_database().await
+}
+
+/// The `UpdateUserApiAccess` job writes at most once per interval.
+#[tokio::test]
+async fn access_update_runs_once_per_interval() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let settings = settings();
+    let read = || {
+        sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT DATE_FORMAT(apiaccess, '%Y-%m-%d %H:%i:%s'), host FROM users WHERE id = 1",
+        )
+        .fetch_one(&db.pool)
+    };
+    nntmux_api::usage::update_user_api_access(
+        &ctx,
+        &settings,
+        1,
+        Some("1.2.3.4"),
+        "2026-01-01 00:00:00",
+    )
+    .await?;
+    assert_eq!(
+        read().await?,
+        (
+            Some("2026-01-01 00:00:00".to_owned()),
+            Some("1.2.3.4".to_owned())
+        )
+    );
+    nntmux_api::usage::update_user_api_access(
+        &ctx,
+        &settings,
+        1,
+        Some("5.6.7.8"),
+        "2026-01-02 00:00:00",
+    )
+    .await?;
+    assert_eq!(
+        read().await?,
+        (
+            Some("2026-01-01 00:00:00".to_owned()),
+            Some("1.2.3.4".to_owned())
+        )
+    );
+    db.drop_database().await
 }
 
 #[tokio::test]

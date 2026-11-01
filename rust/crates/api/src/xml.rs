@@ -115,8 +115,42 @@ fn escape_text(out: &mut String, value: &str) {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
             '\r' => out.push_str("&#13;"),
             c => out.push(c),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_php_xmlwriter() {
+        let raw = include_str!("../tests/fixtures/xml_writer.json");
+        let cases: serde_json::Value = serde_json::from_str(raw).expect("fixture");
+        for case in cases.as_array().expect("list") {
+            let input = case["input"].as_str().expect("input");
+            let mut xml = XmlWriter::document();
+            xml.start("root");
+            xml.attr("a", input);
+            xml.element("e", input);
+            xml.start("empty");
+            xml.end();
+            xml.start("t");
+            xml.attr("b", input);
+            xml.text(input);
+            xml.end();
+            xml.start("c");
+            xml.cdata(input);
+            xml.end();
+            xml.end();
+            assert_eq!(
+                xml.finish(),
+                case["xml"].as_str().expect("xml"),
+                "{input:?}"
+            );
         }
     }
 }
