@@ -17,7 +17,8 @@ note = "nntmux-ctl releases delete. Unknown criteria now fail, an unknown group 
 kind = "command"
 id = "nntmux:import-nzbs"
 source = "app/Console/Commands/ImportNzbs.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl releases import-nzbs, reading NZB_UPLOAD_FOLDER by default, including the uploads crates/api stages. NZBs are only admitted for verification. PHP uploads part way through a custody journal are held for review, so drain them before cutover."
 
 [[entry]]
 kind = "command"

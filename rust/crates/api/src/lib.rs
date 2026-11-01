@@ -27,7 +27,7 @@ mod rss;
 mod search;
 mod settings;
 mod suggest;
-mod upload;
+pub mod upload;
 pub mod usage;
 mod v1;
 mod v2;

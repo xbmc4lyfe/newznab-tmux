@@ -11,17 +11,24 @@ chrono.workspace = true
 clap.workspace = true
 nntmux-categorize.workspace = true
 nntmux-core.workspace = true
+nntmux-ingest.workspace = true
 nntmux-runtime.workspace = true
 nntmux-verify.workspace = true
+flate2.workspace = true
+hex.workspace = true
+rand.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-hex.workspace = true
+nntmux-api.workspace = true
+nntmux-predb.workspace = true
 nntmux-testkit.workspace = true
-rand.workspace = true
 redis.workspace = true
 
 [lints]
