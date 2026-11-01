@@ -1,0 +1,66 @@
+<div class="user-sidebar-menu flex flex-col gap-1 px-3 py-2">
+    <div class="sidebar-section">
+        <button class="sidebar-toggle w-full flex items-center justify-between px-4 py-3 text-white hover:bg-white/10 rounded-lg transition" data-target="submenu1">
+            <div class="flex items-center"><i class="fas fa-tachometer-alt fa-fw mr-3"></i><span>Browse</span></div>
+            <i class="fas fa-chevron-down text-xs transition-transform"></i>
+        </button>
+        <div id="submenu1" class="sidebar-submenu ml-4 mt-1 space-y-1 hidden">
+            {% if layout.show_console %}<a href="/Console" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-gamepad fa-fw mr-2"></i><span>Console</span></a>{% endif %}
+            {% if layout.show_movies %}<a href="/Movies" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-film fa-fw mr-2"></i><span>Movies</span></a>{% endif %}
+            {% if layout.show_movies %}<a href="/trending-movies" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-fire fa-fw mr-2"></i><span>Trending Movies</span></a>{% endif %}
+            {% if layout.show_audio %}<a href="/Audio" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-music fa-fw mr-2"></i><span>Audio</span></a>{% endif %}
+            {% if layout.show_games %}<a href="/Games" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-gamepad fa-fw mr-2"></i><span>Games</span></a>{% endif %}
+            {% if layout.show_tv %}<a href="/series" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-television fa-fw mr-2"></i><span>TV</span></a>{% endif %}
+            {% if layout.show_tv %}<a href="/trending-tv" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-fire fa-fw mr-2"></i><span>Trending TV</span></a>{% endif %}
+            {% if layout.show_adult %}<a href="/XXX" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-venus-mars fa-fw mr-2"></i><span>Adult</span></a>{% endif %}
+            {% if layout.show_books %}<a href="/Books" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-book-open fa-fw mr-2"></i><span>Books</span></a>{% endif %}
+            <a href="/browse/All" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-list-ul fa-fw mr-2"></i><span>Browse All Releases</span></a>
+            <a href="/browsegroup" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-layer-group fa-fw mr-2"></i><span>Browse Groups</span></a>
+        </div>
+    </div>
+    <div class="sidebar-section">
+        <button class="sidebar-toggle w-full flex items-center justify-between px-4 py-3 text-white hover:bg-white/10 rounded-lg transition" data-target="submenu2">
+            <div class="flex items-center"><i class="fa fa-edit fa-fw mr-3"></i><span>Articles & Links</span></div>
+            <i class="fas fa-chevron-down text-xs transition-transform"></i>
+        </button>
+        <div id="submenu2" class="sidebar-submenu ml-4 mt-1 space-y-1 hidden">
+            <a href="/search" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fab fa-searchengin fa-fw mr-2"></i><span>Search</span></a>
+            <a href="/search?search_type=adv" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fab fa-searchengin fa-fw mr-2"></i><span>Advanced Search</span></a>
+            <a href="/rsshelp" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-rss-square fa-fw mr-2"></i><span>RSS Feeds</span></a>
+            <a href="/apihelp" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-hands-helping fa-fw mr-2"></i><span>API</span></a>
+            <a href="/apiv2help" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-hands-helping fa-fw mr-2"></i><span>API V2</span></a>
+            <a href="/status" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-signal fa-fw mr-2"></i><span>Site status</span></a>
+            <a href="/contact-us" class="flex items-center px-4 py-2 text-gray-300 hover:text-white hover:bg-white/10 rounded-lg transition"><i class="fa fa-envelope fa-fw mr-2"></i><span>Contact Us</span></a>
+        </div>
+    </div>
+{% if !layout.useful_links.is_empty() %}
+    <div class="sidebar-section">
+        <button class="sidebar-toggle w-full flex items-center justify-between px-4 py-3 text-white hover:bg-white/10 rounded-lg transition" data-target="submenu-useful-links">
+            <div class="flex items-center"><i class="fa fa-link fa-fw mr-3"></i><span>Useful Links</span></div>
+            <i class="fas fa-chevron-down text-xs transition-transform"></i>
+        </button>
+        <div id="submenu-useful-links" class="sidebar-submenu ml-4 mt-1 space-y-1 hidden">
+            {% for link in layout.useful_links %}
+            <div class="px-2 py-2">
+                {% if let Some(url) = link.url %}
+                <a href="{{ url }}" class="block text-gray-300 hover:text-white transition"{% if link.external %} target="_blank" rel="noopener noreferrer"{% endif %}>
+                    <div class="font-medium mb-1">{{ link.title }}</div>
+                    {% if !link.body.is_empty() %}<div class="text-sm text-gray-400 useful-link-content">{{ link.body|safe }}</div>{% endif %}
+                </a>
+                {% else %}
+                <div class="text-gray-300">
+                    <div class="font-medium mb-1">{{ link.title }}</div>
+                    {% if !link.body.is_empty() %}<div class="text-sm text-gray-400 useful-link-content">{{ link.body|safe }}</div>{% endif %}
+                </div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+{% endif %}
+    {% if let Some(label) = layout.upgrade_label %}
+    <a href="https://example.com" target="_blank" class="flex items-center px-4 py-3 text-white hover:bg-white/10 rounded transition mt-4"><i class="fa {% if label.starts_with("Upgrade") %}fa-arrow-up{% else %}fa-clock{% endif %} fa-fw mr-3"></i><span>{{ label }}</span></a>
+    {% endif %}
+    <a href="/logout" data-logout class="flex items-center px-4 py-3 text-white hover:bg-white/10 rounded transition mt-4"><i class="fa fa-sign-out-alt fa-fw mr-3"></i><span>Sign Out</span></a>
+    <form id="sidebar-logout-form" action="/logout" method="POST" class="hidden"><input type="hidden" name="_token" value="{{ layout.csrf }}"></form>
+</div>
