@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use nntmux_core::{parsed_or, var_or};
+use nntmux_core::{optional, parsed_or, var_or};
 
 #[derive(Clone, Debug)]
 pub struct VerificationConfig {
@@ -21,6 +21,11 @@ pub struct VerificationConfig {
     pub spot_check_articles: i64,
     pub spot_check_bytes: i64,
     pub spot_check_article_bytes: i64,
+    pub article_bytes: i64,
+    pub stat_all_articles: bool,
+    /// The primary host's publication endpoint. Set, this host publishes through it.
+    pub publish_url: Option<String>,
+    pub publish_timeout: u64,
     /// Candidate worker slots on this host.
     pub candidate_workers: i64,
     /// Hosts sharing one database schedule disjoint slots: this host runs `slot_offset + 1` through
@@ -52,6 +57,16 @@ impl VerificationConfig {
                 "RELEASE_VERIFICATION_SPOT_CHECK_ARTICLE_BYTES",
                 1_048_576,
             )?,
+            article_bytes: parsed_or("RELEASE_VERIFICATION_ARTICLE_BYTES", 16_777_216)?,
+            publish_url: optional("RELEASE_VERIFICATION_PUBLISH_URL")
+                .filter(|url| !url.trim().is_empty()),
+            publish_timeout: parsed_or("RELEASE_VERIFICATION_PUBLISH_TIMEOUT", 120)?,
+            stat_all_articles: matches!(
+                var_or("RELEASE_VERIFICATION_STAT_ALL_ARTICLES", "false")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "(true)"
+            ),
             candidate_workers: parsed_or("RELEASE_VERIFICATION_CANDIDATE_WORKERS", 2)?,
             slot_offset: parsed_or("RELEASE_VERIFICATION_SLOT_OFFSET", 0)?,
             host: var_or("RELEASE_VERIFICATION_HOST", ""),
@@ -76,6 +91,10 @@ impl VerificationConfig {
             spot_check_articles: 1,
             spot_check_bytes: 1_048_576,
             spot_check_article_bytes: 1_048_576,
+            article_bytes: 16_777_216,
+            stat_all_articles: false,
+            publish_url: None,
+            publish_timeout: 120,
             candidate_workers: 2,
             slot_offset: 0,
             host: String::new(),

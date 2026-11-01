@@ -10,7 +10,7 @@ status = "ported"
 kind = "command"
 id = "monitoring:export-metrics"
 source = "app/Console/Commands/ExportMonitoringMetrics.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -23,19 +23,20 @@ note = "The ingest role replaces this. ws-ingest owns that role, which is not me
 kind = "command"
 id = "nntmux:all"
 source = "app/Console/Commands/UpdateNNTmux.php"
-status = "todo"
+status = "dropped"
+note = "Self-update for a checkout-based install. Deploys now ship images, and `nntmux-ctl migrate` covers the database."
 
 [[entry]]
 kind = "command"
 id = "nntmux:check-service-health"
 source = "app/Console/Commands/CheckServiceHealth.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:check-service-uptime"
 source = "app/Console/Commands/CheckServiceUptime.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -47,13 +48,15 @@ status = "ported"
 kind = "command"
 id = "nntmux:composer"
 source = "app/Console/Commands/UpdateNNTmuxComposer.php"
-status = "todo"
+status = "dropped"
+note = "Self-update for a checkout-based install. Deploys now ship images, and `nntmux-ctl migrate` covers the database."
 
 [[entry]]
 kind = "command"
 id = "nntmux:db"
 source = "app/Console/Commands/UpdateNNTmuxDB.php"
-status = "todo"
+status = "dropped"
+note = "Self-update for a checkout-based install. `nntmux-ctl migrate` applies migrations on deploy; rollback and seed options have no Rust equivalent, because the schema baseline replaces them."
 
 [[entry]]
 kind = "command"
@@ -77,31 +80,34 @@ status = "todo"
 kind = "command"
 id = "nntmux:git"
 source = "app/Console/Commands/UpdateNNTmuxGit.php"
-status = "todo"
+status = "dropped"
+note = "Self-update for a checkout-based install. Deploys now ship images, and `nntmux-ctl migrate` covers the database."
 
 [[entry]]
 kind = "command"
 id = "nntmux:offset-populate"
 source = "app/Console/Commands/NntmuxOffsetPopulate.php"
-status = "todo"
+status = "dropped"
+note = "`nntmux-ctl ops populate --parallel` fetches and inserts id windows concurrently in one process, which is what these forked workers were for."
 
 [[entry]]
 kind = "command"
 id = "nntmux:offset-worker"
 source = "app/Console/Commands/NntmuxOffsetWorker.php"
-status = "todo"
+status = "dropped"
+note = "`nntmux-ctl ops populate --parallel` fetches and inserts id windows concurrently in one process, which is what these forked workers were for."
 
 [[entry]]
 kind = "command"
 id = "nntmux:optimize-tables"
 source = "app/Console/Commands/NntmuxOptimizeTables.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:populate"
 source = "app/Console/Commands/NntmuxPopulateSearchIndexes.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -113,31 +119,31 @@ status = "todo"
 kind = "command"
 id = "nntmux:remove-bad"
 source = "app/Console/Commands/NntmuxRemoveBadReleases.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:reset-truncate"
 source = "app/Console/Commands/NntmuxResetTruncate.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:reset-tv-show"
 source = "app/Console/Commands/NntmuxResetTvShowPostProcessing.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:resetdb"
 source = "app/Console/Commands/NntmuxResetDb.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:resetpp"
 source = "app/Console/Commands/NntmuxResetPostProcessing.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
@@ -149,7 +155,8 @@ status = "todo"
 kind = "command"
 id = "nntmux:yenc-doctor"
 source = "app/Console/Commands/YencDoctorCommand.php"
-status = "todo"
+status = "dropped"
+note = "Checked the yEnc FFI library, which is gone. The yenc crate is plain Rust with its own tests."
 
 [[entry]]
 kind = "command"
@@ -193,18 +200,6 @@ kind = "command"
 id = "tmux:stop"
 source = "app/Console/Commands/TmuxStop.php"
 status = "ported"
-
-[[entry]]
-kind = "route"
-id = "POST /internal/release-verification/publish"
-source = "App\\Http\\Controllers\\ReleaseVerificationPublicationController"
-status = "todo"
-
-[[entry]]
-kind = "route"
-id = "POST /internal/release-verification/publish-batch"
-source = "App\\Http\\Controllers\\ReleaseVerificationPublicationBatchController"
-status = "todo"
 
 [[entry]]
 kind = "schedule"
@@ -298,19 +293,19 @@ status = "ported"
 kind = "schedule"
 id = "command: 'monitoring:export-metrics --scheduled')->everyMinute()->withoutOverlapping(5)->when(stati"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "command: 'multiprocessing:fixrelnames predbft')->everyFiveMinutes()->withoutOverlapping()->runInBac"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
 id = "command: 'nntmux:check-service-health')->everyMinute()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
@@ -352,7 +347,7 @@ status = "todo"
 kind = "schedule"
 id = "command: 'nntmux:remove-bad')->hourly()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "schedule"
