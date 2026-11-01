@@ -125,3 +125,9 @@ kind = "job"
 id = "CollectReleaseFingerprintMetadata"
 source = "app/Jobs/CollectReleaseFingerprintMetadata.php"
 status = "todo"
+
+[[entry]]
+kind = "service"
+id = "CollectionDowntimeCompensator"
+source = "app/Services/Tmux/CollectionDowntimeCompensator.php"
+status = "ported"
