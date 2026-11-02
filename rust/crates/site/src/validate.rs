@@ -233,12 +233,14 @@ pub async fn domain_has_mail_records(domain: &str) -> bool {
     let Ok(builder) = TokioResolver::builder_tokio() else {
         return true;
     };
-    let resolver = builder.build();
+    let Ok(resolver) = builder.build() else {
+        return true;
+    };
     let name = format!("{domain}.");
     if resolver
         .mx_lookup(name.as_str())
         .await
-        .is_ok_and(|found| found.iter().next().is_some())
+        .is_ok_and(|found| !found.answers().is_empty())
     {
         return true;
     }
