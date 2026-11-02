@@ -4,6 +4,7 @@
 
 pub mod accounts;
 pub mod captcha;
+pub mod erasure;
 pub mod gdpr;
 pub mod groups;
 pub mod roles;
@@ -144,6 +145,15 @@ pub enum UserCommand {
         /// Delete Admin accounts too.
         #[arg(long)]
         allow_admin: bool,
+        /// Confirm. Without it, only show what would change.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Permanently delete soft-deleted accounts, erasing their personal data first (the
+    /// deleted-users page's permanent delete). Payments and audit records stay, anonymized.
+    Purge {
+        #[arg(required = true)]
+        users: Vec<String>,
         /// Confirm. Without it, only show what would change.
         #[arg(long)]
         yes: bool,
@@ -1207,6 +1217,29 @@ async fn user_command(ctx: &Ctx, command: UserCommand, now: chrono::NaiveDateTim
                     println!("deleted {}", account.username);
                 } else {
                     println!("{} was already deleted", account.username);
+                }
+            }
+        }
+        UserCommand::Purge { users: names, yes } => {
+            let mut targets = Vec::new();
+            for name in &names {
+                let account = users::require(db, name).await?;
+                anyhow::ensure!(
+                    account.deleted_at.is_some(),
+                    "{} isn't deleted; delete it first",
+                    account.username
+                );
+                targets.push(account);
+            }
+            for account in targets {
+                if yes {
+                    erasure::erase(ctx, account.id, true, now).await?;
+                    println!("permanently deleted {} with GDPR cleanup", account.username);
+                } else {
+                    println!(
+                        "would permanently delete {} ({}) and erase its data; pass --yes to do it",
+                        account.username, account.id
+                    );
                 }
             }
         }

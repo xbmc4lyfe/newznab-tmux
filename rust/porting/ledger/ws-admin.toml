@@ -4,7 +4,8 @@
 kind = "command"
 id = "admin:warm-dashboard"
 source = "app/Console/Commands/WarmAdminDashboard.php"
-status = "todo"
+status = "dropped"
+note = "Only warmed the cached snapshot behind the admin web dashboard, which phase 1 doesn't have."
 
 [[entry]]
 kind = "command"
@@ -790,13 +791,15 @@ status = "todo"
 kind = "route"
 id = "POST /admin/deleted-users/bulk"
 source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@bulkAction"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user restore` and `nntmux-ctl admin user purge --yes` take several accounts."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/deleted-users/permanent-delete/{id}"
 source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@permanentDelete"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user purge --yes`, which erases the account's data through `nntmux_admin::erasure` first."
 
 [[entry]]
 kind = "route"
