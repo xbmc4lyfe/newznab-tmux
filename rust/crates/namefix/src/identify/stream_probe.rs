@@ -528,6 +528,8 @@ impl Sampler<'_> {
             let mut index = 0;
             let mut end = None;
             let mut in_budget = false;
+            let mut file_chain = String::new();
+            let mut file_unknown = None;
             while index < file.head_message_ids.len().min(limit) {
                 let Some(body) = self.fetch.fetch(group, &file.head_message_ids[index]) else {
                     row.missing = true;
@@ -537,16 +539,15 @@ impl Sampler<'_> {
                 index += 1;
                 let peeled = peel(&buffer);
                 end = Some(peeled.end);
-                row.chain = peeled
+                file_chain = peeled
                     .chain
                     .iter()
                     .copied()
                     .chain([peeled.end.as_str()])
                     .collect::<Vec<_>>()
                     .join(">");
-                if matches!(peeled.end, End::Other | End::LooksRandom) {
-                    row.unknown = Some(unknown_line(evidence.id, file, peeled.stream));
-                }
+                file_unknown = matches!(peeled.end, End::Other | End::LooksRandom)
+                    .then(|| unknown_line(evidence.id, file, peeled.stream));
                 if let Some(found) = peeled
                     .names
                     .iter()
@@ -619,8 +620,11 @@ impl Sampler<'_> {
             }
             if let Some(end) = end {
                 let better = best.is_none_or(|known| !known.is_video() && end.is_video());
+                // What's reported is the file that decided the release, not the last one tried.
                 if better {
                     best = Some(end);
+                    row.chain = file_chain;
+                    row.unknown = file_unknown;
                 }
             }
             if best.is_some_and(End::is_video) {
@@ -1027,6 +1031,50 @@ mod tests {
         assert_eq!(peel(&pattern).end, End::Other);
         // Too little to tell.
         assert_eq!(peel(&noise[..64]).end, End::Other);
+    }
+
+    #[test]
+    fn the_report_follows_the_file_that_decided_the_release() {
+        use crate::identify::archive_probe::tests::Fake;
+        use crate::identify::nzb::{NzbFile, NzbSummary};
+
+        let file = |subject: &str, id: &str| NzbFile {
+            subject: subject.to_owned(),
+            bytes: 100,
+            group: Some("g".to_owned()),
+            first_message_id: Some(id.to_owned()),
+            head_message_ids: vec![id.to_owned()],
+            tail_message_ids: vec![id.to_owned()],
+        };
+        let mut fake = Fake::default();
+        fake.0.insert(
+            "a".to_owned(),
+            b"7z\xbc\xaf\x27\x1c and more bytes".to_vec(),
+        );
+        fake.0.insert("b".to_owned(), vec![0x9c; 4096]);
+        let predb = LocalPredb::default();
+        let known = KnownReleases::default();
+        let sampler = Sampler {
+            fetch: &fake,
+            predb: &predb,
+            known: &known,
+            media_budget: 0,
+            media_taken: AtomicUsize::new(0),
+        };
+        let evidence = Evidence {
+            nzb: Some(NzbSummary {
+                files: vec![
+                    file(r#""x.7z.001" yEnc"#, "a"),
+                    file(r#""x.7z.002" yEnc"#, "b"),
+                ],
+                ..NzbSummary::default()
+            }),
+            ..Evidence::default()
+        };
+        let row = sampler.read_release(&evidence).expect("row");
+        assert_eq!(row.end, Some(End::SevenZip));
+        assert_eq!(row.chain, "7z");
+        assert_eq!(row.unknown, None);
     }
 
     #[test]
