@@ -463,20 +463,28 @@ impl MediaSourceStage<'_> {
 
     /// Early enough that one more ffmpeg call cannot push the release past its own timeout.
     fn deadline(&self, context: &ReleaseContext) -> Instant {
-        let stage = Instant::now() + seconds(self.settings.stage_max_seconds);
+        let now = Instant::now();
+        // A bound too far off to represent is no bound.
+        let stage = now.checked_add(seconds(self.settings.stage_max_seconds));
         if self.settings.release_timeout_seconds <= 0 {
-            return stage;
+            return stage.unwrap_or(now + Duration::from_secs(86_400 * 365));
         }
-        let allowed = self.settings.release_timeout_seconds - (self.settings.ffmpeg_timeout + 5);
+        let allowed = self
+            .settings
+            .release_timeout_seconds
+            .saturating_sub(self.settings.ffmpeg_timeout.saturating_add(5));
         let release = if allowed >= 0 {
-            context.started() + seconds(allowed)
+            match context.started().checked_add(seconds(allowed)) {
+                Some(release) => release,
+                None => return stage.unwrap_or(now + Duration::from_secs(86_400 * 365)),
+            }
         } else {
             context
                 .started()
                 .checked_sub(seconds(-allowed))
                 .unwrap_or_else(|| context.started())
         };
-        stage.min(release)
+        stage.map_or(release, |stage| stage.min(release))
     }
 }
 
@@ -547,7 +555,7 @@ async fn append(
             context.direct_video_witnesses.insert(key, witness);
         }
         written += chunk.len() as i64;
-        expected_offset = Some(offset + data.len() as i64);
+        expected_offset = Some(offset.saturating_add(data.len() as i64));
         index += 1;
     }
     written

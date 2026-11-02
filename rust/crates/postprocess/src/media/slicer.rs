@@ -67,11 +67,14 @@ impl ArchivedMediaEntry {
     pub fn continuation_bytes(&self, target: i64) -> i64 {
         let head = self.head_bytes.len() as i64;
         // Only a head that runs to the end of the downloaded data can be continued.
-        if self.range_start + head != self.volume_bytes_downloaded {
+        if self.range_start.saturating_add(head) != self.volume_bytes_downloaded {
             return 0;
         }
         let wanted = target.min(self.real_size) - head;
-        let left_in_volume = self.in_volume_end + 1 - self.volume_bytes_downloaded;
+        let left_in_volume = self
+            .in_volume_end
+            .saturating_add(1)
+            .saturating_sub(self.volume_bytes_downloaded);
         wanted.min(left_in_volume).max(0)
     }
 }
@@ -120,7 +123,11 @@ pub fn chunk_from_volume(volume: &[u8], entry_name: &[u8]) -> Option<Vec<u8>> {
         let (start, end) = file.range?;
         let length = volume.len() as i64;
         if start < length {
-            return Some(php_substr(volume, start, end.min(length - 1) - start + 1));
+            return Some(php_substr(
+                volume,
+                start,
+                end.min(length - 1).saturating_sub(start).saturating_add(1),
+            ));
         }
     }
     None
@@ -141,7 +148,7 @@ fn entry_for(
     let size = file.size;
     let in_volume_end = match file.next_offset {
         Some(next) if next > start => next - 1,
-        _ => start + size - 1,
+        _ => start.saturating_add(size).saturating_sub(1),
     };
     let available = in_volume_end.min(length - 1) - start + 1;
     let head = php_substr(data, start, available.min(settings.sample_max_bytes));
