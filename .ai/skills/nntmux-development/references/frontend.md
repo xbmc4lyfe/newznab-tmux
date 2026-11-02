@@ -1,14 +1,8 @@
 ## Frontend
 
-Blade + TailwindCSS v4 + Vite bundling. Run `npm run build` after changes.
+Server-rendered askama templates (`rust/crates/webkit/templates/` and `rust/crates/site/templates/`), with TailwindCSS v4, Alpine.js and Vite for the assets.
 
-- **Livewire 3**: Used only by the vendored Spatie Pulse dashboard views (`resources/views/vendor/pulse/`). All application pages (auth, profile, admin, browse, etc.) are plain Blade + Alpine.
-- **Alpine.js**: CSP-safe build with component architecture in `resources/js/alpine/`
-  - Core components loaded eagerly in `alpine/index.js`
-  - Page-specific components lazy-loaded via `alpine/lazy-loader.js`
-  - Lazy-loaded pages must declare an `x-data` name that matches a key in `alpine/lazy-loader.js`, or the component JS will never load; example: `resources/views/admin/content/index.blade.php` uses `x-data="contentToggle"` so delete/toggle handlers from `resources/js/alpine/components/content-toggle.js` are available
-  - Stores in `alpine/stores/`, components in `alpine/components/`
-- **CSS**: Main entry is `resources/css/app.css` (imports `csp-safe.css` for component styles)
-- **Vite entry points**: `resources/js/app.js` and `resources/css/app.css`
-
-This structure ensures Content Security Policy (CSP) compliance by using Alpine.js CSP-safe build and keeping scripts and styles in external files.
+- The source is `rust/frontend/` (`js/app.js`, `css/app.css`). `just frontend` runs `npm ci && npm run build` and writes `rust/frontend/public/build`. The Dockerfile builds it in its own stage, and `nntmux-web` reads the Vite manifest for its asset tags.
+- **Alpine.js** is the CSP-safe build (`@alpinejs/csp`), with components under `rust/frontend/js/alpine/`. The CSP build forbids inline expressions, so put logic in components and register them. `rust/crates/webkit/src/headers.rs` sets the `Content-Security-Policy` header with a per-request nonce.
+- **CSS**: the entry is `rust/frontend/css/app.css`, which imports `csp-safe.css` for component styles.
+- Keep scripts and styles in external files so the CSP holds. Run `just frontend` after changes under `rust/frontend`.

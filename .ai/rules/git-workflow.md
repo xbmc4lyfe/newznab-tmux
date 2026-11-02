@@ -5,17 +5,17 @@ paths:
 
 # Git workflow and review gates
 
-A human prompt or goal authorizes agents to commit task changes, push feature branches, open pull requests, and squash-merge reviewed feature pull requests into `main` in `xbmc4lyfe/newznab-tmux`. Stay within the task. Deployment, production changes, force pushes, and changes to repository protections need separate authorization. Dependency changes don't.
+A human prompt or goal authorizes agents to commit task changes, push feature branches, open pull requests, and squash-merge reviewed feature pull requests into `main`, the default branch, in `xbmc4lyfe/newznab-tmux`. `master` is kept only for the PHP history (see [rust/WORKSTREAMS.md](../../rust/WORKSTREAMS.md)). Stay within the task. Deployment, production changes, force pushes, and changes to repository protections need separate authorization. Dependency changes don't.
 
 ## Prepare the branch
 
-- Start each new task in an isolated Git worktree on a new `codex/` branch whose name is absent from the remote. Reuse that task's worktree while continuing it; an explicitly requested existing PR keeps its branch. Keep `main` as the PR base and never develop or push directly on it.
-- Verify the remote points to `xbmc4lyfe/newznab-tmux`, fetch its `main` at task start, and create the worktree/branch from that fetched commit. `NNTmux/newznab-tmux:master` is a separate upstream and is not the feature-branch base.
-- During active work, fetch and integrate newer `main` commits every 30–60 minutes. Refresh when resuming a session if the last fetch is older than 30 minutes. Preserve unrelated and uncommitted work; never reset or discard it to synchronize. Resolve conflicts and rerun affected checks.
-- Fetch and integrate the fork's current `main` immediately before local review and PR creation, and recheck it before merging. An advanced destination requires updating the branch, affected verification, and fresh local and PR reviews.
-- After each PR merge, fetch the fork's `main` again before creating the next task's worktree and new branch. Start from the newly fetched commit, not the previous task branch or a stale local `main`.
+- Start each new task in an isolated Git worktree on a new `codex/` branch whose name is absent from the remote. Reuse that task's worktree while continuing it; an explicitly requested existing PR keeps its branch. Workstream branches are `codex/rn-<workstream>-<topic>`. Never develop or push directly on `main` or `master`.
+- Verify the remote points to `xbmc4lyfe/newznab-tmux`, fetch `main` at task start, and create the worktree/branch from that fetched commit. `NNTmux/newznab-tmux:master` is a separate upstream and is not the feature-branch base.
+- During active work, fetch and integrate newer base-branch commits every 30–60 minutes. Refresh when resuming a session if the last fetch is older than 30 minutes. Preserve unrelated and uncommitted work; never reset or discard it to synchronize. Resolve conflicts and rerun affected checks.
+- Fetch and integrate the fork's current base branch immediately before local review and PR creation, and recheck it before merging. An advanced destination requires updating the branch, affected verification, and fresh local and PR reviews.
+- After each PR merge, fetch the base branch again before creating the next task's worktree and new branch. Start from the newly fetched commit, not the previous task branch or a stale local copy.
 - Stage files with explicit paths. Exclude scratch files, logs, and unrelated changes.
-- Run the checks required for the changed files. Documentation changes need prose and consistency checks. App changes also need relevant tests and lint.
+- Run the checks required for the changed files. Documentation changes need prose and consistency checks. Rust changes need `just check` and `just test` (or `just test -p <crate>` while working). Run the whole workspace before a PR.
 
 ## Review locally before opening a PR
 
@@ -56,4 +56,4 @@ Use this fallback when the GitHub Codex app reports that review credits have run
 
 ## Upstream synchronization
 
-Upstream is `NNTmux/newznab-tmux:master`. A separate request to synchronize upstream authorizes that workflow. Preserve upstream history with a merge commit. Feature work in this fork uses a squash merge. Apply the same review and verification gates.
+Upstream is `NNTmux/newznab-tmux:master`. A separate request to synchronize upstream authorizes that workflow. Preserve upstream history with a merge commit. Feature work in this fork squash-merges into `main`. Never merge anything into `master`: the PHP production runtime deploys from it until the cutover, which switches that runtime to `main` rather than merging (see [rust/CUTOVER.md](../../rust/CUTOVER.md)). Apply the same review and verification gates.
