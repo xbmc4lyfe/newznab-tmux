@@ -1,4 +1,5 @@
-//! Fetches and stores cover images. Port of `ReleaseImageService::saveRemoteImage`.
+//! Fetches and stores cover images. Port of `ReleaseImageService::saveRemoteImage` and
+//! `saveLocalImage`, and the GD measurements the preview stage takes of frames and samples.
 
 use std::fs;
 use std::io::Cursor;
@@ -26,6 +27,10 @@ pub enum Profile {
     Original,
     MetadataCover,
     Backdrop,
+    /// A preview frame taken from a video.
+    Preview,
+    /// A sample image posted in the release.
+    Sample,
 }
 
 impl Profile {
@@ -34,6 +39,8 @@ impl Profile {
             Self::Original => None,
             Self::MetadataCover => Some((250, 250)),
             Self::Backdrop => Some((1920, 1024)),
+            Self::Preview => Some((800, 600)),
+            Self::Sample => Some((650, 650)),
         }
     }
 }
@@ -107,6 +114,36 @@ impl Images {
                     error = format!("{failure:#}"),
                     "cover not saved"
                 );
+                false
+            }
+        }
+    }
+
+    /// `saveLocalImage`: a readable local file, at most the source size limit, decoded, bounded
+    /// and published as `<directory>/<name>.<extension>`. Blocking.
+    pub fn save_local(
+        &self,
+        name: &str,
+        source: &Path,
+        directory: &Path,
+        profile: Profile,
+    ) -> bool {
+        let saved = (|| -> Result<PathBuf> {
+            let size = fs::metadata(source)
+                .ok()
+                .filter(fs::Metadata::is_file)
+                .context("Image source is not a readable local file.")?
+                .len();
+            if size == 0 || size > self.max_source_bytes {
+                bail!("Image source size is invalid or exceeds the configured limit.");
+            }
+            let contents = fs::read(source).context("Unable to read the local image source.")?;
+            self.process(name, &contents, directory, profile)
+        })();
+        match saved {
+            Ok(_) => true,
+            Err(failure) => {
+                debug!(error = format!("{failure:#}"), "local image not saved");
                 false
             }
         }
@@ -259,6 +296,113 @@ impl Images {
             .map_err(|failure| anyhow!("Unable to encode the image: {failure}"))?;
         Ok(out)
     }
+}
+
+/// The image types `getimagesize` names that the preview stage tells apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageKind {
+    Jpeg,
+    Png,
+    Webp,
+    Other,
+}
+
+/// `getimagesize`: the type and size the header declares, without decoding the pixels.
+pub fn image_size(path: &Path) -> Option<(ImageKind, u32, u32)> {
+    let reader = ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let kind = match reader.format()? {
+        image::ImageFormat::Jpeg => ImageKind::Jpeg,
+        image::ImageFormat::Png => ImageKind::Png,
+        image::ImageFormat::WebP => ImageKind::Webp,
+        _ => ImageKind::Other,
+    };
+    let (width, height) = reader.into_dimensions().ok()?;
+    Some((kind, width, height))
+}
+
+/// Width frames are measured at, as `FrameQualityScorer` sampled them.
+const SAMPLE_WIDTH: u32 = 64;
+
+/// `FrameQualityScorer::measure`: mean luma and its standard deviation (0 to 255), on a copy
+/// GD's `imagescale` would have shrunk to 64 pixels wide. None when the file doesn't decode.
+pub fn luma_measure(path: &Path) -> Option<(f64, f64)> {
+    let contents = fs::read(path)
+        .ok()
+        .filter(|contents| !contents.is_empty())?;
+    let mut reader = ImageReader::new(Cursor::new(contents))
+        .with_guessed_format()
+        .ok()?;
+    reader.no_limits();
+    let image = reader.decode().ok()?.to_rgb8();
+    let (width, height) = image.dimensions();
+    let sample = if width > SAMPLE_WIDTH {
+        // PHP's `imagescale($image, 64)` keeps the ratio with integer division.
+        let new_height = (u64::from(SAMPLE_WIDTH) * u64::from(height) / u64::from(width)) as u32;
+        gd_scale_bilinear(&image, SAMPLE_WIDTH, new_height)
+    } else {
+        image
+    };
+    let (mut sum, mut squares) = (0.0f64, 0.0f64);
+    for pixel in sample.pixels() {
+        let [red, green, blue] = pixel.0;
+        let luma = 0.299 * f64::from(red) + 0.587 * f64::from(green) + 0.114 * f64::from(blue);
+        sum += luma;
+        squares += luma * luma;
+    }
+    let pixels = f64::from((sample.width() * sample.height()).max(1));
+    let mean = sum / pixels;
+    Some((mean, (squares / pixels - mean * mean).max(0.0).sqrt()))
+}
+
+/// GD's `gdImageScaleBilinearTC` (`IMG_BILINEAR_FIXED`, `imagescale`'s default), in its 24.8
+/// fixed point, so frames are measured as PHP measured them.
+fn gd_scale_bilinear(source: &image::RgbImage, width: u32, height: u32) -> image::RgbImage {
+    let (width, height) = (width.max(1), height.max(1));
+    let to_fixed = |value: f32| (value * 256.0) as i64;
+    let multiply = |left: i64, right: i64| (left * right) >> 8;
+    let step_x = to_fixed(source.width() as f32 / width as f32);
+    let step_y = to_fixed(source.height() as f32 / height as f32);
+    let one = 1i64 << 8;
+    let pixel_at = |x: i64, y: i64, background: [u8; 3]| -> [u8; 3] {
+        if x >= 0 && y >= 0 && x < i64::from(source.width()) && y < i64::from(source.height()) {
+            source.get_pixel(x as u32, y as u32).0
+        } else {
+            background
+        }
+    };
+    let mut scaled = image::RgbImage::new(width, height);
+    for row in 0..height {
+        for column in 0..width {
+            let along_y = multiply(i64::from(row) << 8, step_y);
+            let along_x = multiply(i64::from(column) << 8, step_x);
+            let (m, n) = (along_y >> 8, along_x >> 8);
+            let (fraction_y, fraction_x) = (along_y - (m << 8), along_x - (n << 8));
+            let weights = [
+                multiply(one - fraction_y, one - fraction_x),
+                multiply(one - fraction_y, fraction_x),
+                multiply(fraction_y, one - fraction_x),
+                multiply(fraction_y, fraction_x),
+            ];
+            let first = pixel_at(n, m, [0, 0, 0]);
+            let corners = [
+                first,
+                pixel_at(n + 1, m, first),
+                pixel_at(n, m + 1, first),
+                pixel_at(n + 1, m + 1, first),
+            ];
+            let mut out = [0u8; 3];
+            for (channel, value) in out.iter_mut().enumerate() {
+                let total: i64 = corners
+                    .iter()
+                    .zip(weights)
+                    .map(|(corner, weight)| multiply(weight, i64::from(corner[channel]) << 8))
+                    .sum();
+                *value = (total >> 8) as u8;
+            }
+            scaled.put_pixel(column, row, image::Rgb(out));
+        }
+    }
+    scaled
 }
 
 fn publish(encoded: &[u8], temporary: &Path, destination: &Path) -> Result<()> {

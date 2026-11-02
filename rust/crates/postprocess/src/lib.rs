@@ -5,6 +5,7 @@
 pub mod additional;
 pub mod archive_info;
 pub mod config;
+pub mod media;
 pub mod mediainfo;
 pub mod nfo;
 pub mod tv_pipeline;
