@@ -4,7 +4,7 @@ The goal is zero PHP, with every entry point in Rust: all routes, commands, jobs
 
 ## How the branch works
 
-- `rust-native` is the default branch, and all work lands on it. `master` is kept only for history, so never base work on it or target it. The final cutover moves production onto `rust-native`.
+- `main` is the default branch, and all work lands on it. `master` is kept only for history, so never base work on it or target it. The final cutover moves production onto `main`.
 - The PHP is at the `php-final` tag. On this Mac it's checked out at `~/git.xbmc4lyfe/newznab-tmux-php-ref`, with `vendor/` in place and a `.env` that points only at local services. Read it there or with `git show php-final:<path>`. Never edit it. To run it, start `rust/compose.test.yml` and run `rust/porting/php-ref-setup.sh`, which builds its `nntmux` database on the test MariaDB, once.
 - The database schema doesn't change shape. `rust/migrations/0001` and `0002` are generated from Laravel's migrations and seeders. Add a new migration only when a workstream truly needs it, as the next number in `crates/db/src/migrate.rs`.
 - No deploys, restarts or production writes. The deployment owner handles rollouts. Reading production through a read-only login is fine when a workstream needs real samples, but never write there.
@@ -17,9 +17,9 @@ The goal is zero PHP, with every entry point in Rust: all routes, commands, jobs
 4. **Port behaviour, not structure.** Start from the entry points in your ledger file and read what production actually calls. Skip code nothing reaches. Keep every edge case that exists because of real data: name parsing quirks, transaction order, lock and lease semantics, retries. Write idiomatic Rust rather than translating classes line by line, and use tokio concurrency for network I/O.
 5. **Fixtures come from the PHP.** Run the PHP reference to generate golden data, commit it under `rust/crates/<crate>/tests/fixtures/`, and commit the small script that made it beside it. Pure logic needs a golden test; database logic needs an integration test through `nntmux_testkit::TestDb`; provider and HTTP clients need `wiremock` tests. Tests that only restate the implementation don't count.
 6. **Track progress in `rust/porting/ledger/<workstream>.toml`.** Set an entry to `ported` in the PR that ports it. Set it to `dropped`, with a `note` saying why, only if it has no place in the Rust stack. Move an entry to another workstream's file if it's misfiled.
-7. **PR flow:** work in `~/git.xbmc4lyfe/rn-<workstream>` on a new `codex/rn-<workstream>-<topic>` branch from `origin/rust-native`, and merge `origin/rust-native` often. Keep PRs reviewable, about 3k lines of non-fixture code or less, and land them often rather than holding a large branch.
+7. **PR flow:** work in `~/git.xbmc4lyfe/rn-<workstream>` on a new `codex/rn-<workstream>-<topic>` branch from `origin/main`, and merge `origin/main` often. Keep PRs reviewable, about 3k lines of non-fixture code or less, and land them often rather than holding a large branch.
    Before opening a PR: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `python3 rust/porting/check.py`, and an independent review of the full diff from a fresh subagent or Codex with no P0 or P1 findings.
-   After opening it: comment `@codex review`, fix P0 and P1 findings only, and squash-merge into `rust-native` once CI passes and the review is clean. If Codex has no credits, use a fresh independent local review and record it with the head commit in the PR. Don't put a requester's name or attribution comment in the PR.
+   After opening it: comment `@codex review`, fix P0 and P1 findings only, and squash-merge into `main` once CI passes and the review is clean. If Codex has no credits, use a fresh independent local review and record it with the head commit in the PR. Don't put a requester's name or attribution comment in the PR.
 8. **Tests:** `docker compose -f rust/compose.test.yml up -d`, then export the variables named at the top of that file. The services are shared by all worktrees. `TestDb` gives each test its own database, so prefix any Redis keys and Manticore tables the same way.
 9. **Build load:** this Mac is shared by every worktree, so set `CARGO_BUILD_JOBS=4` and test your own crate with `-p` while working. Run the whole workspace only before a PR.
 10. **Done:** your ledger file has no `todo` entries, the role or route works end to end against local services, and any PHP-era files you own outside `app/` are gone. Report what's unverified, especially anything that needs real NNTP or production data. Don't claim parity you haven't tested.
@@ -45,7 +45,7 @@ Order: `ws-formats` first if threads must be staggered, since `ws-ingest`, `ws-r
 
 ## Cutover requirements
 
-Moving production onto `rust-native` is the last step, and `ws-deploy` owns getting it ready:
+Moving production onto `main` is the last step, and `ws-deploy` owns getting it ready:
 
 - The progress metric reads the ledger, so keep two conventions stable: entries whose `source` is a `.rs` file don't count toward the headline, and `rust/porting/ledger/dropped.toml` holds vendor routes and is excluded. Record other dropped entries in the owning workstream's file, not there.
 - Rebuild the PreDB identity index once at cutover with `nntmux-ctl predb identity-rebuild`. Put this in the deployment owner's handoff, because it runs against production.

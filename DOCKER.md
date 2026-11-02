@@ -88,11 +88,11 @@ Run `just` or `just help` to see all recipes, or `just docker <recipe>` (or `jus
 
 | Recipe | Description |
 |--------|-------------|
-| `just deploy-plan` | Sync `origin/rust-native` and show per-service change classification, dirty image targets, and selective rollout plan |
-| `just deploy` | Smart guarded deploy: syncs `origin/rust-native`, skips non-runtime edits, builds/drains/recreates only affected services |
-| `just deploy <component>` | Sync `origin/rust-native` and redeploy the named component(s) (`web`, `horizon`, `scheduler`, `indexer`, `proxy`, `monitoring`, `redis`, `manticore`, `mariadb`, `mailpit`, `grafana`, `prometheus`) |
+| `just deploy-plan` | Sync `origin/main` and show per-service change classification, dirty image targets, and selective rollout plan |
+| `just deploy` | Smart guarded deploy: syncs `origin/main`, skips non-runtime edits, builds/drains/recreates only affected services |
+| `just deploy <component>` | Sync `origin/main` and redeploy the named component(s) (`web`, `horizon`, `scheduler`, `indexer`, `proxy`, `monitoring`, `redis`, `manticore`, `mariadb`, `mailpit`, `grafana`, `prometheus`) |
 | `just deploy-<component>` | Shortcut recipes (`just deploy-web`, `just deploy-horizon`, `just deploy-scheduler`, `just deploy-indexer`, `just deploy-proxy`, `just deploy-monitoring`, `just deploy-redis`, `just deploy-manticore`, `just deploy-mariadb`, `just deploy-mailpit`, `just deploy-grafana`, `just deploy-prometheus`) |
-| `just build-stack` | Sync `origin/rust-native` and build dirty self-hosted service image targets (`selfhosted-web`, `selfhosted-horizon`, `selfhosted-scheduler`, `selfhosted-indexer`) |
+| `just build-stack` | Sync `origin/main` and build dirty self-hosted service image targets (`selfhosted-web`, `selfhosted-horizon`, `selfhosted-scheduler`, `selfhosted-indexer`) |
 | `just docker build-base` | Build the cached OS + PHP extension base image (`nntmux/base:local`) |
 | `just docker up` | Initial bringup or guarded deploy when app containers exist |
 

@@ -275,11 +275,11 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertNotEqual(0, self.execute(script, current='null')[0])
 
     def test_predeploy_guard_only_accepts_current_source(self):
-        script = self.script('Check that rust-native still matches the rendered build')
+        script = self.script('Check that main still matches the rendered build')
         self.assertEqual((0, 'matches=true\n', ''), self.execute(script))
         code, output, summary = self.execute(script, current='c' * 40)
         self.assertEqual((0, ''), (code, output))
-        self.assertIn('rust-native advanced', summary)
+        self.assertIn('main advanced', summary)
         self.assertNotEqual(0, self.execute(script, current='null')[0])
 
     def test_postdeploy_failure_is_superseded_only_with_valid_new_master(self):
@@ -304,14 +304,14 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn('sha: ${{ steps.source.outputs.sha }}', test)
         self.assertIn('ref: ${{ steps.source.outputs.sha }}', test)
         self.assertIn('ref: ${{ needs.test.outputs.sha }}', build)
-        self.assertNotIn('ref: rust-native', build)
+        self.assertNotIn('ref: main', build)
         self.assertIn("github.event.workflow_run.event == 'workflow_dispatch'", build)
         self.assertIn("github.event.workflow_run.head_repository.full_name == github.repository", build)
-        self.assertIn("github.event.workflow_run.head_branch == 'rust-native'", build)
+        self.assertIn("github.event.workflow_run.head_branch == 'main'", build)
         self.assertIn('actions/upload-artifact@', build)
         self.assertIn('actions/download-artifact@', deploy)
         self.assertGreater(deploy.index('verify-benchmark-pages.py verify'), deploy.index('actions/deploy-pages@'))
-        self.assertIn('rust-native advanced; publication verification is superseded', deploy)
+        self.assertIn('main advanced; publication verification is superseded', deploy)
 
 
 if __name__ == '__main__':

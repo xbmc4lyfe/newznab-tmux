@@ -4,14 +4,14 @@
 Usage:
     python3 progress.py --master DIR [--rust-native DIR] --output rewrite-progress.json
 
-The PHP is deleted on rust-native before it's replaced and stays on master until the
+The PHP is deleted on main before it's replaced and stays on master until the
 cutover, so counting PHP lines on either branch says nothing about porting. The
 headline is the share of the baseline's live PHP whose entry points are done: each
 subsystem's baseline lines, multiplied by the share of its ledger entries that are
 ported or dropped.
 
 An entry only counts if it retires PHP, so ports of existing Rust (a .rs source) don't.
-Ledgers come from rust-native, or from master once rust-native is gone after the cutover.
+Ledgers come from main, or from master once main is gone after the cutover.
 """
 
 import argparse
