@@ -15,7 +15,7 @@ SHA = 'a' * 40
 
 
 def run(event='push', run_id=12, attempt=2):
-    return dict(id=run_id, run_attempt=attempt, head_sha=SHA, head_branch='rust-native', event=event,
+    return dict(id=run_id, run_attempt=attempt, head_sha=SHA, head_branch='main', event=event,
                 status='completed', conclusion='success', head_repository={'full_name': pages.REPOSITORY})
 
 
