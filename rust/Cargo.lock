@@ -2552,12 +2552,14 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "crc32fast",
  "flate2",
  "hex",
  "md-5 0.10.6",
  "metrics",
  "nntmux-categorize",
  "nntmux-core",
+ "nntmux-formats",
  "nntmux-nntp",
  "nntmux-predb",
  "nntmux-runtime",
@@ -2570,6 +2572,7 @@ dependencies = [
  "rand 0.9.5",
  "redis",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2579,6 +2582,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "wiremock",
 ]
 
 [[package]]

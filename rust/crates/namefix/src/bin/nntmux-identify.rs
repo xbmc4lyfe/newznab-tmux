@@ -3,13 +3,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nntmux_namefix::identify::Hooks;
+use nntmux_namefix::identify::archive_probe::{ArchiveProbe, NntpFetch};
 use nntmux_namefix::identify::catalog::{
-    Options, holdout, render_holdout, render_report, render_tsv, run,
+    Options, holdout, render_holdout, render_report, render_tsv, run_with_probe,
 };
+use nntmux_namefix::identify::{Hooks, SrrdbClient, SrrdbConfig};
 
 #[derive(Parser)]
 #[command(about = "Identify releases from the evidence in a SQLite import")]
@@ -36,6 +38,20 @@ enum Command {
         /// Writes results to release_identifications in catalog.db. Without it, a dry run.
         #[arg(long)]
         apply: bool,
+        /// Also asks srrdb.com, caching answers here. This sends CRC32s and names to srrDB, and
+        /// nothing leaves this machine without it.
+        #[arg(long)]
+        srrdb_cache: Option<PathBuf>,
+        /// Stops asking srrDB after this many releases, chosen at random.
+        #[arg(long)]
+        srrdb_sample: Option<usize>,
+        /// Reads archive headers over NNTP for this many releases with no other evidence, chosen
+        /// at random. It takes the provider from the NNTP_* variables, and needs nothing else.
+        #[arg(long)]
+        archive_probe_sample: Option<usize>,
+        /// The least time between srrDB requests.
+        #[arg(long, default_value_t = 1000)]
+        srrdb_interval_ms: u64,
     },
     /// Measures the weak rungs on releases whose PreDB row is already known.
     Holdout,
@@ -54,15 +70,52 @@ fn start(cli: &Cli) -> Result<()> {
         threads: cli.threads,
         limit: cli.limit,
         apply: false,
+        shuffle: false,
     };
     match cli.command {
-        Command::Run { apply } => {
+        Command::Run {
+            apply,
+            ref srrdb_cache,
+            srrdb_sample,
+            archive_probe_sample,
+            srrdb_interval_ms,
+        } => {
             options.apply = apply;
-            let report = run(&options, Hooks::default())?;
+            let srrdb = srrdb_cache
+                .as_ref()
+                .map(|cache| {
+                    let mut config = SrrdbConfig::new(cache);
+                    config.budget = srrdb_sample;
+                    config.min_interval = Duration::from_millis(srrdb_interval_ms);
+                    SrrdbClient::new(config)
+                })
+                .transpose()?;
+            let fetcher = archive_probe_sample
+                .map(|_| NntpFetch::from_env())
+                .transpose()?;
+            let probe = fetcher.as_ref().map(|fetcher| {
+                ArchiveProbe::new(fetcher, archive_probe_sample.unwrap_or_default())
+            });
+            options.shuffle = srrdb.is_some() || probe.is_some();
+            let hooks = srrdb.as_ref().map_or_else(Hooks::default, |client| Hooks {
+                srrdb: client,
+                ..Hooks::default()
+            });
+            let report = run_with_probe(&options, hooks, probe.as_ref())?;
             let text = render_report(&report);
             write_out(&cli.out, "report.md", &text)?;
             write_out(&cli.out, "identifications.tsv", &render_tsv(&report))?;
             print!("{text}");
+            if let Some(probe) = &probe {
+                let stats = probe.render_stats();
+                write_out(&cli.out, "archive_probe.md", &stats)?;
+                print!("\n{stats}");
+            }
+            if let Some(client) = &srrdb {
+                let stats = client.render_stats();
+                write_out(&cli.out, "srrdb.md", &stats)?;
+                print!("\n{stats}");
+            }
         }
         Command::Holdout => {
             let text = render_holdout(&holdout(&options)?);

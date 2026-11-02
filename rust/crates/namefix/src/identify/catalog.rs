@@ -17,6 +17,7 @@ use flate2::read::GzDecoder;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
+use super::archive_probe::ArchiveProbe;
 use super::donor::{DonorIndex, DonorKey, DonorMatch, MIN_DONOR_HASHED_SIZE, size_can_identify};
 use super::ladder::{Context, Evidence, Flags, Hooks, Identification, Outcome, identify};
 use super::local_predb::{LocalPredb, PredbRow, parse_size_mib};
@@ -93,6 +94,9 @@ pub struct Options {
     pub limit: Option<usize>,
     /// Writes `release_identifications`, which also migrates the catalog.
     pub apply: bool,
+    /// Works through the releases in a fixed random order, so that a run stopped early, or one
+    /// with an srrDB budget, is a fair sample instead of the oldest posts.
+    pub shuffle: bool,
 }
 
 #[derive(Debug, Default)]
@@ -473,6 +477,16 @@ fn for_each_target<T: Send>(
 }
 
 pub fn run(options: &Options, hooks: Hooks<'_>) -> Result<Report> {
+    run_with_probe(options, hooks, None)
+}
+
+/// [`run`], and `probe` reads archive headers for releases with no other evidence, then climbs
+/// the ladder again with what it found.
+pub fn run_with_probe(
+    options: &Options,
+    hooks: Hooks<'_>,
+    probe: Option<&ArchiveProbe<'_>>,
+) -> Result<Report> {
     let started = Instant::now();
     let catalog_path = options.data_dir.join("catalog.db");
     let nzbs_path = options.data_dir.join("nzbs.db");
@@ -486,10 +500,43 @@ pub fn run(options: &Options, hooks: Hooks<'_>) -> Result<Report> {
         donors: &loaded.donors,
         hooks,
     };
-    let targets = loaded.targets;
+    let offline = Context {
+        predb: &loaded.predb,
+        donors: &loaded.donors,
+        hooks: Hooks::default(),
+    };
+    let mut targets = loaded.targets;
+    if options.shuffle {
+        targets.sort_by_key(|target| sample_order(target.id));
+    }
     let target_count = targets.len();
     let answers = for_each_target(&nzbs_path, options.threads, targets, |target| {
-        let (outcome, flags) = identify(target, &context);
+        let Some(probe) = probe else {
+            let (outcome, flags) = identify(target, &context);
+            return Answer {
+                outcome,
+                flags,
+                payload_bytes: target.nzb.as_ref().map(|nzb| nzb.payload_bytes),
+            };
+        };
+        // Hooks wait for the archive's evidence, so a release asks srrDB once, knowing the most.
+        let (mut outcome, flags) = identify(target, &offline);
+        if !matches!(outcome, Outcome::Identified(_)) {
+            let enriched = flags
+                .obfuscated_only()
+                .then(|| probe.enrich(target))
+                .flatten();
+            match enriched {
+                Some(enriched) => {
+                    let (second, _) = identify(&enriched, &context);
+                    probe.record_outcome(&second);
+                    if matches!(second, Outcome::Identified(_)) {
+                        outcome = second;
+                    }
+                }
+                None => outcome = identify(target, &context).0,
+            }
+        }
         Answer {
             outcome,
             flags,
@@ -959,6 +1006,7 @@ mod tests {
             threads: 2,
             limit: None,
             apply,
+            shuffle: false,
         }
     }
 
@@ -1068,6 +1116,57 @@ mod tests {
             )
             .expect("count");
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn with_a_probe_srrdb_is_asked_once_and_after_the_archive_is_read() {
+        use std::sync::Mutex;
+
+        use crate::identify::archive_probe::tests::{Fake, rar4};
+        use crate::identify::ladder::{SrrdbLookup, SrrdbQuery};
+
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<Vec<String>>>);
+        impl SrrdbLookup for Recording {
+            fn lookup(&self, query: &SrrdbQuery) -> Result<Option<String>> {
+                self.0.lock().expect("lock").push(query.crc32s.clone());
+                Ok(None)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+        gzip.write_all(br#"<file subject="&quot;hrdvTRGDFSztvQwEr.part01.rar&quot; yEnc"><groups><group>g</group></groups><segments><segment bytes="9" number="1">id4</segment></segments></file>"#)
+            .expect("gzip");
+        Connection::open(dir.path().join("nzbs.db"))
+            .expect("nzbs")
+            .execute(
+                "INSERT INTO nzbs VALUES (4, 'gzip', ?1)",
+                [gzip.finish().expect("gzip")],
+            )
+            .expect("nzb");
+        let mut fake = Fake::default();
+        fake.0.insert(
+            "id4".to_owned(),
+            rar4(
+                "7d8c650a91cf437a8dd9ecce444c1ddc.mkv",
+                3_000_000_000,
+                0xAABB_CCDD,
+                0,
+            ),
+        );
+        let probe = ArchiveProbe::new(&fake, 10);
+        let srrdb = Recording::default();
+        let hooks = Hooks {
+            srrdb: &srrdb,
+            ..Hooks::default()
+        };
+        run_with_probe(&options(dir.path(), false), hooks, Some(&probe)).expect("run");
+        assert_eq!(
+            *srrdb.0.lock().expect("lock"),
+            [vec!["aabbccdd:3000000000".to_owned()]]
+        );
     }
 
     #[test]

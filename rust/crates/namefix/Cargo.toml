@@ -17,6 +17,7 @@ md-5.workspace = true
 metrics.workspace = true
 nntmux-categorize.workspace = true
 nntmux-core.workspace = true
+nntmux-formats.workspace = true
 nntmux-nntp.workspace = true
 nntmux-predb.workspace = true
 nntmux-runtime.workspace = true
@@ -28,6 +29,7 @@ quick-xml.workspace = true
 rand.workspace = true
 redis.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 sha2.workspace = true
@@ -38,10 +40,12 @@ tracing.workspace = true
 unicode-normalization.workspace = true
 
 [dev-dependencies]
+crc32fast.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 nntmux-testkit.workspace = true
 tempfile.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true

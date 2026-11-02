@@ -12,6 +12,7 @@
 //! - [`identify_release`] is for a caller with a MariaDB pool.
 //! - [`catalog`] runs over the SQLite import, and backs the `nntmux-identify` binary.
 
+pub mod archive_probe;
 pub mod catalog;
 pub mod donor;
 pub mod ladder;
@@ -19,6 +20,7 @@ pub mod local_predb;
 pub mod mysql;
 pub mod name;
 pub mod nzb;
+pub mod srrdb;
 
 pub use donor::DonorIndex;
 pub use ladder::{
@@ -27,3 +29,4 @@ pub use ladder::{
 };
 pub use mysql::identify_release;
 pub use name::{Kind, ParsedName, Scope};
+pub use srrdb::{SrrdbClient, SrrdbConfig};
