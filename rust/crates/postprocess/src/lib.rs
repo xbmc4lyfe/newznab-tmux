@@ -4,6 +4,7 @@
 
 pub mod additional;
 pub mod archive_info;
+pub mod commands;
 pub mod config;
 pub mod media;
 pub mod mediainfo;
@@ -40,6 +41,62 @@ pub enum Command {
         /// Deprecated and ignored; every run uses the provider pipeline.
         #[arg(long)]
         mode: Option<String>,
+    },
+    /// `releases:additional`: run additional post-processing on one release, by GUID or ID,
+    /// whatever its processing state.
+    Additional {
+        /// The release GUID; or give --id.
+        guid: Option<String>,
+        /// The numeric release ID, instead of the GUID.
+        #[arg(long)]
+        id: Option<String>,
+        /// Reset the release's additional-processing flags first.
+        #[arg(long)]
+        reset: bool,
+        /// Accepted for compatibility; the output is already quiet.
+        #[arg(long)]
+        no_progress: bool,
+        /// Show the stage and download profile.
+        #[arg(long)]
+        profile: bool,
+    },
+    /// `postprocess:guid`: one kind of post-processing for one GUID bucket.
+    Guid {
+        /// additional, nfo, movie, tv, anime, books, music, console or games.
+        #[arg(value_name = "TYPE")]
+        kind: String,
+        /// First character of the release GUID (a-f, 0-9).
+        guid: String,
+        /// For movie and tv: 2 for renamed releases only.
+        renamed: Option<String>,
+        /// Drain several additional-processing batches.
+        #[arg(long)]
+        worker: bool,
+        /// Most claim batches in worker mode.
+        #[arg(long, default_value_t = 4)]
+        max_batches: i64,
+        /// Print one JSON performance record per additional batch.
+        #[arg(long)]
+        profile: bool,
+    },
+    /// `releases:fetch-samples`: reset and reprocess releases of the given categories that have
+    /// no sample picture.
+    FetchSamples {
+        /// Category ID, or IDs separated by commas or spaces.
+        #[arg(long)]
+        category: Option<String>,
+        /// Most releases to process; 0 for all.
+        #[arg(long, default_value_t = 0)]
+        limit: i64,
+        /// Releases read per query.
+        #[arg(long, default_value_t = 500)]
+        chunk: i64,
+        /// List the GUIDs that would be processed, and stop.
+        #[arg(long)]
+        dry_run: bool,
+        /// Show each release's outcome.
+        #[arg(long)]
+        show_output: bool,
     },
     /// `update:postprocess nfo`: one pass of NFO processing, then the archive pass for releases
     /// out of retries.
@@ -80,6 +137,67 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 return Ok(());
             };
             nntmux_metadata::process_tv_pipeline(&ctx, 0, &guid, renamed).await
+        }
+        Command::Additional {
+            guid,
+            id,
+            reset,
+            no_progress: _,
+            profile,
+        } => {
+            let guid = guid
+                .map(|guid| guid.trim().to_owned())
+                .filter(|g| !g.is_empty());
+            let id = id.filter(|id| !id.is_empty());
+            let target = match (guid, id) {
+                (None, None) => {
+                    bail!("You must supply either a GUID argument or --id=<release id>.")
+                }
+                (Some(_), Some(_)) => bail!("Provide only one identifier: GUID or --id, not both."),
+                (Some(guid), None) => commands::Target::Guid(guid),
+                (None, Some(id)) => commands::Target::Id(id),
+            };
+            commands::additional(&ctx, target, reset, profile).await
+        }
+        Command::Guid {
+            kind,
+            guid,
+            renamed,
+            worker,
+            max_batches,
+            profile,
+        } => {
+            commands::guid(
+                &ctx,
+                commands::GuidOptions {
+                    kind,
+                    guid,
+                    renamed,
+                    worker,
+                    max_batches,
+                    profile,
+                },
+            )
+            .await
+        }
+        Command::FetchSamples {
+            category,
+            limit,
+            chunk,
+            dry_run,
+            show_output,
+        } => {
+            commands::fetch_samples(
+                &ctx,
+                commands::FetchSamplesOptions {
+                    category,
+                    limit,
+                    chunk,
+                    dry_run,
+                    show_output,
+                },
+            )
+            .await
         }
         Command::Nfo { guid, group } => {
             if !guid.is_empty() {

@@ -310,6 +310,15 @@ impl<'a> ReleaseProcessor<'a> {
         }
     }
 
+    /// Group names already looked up, kept by the caller between processors.
+    pub fn set_group_names(&mut self, names: HashMap<i64, String>) {
+        self.group_names = names;
+    }
+
+    pub fn into_group_names(self) -> HashMap<i64, String> {
+        self.group_names
+    }
+
     fn settings(&self) -> &ProcessorSettings {
         &self.config.settings
     }

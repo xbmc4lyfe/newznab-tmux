@@ -45,13 +45,15 @@ note = "nntmux-ctl releases import-database."
 kind = "command"
 id = "releases:additional"
 source = "app/Console/Commands/ProcessAdditionalGuid.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl postprocess additional <guid>|--id. Any failure exits 1 rather than PHP's 1-5 codes. Audio info is not ported (TV and movies only)."
 
 [[entry]]
 kind = "command"
 id = "releases:fetch-samples"
 source = "app/Console/Commands/FetchSamples.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl postprocess fetch-samples. Releases run in process instead of through a releases:additional subprocess."
 
 [[entry]]
 kind = "command"

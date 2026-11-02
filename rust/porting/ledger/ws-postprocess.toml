@@ -24,7 +24,8 @@ note = "nntmux-ctl releases import-nfos, by ws-releases with the upload manifest
 kind = "command"
 id = "postprocess:guid"
 source = "app/Console/Commands/PostProcessGuid.php"
-status = "todo"
+status = "ported"
+note = "nntmux-ctl postprocess guid <type> <char> [renamed] [--worker --max-batches --profile]. Book, music, console and game lookups fail until those providers are ported."
 
 [[entry]]
 kind = "command"

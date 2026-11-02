@@ -405,6 +405,37 @@ async fn lock_candidates(
     Ok(ids)
 }
 
+/// Refreshes the holder's claims on `ids`, so a batch that outlasts the claim TTL keeps the
+/// releases it has not finished. Returns the ids still held under `token`; one another worker
+/// has taken since is left alone.
+pub async fn renew_claims(pool: &MySqlPool, ids: &[i64], token: &str) -> Result<Vec<i64>> {
+    if ids.is_empty() || token.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut update = QueryBuilder::<MySql>::new("UPDATE releases SET additional_pp_claimed_at = ");
+    update.push_bind(now());
+    update.push(" WHERE additional_pp_claim_token = ");
+    update.push_bind(token.to_owned());
+    update.push(" AND id IN (");
+    let mut separated = update.separated(", ");
+    for id in ids {
+        separated.push_bind(*id);
+    }
+    update.push(")");
+    update.build().execute(pool).await?;
+    let mut held = QueryBuilder::<MySql>::new(
+        "SELECT CAST(id AS SIGNED) FROM releases WHERE additional_pp_claim_token = ",
+    );
+    held.push_bind(token.to_owned());
+    held.push(" AND id IN (");
+    let mut separated = held.separated(", ");
+    for id in ids {
+        separated.push_bind(*id);
+    }
+    held.push(")");
+    Ok(held.build_query_scalar().fetch_all(pool).await?)
+}
+
 /// Gives a claim back. With a token, only the holder's own claim is cleared.
 pub async fn clear_claim(pool: &MySqlPool, release_id: i64, token: Option<&str>) -> Result<()> {
     let mut query: QueryBuilder<MySql> = QueryBuilder::new(
