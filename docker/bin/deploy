@@ -384,17 +384,33 @@ for svc in $("$inspect" services < "$work/model.json"); do
     has "$data_services" "$svc" || continue
     [ -n "$("$compose" ps -q --status running "$svc")" ] || missing+=("$svc")
 done
-if [ ${#missing[@]} -gt 0 ]; then
+# A missing data service (restored storage, say) may hold another schema than the writers
+# expect. With writers running, whatever the targets, it starts only after they stop, is then
+# fenced by a fresh barrier and migrated. With none running (a new install) it starts first.
+writers_up=0
+for svc in $all_app_users; do
+    [ "$svc" = migrate ] && continue
+    [ -n "$("$compose" ps -q --status running "$svc")" ] && writers_up=1 && break
+done
+late_start=0
+if [ ${#missing[@]} -gt 0 ] && [ "$writers_up" = 1 ]; then
+    late_start=1
+    quiesce=1
+    need_migrate=1
+fi
+start_missing() {
     # A stopped data service may be a replacement a failed attempt stopped because it couldn't
     # be fenced, so it is stopped again on any exit until a barrier is confirmed (or none is
     # needed).
     fence_stop=("${missing[@]}")
     unfenced=1
-    # --no-deps: nothing but these data services starts before the writers stop.
+    echo "Starting data service(s) that weren't running: ${missing[*]}."
+    # --no-deps: nothing but these data services starts.
     pinned up -d --wait --wait-timeout "$timeout" --no-deps --no-recreate "${missing[@]}"
-fi
+}
+[ ${#missing[@]} -gt 0 ] && [ "$late_start" = 0 ] && start_missing
 empty=0
-if [ "$need_migrate" = 1 ]; then
+if [ "$need_migrate" = 1 ] && [ "$late_start" = 0 ]; then
     read_pending
     [ "${pending:-unknown}" = 0 ] || quiesce=1
 fi
@@ -439,6 +455,10 @@ if [ "$quiesce" = 1 ]; then
         printf '%s\n' "${stopped[@]}" > "$stopped_stamp"
         echo "Stopping writers so they drain before the schema or data services change: ${stopped[*]}."
         "$compose" stop "${stopped[@]}"
+    fi
+    if [ "$late_start" = 1 ]; then
+        start_missing
+        read_pending
     fi
     if [ -n "$(docker ps -q --filter "name=^${barrier}\$")" ]; then
         # An interrupted deploy can leave one still waiting for remote workers to drain.
