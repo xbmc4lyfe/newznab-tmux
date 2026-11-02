@@ -5,6 +5,9 @@
   deploy-inspect services           every service, in any profile
   deploy-inspect image-users IMAGE  services that run IMAGE
   deploy-inspect image-of SERVICE   the image SERVICE runs
+  deploy-inspect data BASE IMAGE    stateful services: not running IMAGE, and either listed in BASE
+                                    (space-separated) or absent from the base roster read as names on
+                                    fd 3, unless labelled nntmux.deploy.stateless: "true"
   deploy-inspect configs            one "service hash" line per service that bind-mounts config
   deploy-inspect storage            the same, for where existing writable bind mounts really land
   deploy-inspect interpolated FILE  keys of a dotenv FILE whose value Compose would interpolate
@@ -96,6 +99,21 @@ def main() -> None:
         print(model.get("name", ""))
     elif command == ["services"]:
         print("\n".join(sorted(services)))
+    elif command == ["data"]:
+        base, image = set(sys.argv[2].split()), sys.argv[3]
+        with os.fdopen(3) as handle:
+            roster = set(handle.read().split())
+        data = []
+        for name, svc in services.items():
+            labels = svc.get("labels") or {}
+            if isinstance(labels, list):
+                labels = dict(item.split("=", 1) if "=" in item else (item, "") for item in labels)
+            if svc.get("image") == image or str(labels.get("nntmux.deploy.stateless", "")).lower() == "true":
+                continue
+            # A service an override adds (another database, say) holds data until it says otherwise.
+            if name in base or name not in roster:
+                data.append(name)
+        print("\n".join(sorted(data)))
     elif command == ["image-of"]:
         print((services.get(sys.argv[2]) or {}).get("image", ""))
     elif command == ["image-users"]:

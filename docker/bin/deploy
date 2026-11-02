@@ -58,7 +58,11 @@ config_stamp=${DEPLOY_CONFIG_STAMP:-$stack/.deploy.config}
 # whose deployment pause a failed attempt still owes a release.
 project_stamp=$(dirname "$config_stamp")/.deploy.project
 owed=$(dirname "$config_stamp")/.deploy.barrier-owed
-data_services=" ${DEPLOY_DATA_SERVICES:-mariadb redis manticore} "
+# The Docker daemon of the last healthy deploy, and the writers a quiesce stopped that a failed
+# attempt hasn't brought back yet.
+daemon_stamp=$(dirname "$config_stamp")/.deploy.daemon
+stopped_stamp=$(dirname "$config_stamp")/.deploy.stopped
+base_data=${DEPLOY_DATA_SERVICES:-mariadb redis manticore}
 app_env=${APP_ENV_FILE:-$stack/config/app.env}
 image=${APP_IMAGE:-nntmux/rust:local}
 dry_run=${DRY_RUN:-0}
@@ -125,7 +129,23 @@ if [ -f "$project_stamp" ] && [ "$(cat "$project_stamp")" != "$project" ]; then
     echo "project first, then remove $project_stamp." >&2
     exit 1
 fi
+# Another daemon (a changed DOCKER_HOST or DOCKER_CONTEXT) would see none of the stack either.
+daemon=$(docker info --format '{{.ID}}' 2> /dev/null || true)
+if [ -z "$daemon" ]; then
+    echo "Couldn't read the Docker daemon's ID; check DOCKER_HOST and DOCKER_CONTEXT." >&2
+    exit 1
+fi
+if [ -f "$daemon_stamp" ] && [ "$(cat "$daemon_stamp")" != "$daemon" ]; then
+    echo "The last healthy deploy used Docker daemon $(cat "$daemon_stamp"), this one $daemon." >&2
+    echo "Check DOCKER_HOST and DOCKER_CONTEXT. To move the stack on purpose, stop it on the old" >&2
+    echo "daemon first, then remove $daemon_stamp." >&2
+    exit 1
+fi
 known=" $("$inspect" services < "$work/all.json" | tr '\n' ' ') "
+# Stateful services: the base data services, plus any service an override adds that doesn't run
+# the app image, unless it is labelled nntmux.deploy.stateless: "true".
+COMPOSE_FILE="$stack/docker-compose.yml" "$compose" --profile '*' config --services > "$work/roster"
+data_services=" $("$inspect" data "$base_data" "$image" < "$work/all.json" 3< "$work/roster" | tr '\n' ' ') "
 app_users=" $("$inspect" image-users "$image" < "$work/model.json" | tr '\n' ' ') "
 # Writers in every profile, so one started with an inactive profile (pending) is still quiesced.
 all_app_users=" $("$inspect" image-users "$image" < "$work/all.json" | tr '\n' ' ') "
@@ -263,7 +283,10 @@ pinned() {
         echo "Stopping before it is used; rerun the deploy." >&2
         exit 1
     fi
-    "$compose" "$@"
+    # No pulls: an image the preflight didn't inspect (a moved `latest` tag) must not arrive here.
+    sub=$1
+    shift
+    "$compose" "$sub" --pull never "$@"
 }
 
 # A schema change or a data-service restart must not race a writer, here or on another host.
@@ -347,6 +370,12 @@ if [ "$need_migrate" = 1 ]; then
     [ "${pending:-unknown}" = 0 ] || quiesce=1
 fi
 stopped=()
+# Writers an earlier failed attempt stopped come back with this run's, and count for the release.
+if [ -f "$stopped_stamp" ]; then
+    for svc in $(cat "$stopped_stamp"); do
+        has "$known" "$svc" && stopped+=("$svc")
+    done
+fi
 if [ "$quiesce" = 1 ]; then
     database=$(database_identity)
     if [ -z "$database" ]; then
@@ -373,9 +402,12 @@ if [ "$quiesce" = 1 ]; then
     for svc in $all_app_users; do
         # The barrier itself is a one-off container of the migrate service.
         [ "$svc" = migrate ] && continue
+        has " ${stopped[*]-} " "$svc" && continue
         [ -n "$("$compose" ps -q --status running "$svc")" ] && stopped+=("$svc")
     done
     if [ ${#stopped[@]} -gt 0 ]; then
+        # Recorded first, so a failure from here on still brings every one of them back.
+        printf '%s\n' "${stopped[@]}" > "$stopped_stamp"
         echo "Stopping writers so they drain before the schema or data services change: ${stopped[*]}."
         "$compose" stop "${stopped[@]}"
     fi
@@ -487,6 +519,7 @@ fi
 } > "$work/stamp"
 mv "$work/stamp" "$config_stamp"
 printf '%s\n' "$project" > "$project_stamp"
+printf '%s\n' "$daemon" > "$daemon_stamp"
 
 # Remote verification workers may claim again only once the whole stack is healthy: a targeted
 # deploy can leave writers that an earlier failed attempt stopped, or a migration unfinished.
@@ -494,7 +527,7 @@ printf '%s\n' "$project" > "$project_stamp"
 # left its durable pause, which --release clears.
 if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ] || [ -f "$owed" ]; then
     down=""
-    for svc in $app_users; do
+    for svc in $app_users ${stopped[@]+"${stopped[@]}"}; do
         [ "$svc" = migrate ] && continue
         id=$("$compose" ps -q --status running "$svc" | head -n 1)
         if [ -z "$id" ]; then
@@ -525,6 +558,9 @@ if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ] || [ -f "$owed" ]; th
     rm -f "$owed"
     echo "Released the verification barrier."
 fi
+
+# Every writer the quiesce stopped is back (the restart above waited for it to be healthy).
+rm -f "$stopped_stamp"
 
 "$compose" ps
 echo "Deployed $commit (image sources at ${revision:0:12})."
