@@ -6,7 +6,7 @@ use chrono::NaiveDateTime;
 use nntmux_ingest::groups::ServerGroup;
 use nntmux_runtime::{Ctx, Shutdown};
 use nntmux_verify::context::Verify;
-use sqlx::{FromRow, MySqlPool, QueryBuilder};
+use sqlx::{ConnectOptions, Connection, FromRow, MySqlPool, QueryBuilder};
 use tracing::warn;
 
 const MB: f64 = 1_048_576.0;
@@ -316,6 +316,29 @@ impl Exclusive<'_> {
     /// Drains processing under a token of its own, runs `work`, then resumes. Resuming by that
     /// token leaves an operator's earlier pause in place.
     async fn run<F, Fut, T>(&self, work: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        // One destructive group change at a time, held from the drain until after the resume:
+        // `drain` admits a second caller into a drain that already exists, so without this a
+        // finishing change could resume processing under another one still cleaning up. A
+        // session lock, so a killed command can't leave it held.
+        let mut guard = self.ctx.db.connect_options().connect().await?;
+        let got: Option<i64> = sqlx::query_scalar(
+            "SELECT GET_LOCK(CONCAT('nntmux-admin-group-change:', MD5(DATABASE())), 0)",
+        )
+        .fetch_one(&mut guard)
+        .await?;
+        if got != Some(1) {
+            bail!("Another group reset, purge or delete is running; retry once it has finished.");
+        }
+        let outcome = self.drained(work).await;
+        let _ = guard.close().await;
+        outcome
+    }
+
+    async fn drained<F, Fut, T>(&self, work: F) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,

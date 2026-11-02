@@ -10,6 +10,7 @@ use nntmux_testkit::TestDb;
 use nntmux_verify::cache::Cache;
 use nntmux_verify::config::VerificationConfig;
 use nntmux_verify::context::Verify;
+use sqlx::Connection;
 
 fn at(raw: &str) -> NaiveDateTime {
     NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").expect("a timestamp")
@@ -562,6 +563,24 @@ async fn a_group_reset_retires_its_queued_verification_work() -> Result<()> {
     assert_eq!(pending, 20);
     // The fence is gone afterwards.
     assert!(!nntmux_verify::locks::paused(&db.pool, None).await?);
+
+    // A second change waits for none: it refuses while another holds the change lock.
+    let mut holder = sqlx::MySqlConnection::connect_with(&db.pool.connect_options()).await?;
+    sqlx::query("SELECT GET_LOCK(CONCAT('nntmux-admin-group-change:', MD5(DATABASE())), 0)")
+        .execute(&mut holder)
+        .await?;
+    let refused = groups::reset(&exclusive(&ctx, &verify), two).await;
+    assert!(refused.is_err());
+    holder.close().await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM release_verification_candidates WHERE groups_id = ?"
+        )
+        .bind(two)
+        .fetch_one(&db.pool)
+        .await?,
+        "pending"
+    );
 
     // Work that won't finish blocks the change, which leaves the group as it was.
     nntmux_ops::runtime_state::resume(&ctx, None).await?;
