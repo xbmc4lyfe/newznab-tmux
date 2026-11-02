@@ -8,6 +8,7 @@ pub mod gdpr;
 pub mod groups;
 pub mod roles;
 pub mod settings;
+pub mod user_role;
 pub mod users;
 
 use anyhow::{Context, Result};
@@ -161,6 +162,27 @@ pub enum UserCommand {
     ResendVerification {
         #[arg(required = true)]
         users: Vec<String>,
+    },
+    /// Change an account's role or its expiry, as the edit form's role fields did. A role
+    /// change applies now, or with `--stack` after the current role ends. An expiry set here
+    /// is kept and skips promotions.
+    Role {
+        user: String,
+        /// The new role, by id or name.
+        #[arg(long)]
+        role: Option<String>,
+        /// Queue the new role after the current one while the current one runs.
+        #[arg(long, requires = "role")]
+        stack: bool,
+        /// Set the current role's expiry (YYYY-MM-DD).
+        #[arg(long, conflicts_with = "clear_expiry")]
+        expires: Option<chrono::NaiveDate>,
+        /// Remove the current role's expiry.
+        #[arg(long)]
+        clear_expiry: bool,
+        /// Drop a queued role first.
+        #[arg(long)]
+        cancel_pending: bool,
     },
     /// List an account's passkeys.
     Passkeys { user: String },
@@ -1213,6 +1235,40 @@ async fn user_command(ctx: &Ctx, command: UserCommand, now: chrono::NaiveDateTim
                 let account = users::require(db, name).await?;
                 users::resend_verification(ctx, &account).await?;
                 println!("sent a verification link to {}", account.username);
+            }
+        }
+        UserCommand::Role {
+            user,
+            role,
+            stack,
+            expires,
+            clear_expiry,
+            cancel_pending,
+        } => {
+            let account = users::require(db, &user).await?;
+            let request = user_role::Request {
+                role,
+                stack,
+                expires: if clear_expiry {
+                    Some(None)
+                } else {
+                    expires.map(Some)
+                },
+                cancel_pending,
+            };
+            match user_role::change(ctx, &account, &request, now).await? {
+                user_role::Outcome::Unchanged => {
+                    println!("{}'s role is unchanged", account.username)
+                }
+                user_role::Outcome::Stacked { starts, expires } => println!(
+                    "{}'s new role starts {starts} and runs until {expires}",
+                    account.username
+                ),
+                user_role::Outcome::Immediate { expires } => println!(
+                    "{}'s role changed, expiring {}",
+                    account.username,
+                    when(expires)
+                ),
             }
         }
         UserCommand::Passkeys { user } => {
