@@ -20,6 +20,7 @@ nntmux-namefix.workspace = true
 nntmux-nntp.workspace = true
 nntmux-predb.workspace = true
 nntmux-runtime.workspace = true
+nntmux-search.workspace = true
 nntmux-verify.workspace = true
 nntmux-yenc.workspace = true
 quick-xml.workspace = true

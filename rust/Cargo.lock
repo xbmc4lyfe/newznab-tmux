@@ -2752,6 +2752,7 @@ dependencies = [
  "nntmux-nntp",
  "nntmux-predb",
  "nntmux-runtime",
+ "nntmux-search",
  "nntmux-testkit",
  "nntmux-verify",
  "nntmux-yenc",
