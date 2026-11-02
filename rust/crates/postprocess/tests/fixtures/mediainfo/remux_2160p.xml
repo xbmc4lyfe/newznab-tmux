@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Mediainfo version="21.09">
+<File>
+<track type="General">
+<Count>331</Count>
+<Count_of_stream_of_this_kind>1</Count_of_stream_of_this_kind>
+<Kind_of_stream>General</Kind_of_stream>
+<Kind_of_stream>General</Kind_of_stream>
+<Unique_ID>186135458392113489023851745671339098311</Unique_ID>
+<Unique_ID>186135458392113489023851745671339098311 (0x8C08E3B5C7A43D3A86ED4E6A3F7B7C47)</Unique_ID>
+<Complete_name>/tmp/Some.Movie.2021.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.Atmos-GROUP.mkv</Complete_name>
+<File_name>Some.Movie.2021.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.Atmos-GROUP</File_name>
+<File_extension>mkv</File_extension>
+<Format>Matroska</Format>
+<Format>Matroska</Format>
+<Format_Url>https://matroska.org/downloads/windows.html</Format_Url>
+<Format_Extensions_usually_used>mkv mk3d mka mks</Format_Extensions_usually_used>
+<Format_version>Version 4</Format_version>
+<File_size>62914560000</File_size>
+<File_size>58.6 GiB</File_size>
+<Duration>7845123</Duration>
+<Duration>2 h 10 min</Duration>
+<Duration>2 h 10 min 45 s 123 ms</Duration>
+<Overall_bit_rate_mode>VBR</Overall_bit_rate_mode>
+<Overall_bit_rate_mode>Variable</Overall_bit_rate_mode>
+<Overall_bit_rate>64156841</Overall_bit_rate>
+<Overall_bit_rate>64.2 Mb/s</Overall_bit_rate>
+<Movie_name>Some Movie</Movie_name>
+<Writing_application>mkvmerge v62.0.0 ('Apollo') 64-bit</Writing_application>
+<Writing_library>libebml v1.4.2 + libmatroska v1.6.4</Writing_library>
+</track>
+<track type="Video">
+<Count>389</Count>
+<Kind_of_stream>Video</Kind_of_stream>
+<Kind_of_stream>Video</Kind_of_stream>
+<ID>1</ID>
+<ID>1</ID>
+<Format>HEVC</Format>
+<Format>HEVC</Format>
+<Format_Info>High Efficiency Video Coding</Format_Info>
+<Format_profile>Main 10@L5.1@High</Format_profile>
+<Codec_ID>V_MPEGH/ISO/HEVC</Codec_ID>
+<Duration>7845087</Duration>
+<Duration>2 h 10 min</Duration>
+<Bit_rate>58000000</Bit_rate>
+<Bit_rate>58.0 Mb/s</Bit_rate>
+<Width>3840</Width>
+<Width>3 840 pixels</Width>
+<Height>2160</Height>
+<Height>2 160 pixels</Height>
+<Display_aspect_ratio>1.778</Display_aspect_ratio>
+<Display_aspect_ratio>16:9</Display_aspect_ratio>
+<Frame_rate_mode>CFR</Frame_rate_mode>
+<Frame_rate_mode>Constant</Frame_rate_mode>
+<Frame_rate>23.976</Frame_rate>
+<Frame_rate>23.976 (24000/1001) FPS</Frame_rate>
+<Bit_depth>10</Bit_depth>
+<Bit_depth>10 bits</Bit_depth>
+<Language>en</Language>
+<Language>English</Language>
+<Default>Yes</Default>
+<Default>Yes</Default>
+</track>
+<track type="Audio" typeorder="1">
+<Count>285</Count>
+<ID>2</ID>
+<ID>2</ID>
+<Format>MLP FBA</Format>
+<Format>MLP FBA 16-ch</Format>
+<Format_Commercial_IfAny>Dolby TrueHD with Dolby Atmos</Format_Commercial_IfAny>
+<Codec_ID>A_TRUEHD</Codec_ID>
+<Bit_rate_mode>VBR</Bit_rate_mode>
+<Bit_rate_mode>Variable</Bit_rate_mode>
+<Bit_rate>4523000</Bit_rate>
+<Bit_rate>4 523 kb/s</Bit_rate>
+<Channel_s_>8</Channel_s_>
+<Channel_s_>8 channels</Channel_s_>
+<Sampling_rate>48000</Sampling_rate>
+<Sampling_rate>48.0 kHz</Sampling_rate>
+<Title>TrueHD Atmos 7.1</Title>
+<Language>en</Language>
+<Language>English</Language>
+<Language>English</Language>
+<Language>en</Language>
+<Language>eng</Language>
+<Language>en</Language>
+</track>
+<track type="Audio" typeorder="2">
+<ID>3</ID>
+<ID>3</ID>
+<Format>AC-3</Format>
+<Format>AC-3</Format>
+<Bit_rate_mode>CBR</Bit_rate_mode>
+<Bit_rate_mode>Constant</Bit_rate_mode>
+<Bit_rate>640000</Bit_rate>
+<Bit_rate>640 kb/s</Bit_rate>
+<Channel_s_>6</Channel_s_>
+<Channel_s_>6 channels</Channel_s_>
+<Sampling_rate>48000</Sampling_rate>
+<Sampling_rate>48.0 kHz</Sampling_rate>
+<Language>fr</Language>
+<Language>French</Language>
+</track>
+<track type="Text" typeorder="1">
+<ID>4</ID>
+<ID>4</ID>
+<Format>PGS</Format>
+<Format>PGS</Format>
+<Language>en</Language>
+<Language>English</Language>
+</track>
+<track type="Text" typeorder="2">
+<ID>5</ID>
+<ID>5</ID>
+<Format>UTF-8</Format>
+<Format>UTF-8</Format>
+<Title>SDH</Title>
+</track>
+<track type="Text" typeorder="3">
+<ID>6</ID>
+<ID>6</ID>
+<Language>de</Language>
+</track>
+<track type="Menu">
+<Count>11</Count>
+<_00_00_00_000>en:Chapter 01</_00_00_00_000>
+<_00_05_10_000>en:Chapter 02</_00_05_10_000>
+</track>
+</File>
+</Mediainfo>

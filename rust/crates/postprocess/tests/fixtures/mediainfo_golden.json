@@ -1,0 +1,378 @@
+[
+    {
+        "name": "attributes.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": {
+                "movie_name": "Attributed",
+                "file_name": {
+                    "unbindable": true
+                },
+                "unique_id": "0x0"
+            }
+        },
+        "extra": {
+            "video": [
+                {
+                    "containerformat": "Matroska",
+                    "overallbitrate": "",
+                    "videoduration": "",
+                    "videoformat": "",
+                    "videocodec": {
+                        "unbindable": true
+                    },
+                    "videowidth": "",
+                    "videoheight": "",
+                    "videoaspect": "",
+                    "videoframerate": "",
+                    "videolibrary": ""
+                }
+            ],
+            "audio": [],
+            "subs": []
+        },
+        "extra_error": null
+    },
+    {
+        "name": "edge_cases.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": {
+                "movie_name": {
+                    "unbindable": true
+                },
+                "file_name": "  spaced  ",
+                "unique_id": null
+            }
+        },
+        "extra": {
+            "video": [
+                {
+                    "containerformat": "AVI",
+                    "overallbitrate": "",
+                    "videoduration": "00h:00m:00s",
+                    "videoformat": "XviD",
+                    "videocodec": "",
+                    "videowidth": 720,
+                    "videoheight": 576,
+                    "videoaspect": "",
+                    "videoframerate": "25.000 FPS",
+                    "videolibrary": "XviD 64"
+                },
+                {
+                    "containerformat": "AVI",
+                    "overallbitrate": "",
+                    "videoduration": "00h:00m:00s",
+                    "videoformat": "Second video",
+                    "videocodec": "",
+                    "videowidth": 720,
+                    "videoheight": 576,
+                    "videoaspect": "",
+                    "videoframerate": "25.000 FPS",
+                    "videolibrary": "XviD 64"
+                }
+            ],
+            "audio": [
+                {
+                    "audioid": "1",
+                    "audioformat": "MPEG Audio",
+                    "audiomode": "",
+                    "audiobitratemode": "",
+                    "audiobitrate": "",
+                    "audiochannels": "",
+                    "audiosamplerate": "",
+                    "audiolibrary": "",
+                    "audiolanguage": "n",
+                    "audiotitle": ""
+                },
+                {
+                    "audioid": "2",
+                    "audioformat": "AAC LC",
+                    "audiomode": "",
+                    "audiobitratemode": "",
+                    "audiobitrate": "",
+                    "audiochannels": "",
+                    "audiosamplerate": "",
+                    "audiolibrary": "",
+                    "audiolanguage": "n",
+                    "audiotitle": ""
+                }
+            ],
+            "subs": [
+                {
+                    "subsid": 1,
+                    "subslanguage": "n"
+                }
+            ]
+        },
+        "extra_error": null
+    },
+    {
+        "name": "general_only.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": null
+        },
+        "extra": {
+            "video": [],
+            "audio": [],
+            "subs": []
+        },
+        "extra_error": null
+    },
+    {
+        "name": "latin1.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": {
+                "movie_name": "CafÃ© Society",
+                "file_name": null,
+                "unique_id": null
+            }
+        },
+        "extra": {
+            "video": [],
+            "audio": [
+                {
+                    "audioid": "1",
+                    "audioformat": "",
+                    "audiomode": "",
+                    "audiobitratemode": "",
+                    "audiobitrate": "",
+                    "audiochannels": "",
+                    "audiosamplerate": "",
+                    "audiolibrary": "",
+                    "audiolanguage": "FranÃ§ais",
+                    "audiotitle": "FranÃ§ais"
+                }
+            ],
+            "subs": []
+        },
+        "extra_error": null
+    },
+    {
+        "name": "new_format.xml",
+        "parse_error": "Mhor\\MediaInfo\\Exception\\MediainfoOutputParsingException",
+        "media_info": null,
+        "extra": null,
+        "extra_error": null
+    },
+    {
+        "name": "no_general.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": null
+        },
+        "extra": {
+            "video": [],
+            "audio": [],
+            "subs": []
+        },
+        "extra_error": null
+    },
+    {
+        "name": "rate_single.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": {
+                "movie_name": null,
+                "file_name": null,
+                "unique_id": null
+            }
+        },
+        "extra": {
+            "video": [
+                {
+                    "containerformat": "MPEG-TS",
+                    "overallbitrate": "",
+                    "videoduration": "",
+                    "videoformat": "",
+                    "videocodec": "",
+                    "videowidth": 1,
+                    "videoheight": "",
+                    "videoaspect": "",
+                    "videoframerate": "",
+                    "videolibrary": ""
+                }
+            ],
+            "audio": [],
+            "subs": []
+        },
+        "extra_error": null
+    },
+    {
+        "name": "remux_2160p.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": {
+                "movie_name": "Some Movie",
+                "file_name": "Some.Movie.2021.2160p.UHD.BluRay.REMUX.HDR.HEVC.TrueHD.7.1.Atmos-GROUP",
+                "unique_id": "186135458392113489023851745671339098311"
+            }
+        },
+        "extra": {
+            "video": [
+                {
+                    "containerformat": "Matroska",
+                    "overallbitrate": "58.0 Mb/s",
+                    "videoduration": "02h:10m:45s",
+                    "videoformat": "HEVC",
+                    "videocodec": "V_MPEGH/ISO/HEVC",
+                    "videowidth": 3840,
+                    "videoheight": 2160,
+                    "videoaspect": "16:9",
+                    "videoframerate": "23.976 (24000/1001) FPS",
+                    "videolibrary": ""
+                }
+            ],
+            "audio": [
+                {
+                    "audioid": "2",
+                    "audioformat": "MLP FBA 16-ch",
+                    "audiomode": "",
+                    "audiobitratemode": "Variable",
+                    "audiobitrate": "4 523 kb/s",
+                    "audiochannels": 8,
+                    "audiosamplerate": "48.0 kHz",
+                    "audiolibrary": "",
+                    "audiolanguage": "English",
+                    "audiotitle": "TrueHD Atmos 7.1"
+                },
+                {
+                    "audioid": "3",
+                    "audioformat": "AC-3",
+                    "audiomode": "",
+                    "audiobitratemode": "Constant",
+                    "audiobitrate": "640 kb/s",
+                    "audiochannels": 6,
+                    "audiosamplerate": "48.0 kHz",
+                    "audiolibrary": "",
+                    "audiolanguage": "French",
+                    "audiotitle": "TrueHD Atmos 7.1"
+                }
+            ],
+            "subs": [
+                {
+                    "subsid": "4",
+                    "subslanguage": "English"
+                },
+                {
+                    "subsid": "5",
+                    "subslanguage": "n"
+                },
+                {
+                    "subsid": "6",
+                    "subslanguage": "e"
+                }
+            ]
+        },
+        "extra_error": null
+    },
+    {
+        "name": "truncated.xml",
+        "parse_error": "TypeError",
+        "media_info": null,
+        "extra": null,
+        "extra_error": null
+    },
+    {
+        "name": "typeerrors.xml",
+        "parse_error": "TypeError",
+        "media_info": null,
+        "extra": null,
+        "extra_error": null
+    },
+    {
+        "name": "webdl_1080p.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": {
+                "movie_name": null,
+                "file_name": "Show.Name.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP",
+                "unique_id": "0"
+            }
+        },
+        "extra": {
+            "video": [
+                {
+                    "containerformat": "MPEG-4",
+                    "overallbitrate": "8 000 kb/s",
+                    "videoduration": "00h:45m:12s",
+                    "videoformat": "AVC",
+                    "videocodec": "avc1",
+                    "videowidth": 1920,
+                    "videoheight": 1080,
+                    "videoaspect": "16:9",
+                    "videoframerate": "23.976 FPS",
+                    "videolibrary": "x264core 164"
+                }
+            ],
+            "audio": [
+                {
+                    "audioid": 1,
+                    "audioformat": "E-AC-3",
+                    "audiomode": "No (Explicit)",
+                    "audiobitratemode": "",
+                    "audiobitrate": "640 kb/s",
+                    "audiochannels": 6,
+                    "audiosamplerate": "48.0 kHz",
+                    "audiolibrary": "Dolby",
+                    "audiolanguage": "n",
+                    "audiotitle": ""
+                }
+            ],
+            "subs": []
+        },
+        "extra_error": null
+    },
+    {
+        "name": "whitespace.xml",
+        "parse_error": null,
+        "media_info": {
+            "row": {
+                "movie_name": {
+                    "unbindable": true
+                },
+                "file_name": "Tom & Jerry  S01",
+                "unique_id": "42"
+            }
+        },
+        "extra": {
+            "video": [
+                {
+                    "containerformat": "Matroska",
+                    "overallbitrate": "",
+                    "videoduration": "00h:00m:00s",
+                    "videoformat": "AB",
+                    "videocodec": "",
+                    "videowidth": "",
+                    "videoheight": "",
+                    "videoaspect": "",
+                    "videoframerate": "",
+                    "videolibrary": ""
+                }
+            ],
+            "audio": [
+                {
+                    "audioid": "7 (0x7)",
+                    "audioformat": "DTS XLL",
+                    "audiomode": "",
+                    "audiobitratemode": "",
+                    "audiobitrate": "",
+                    "audiochannels": 2,
+                    "audiosamplerate": "",
+                    "audiolibrary": "lib",
+                    "audiolanguage": "German",
+                    "audiotitle": ""
+                }
+            ],
+            "subs": [
+                {
+                    "subsid": "9",
+                    "subslanguage": "German"
+                }
+            ]
+        },
+        "extra_error": null
+    }
+]
