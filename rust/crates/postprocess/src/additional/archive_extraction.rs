@@ -38,7 +38,7 @@ pub const SEVENZIP_LISTING_MAX_ENTRIES: usize = 1000;
 /// How long the 7-Zip client gets to list an archive.
 const SEVENZIP_LISTING_TIMEOUT: Duration = Duration::from_secs(60);
 /// Laravel's process timeout around every extractor.
-const COMMAND_TIMEOUT_CAP: Duration = Duration::from_secs(1800);
+pub(crate) const COMMAND_TIMEOUT_CAP: Duration = Duration::from_secs(1800);
 
 /// The `ReleaseProcessingContext` fields archive inspection sets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -579,7 +579,7 @@ fn read_seven_zip_listing(mut command: Command) -> Option<(Vec<FileRecord>, bool
 
 /// Runs an extractor to completion or its time limit, without a shell. What it did is judged by
 /// the files it left.
-fn run(mut command: Command, limit: Duration) {
+pub(crate) fn run(mut command: Command, limit: Duration) {
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -614,14 +614,14 @@ fn stop(child: &mut Child) {
 }
 
 /// unrar reads a destination as a directory only with its trailing slash.
-fn directory_argument(directory: &Path) -> PathBuf {
+pub(crate) fn directory_argument(directory: &Path) -> PathBuf {
     let mut argument = directory.as_os_str().to_owned();
     argument.push("/");
     PathBuf::from(argument)
 }
 
 /// Laravel's `File::allFiles` without hidden files: dot files and dot directories are skipped.
-fn visible_files(directory: &Path, files: &mut Vec<PathBuf>) {
+pub(crate) fn visible_files(directory: &Path, files: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
