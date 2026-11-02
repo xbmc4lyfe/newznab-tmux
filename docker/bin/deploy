@@ -206,7 +206,8 @@ fi
 need_migrate=0
 for svc in $targets; do
     has "$known" "$svc" || { echo "Unknown service: $svc" >&2; exit 1; }
-    has "$app_users" "$svc" && need_migrate=1
+    # An explicit target runs whatever its profile, so a role in an inactive profile counts too.
+    has "$all_app_users" "$svc" && need_migrate=1
 done
 
 # Mounted config: compare with the last healthy deploy's stamp. Without a stamp (first deploy)
@@ -322,9 +323,10 @@ barrier="$project-deploy-barrier"
 barrier_label=nntmux.deploy.database
 quiesce=0
 [ ${#data_recreate[@]} -gt 0 ] && quiesce=1
-# A barrier, or a release owed, left by a failed attempt means the last schema change may be
-# unfinished, so migrations are checked (and applied) whatever the targets are.
-if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ] || [ -f "$owed" ]; then
+# A barrier, a release owed, or writers a quiesce stopped, left by a failed attempt, mean the last
+# schema change may be unfinished (an empty database takes no barrier), so migrations are checked
+# (and applied) whatever the targets are, before any of those writers comes back.
+if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ] || [ -f "$owed" ] || [ -f "$stopped_stamp" ]; then
     quiesce=1
     need_migrate=1
 fi
