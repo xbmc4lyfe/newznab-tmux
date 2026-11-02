@@ -106,7 +106,8 @@ pub fn read_headers(bytes: &[u8]) -> HeaderReading {
                         reading.files.push(InnerFile {
                             name: name.clone(),
                             size: file.uncompressed_size.unwrap_or(0),
-                            crc32: Some(file.file_crc32),
+                            // Split across volumes, this only covers the packed data in this one.
+                            crc32: (!file.split_after).then_some(file.file_crc32),
                         });
                     }
                 }
@@ -124,7 +125,9 @@ pub fn read_headers(bytes: &[u8]) -> HeaderReading {
                         reading.files.push(InnerFile {
                             name: name.clone(),
                             size: file.unpacked_size_effective.unwrap_or(0),
-                            crc32: file.data_crc32,
+                            crc32: file
+                                .data_crc32
+                                .filter(|_| file.data_crc32_scope == Some("unpacked_file_data")),
                         });
                     }
                 }
@@ -334,7 +337,7 @@ impl<'a> ArchiveProbe<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use super::*;
@@ -343,7 +346,7 @@ mod tests {
     use crate::identify::local_predb::{LocalPredb, PredbRow};
 
     /// A RAR4 volume's first bytes, with valid header checksums.
-    fn rar4(name: &str, size: u32, crc: u32, flags: u16) -> Vec<u8> {
+    pub(crate) fn rar4(name: &str, size: u32, crc: u32, flags: u16) -> Vec<u8> {
         let mut out = b"Rar!\x1a\x07\x00".to_vec();
         let mut main = vec![0x73, 0x00, 0x00, 13, 0x00];
         main.extend_from_slice(&[0; 6]);
@@ -390,9 +393,13 @@ mod tests {
     }
 
     fn rar5(name: &str, size: u64, crc: u32) -> Vec<u8> {
+        rar5_flagged(name, size, crc, 0)
+    }
+
+    fn rar5_flagged(name: &str, size: u64, crc: u32, block_flags: u8) -> Vec<u8> {
         let mut out = b"Rar!\x1a\x07\x01\x00".to_vec();
         out.extend_from_slice(&rar5_block(&[1, 0, 0]));
-        let mut file = vec![2, 0];
+        let mut file = vec![2, block_flags];
         file.extend(vint(0x04));
         file.extend(vint(size));
         file.extend(vint(0x20));
@@ -406,7 +413,7 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct Fake(HashMap<String, Vec<u8>>);
+    pub(crate) struct Fake(pub(crate) HashMap<String, Vec<u8>>);
 
     impl ArticleFetch for Fake {
         fn fetch(&self, _group: &str, message_id: &str) -> Option<Vec<u8>> {
@@ -463,6 +470,43 @@ mod tests {
                 size: 64_000_000_000,
                 crc32: Some(0x1234_5678),
             }]
+        );
+    }
+
+    #[test]
+    fn a_split_file_keeps_its_name_but_not_a_volume_only_crc() {
+        for bytes in [
+            rar4(REMUX, 2_000_000_000, 0xAABB_CCDD, 0x0002),
+            rar5_flagged(REMUX, 2_000_000_000, 0xAABB_CCDD, 0x10),
+        ] {
+            let reading = read_headers(&bytes);
+            assert_eq!(reading.files.len(), 1);
+            assert_eq!(reading.files[0].name, REMUX);
+            assert_eq!(reading.files[0].crc32, None);
+        }
+    }
+
+    #[test]
+    fn a_split_file_adds_no_crc_fact() {
+        let mut fake = Fake::default();
+        fake.0.insert(
+            "one".to_owned(),
+            rar4(
+                "7d8c650a91cf437a8dd9ecce444c1ddc.mkv",
+                3_000_000_000,
+                7,
+                0x0002,
+            ),
+        );
+        let probe = ArchiveProbe::new(&fake, 10);
+        let enriched = probe
+            .enrich(&obfuscated(vec![file("x.part01.rar", 900, "one")]))
+            .expect("headers");
+        assert!(enriched.facts.is_empty());
+        assert!(
+            probe
+                .render_stats()
+                .contains("| Gained a CRC32 for a file of 50 MB or more | 0 |")
         );
     }
 
