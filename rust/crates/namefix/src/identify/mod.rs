@@ -19,6 +19,7 @@ pub mod local_predb;
 pub mod mysql;
 pub mod name;
 pub mod nzb;
+pub mod srrdb;
 
 pub use donor::DonorIndex;
 pub use ladder::{
@@ -27,3 +28,4 @@ pub use ladder::{
 };
 pub use mysql::identify_release;
 pub use name::{Kind, ParsedName, Scope};
+pub use srrdb::{SrrdbClient, SrrdbConfig};
