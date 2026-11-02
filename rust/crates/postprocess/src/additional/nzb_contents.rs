@@ -424,6 +424,49 @@ fn file_list(document: &RawDocument) -> Vec<NzbFile> {
         .collect()
 }
 
+/// One `<file>` as `simplexml` lists it: the subject and its segments' message-IDs, in document
+/// order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DocumentFile {
+    pub subject: String,
+    pub segments: Vec<String>,
+    /// Each segment's `number` attribute, as PHP's `(int)` read it.
+    pub numbers: Vec<Option<i64>>,
+}
+
+impl DocumentFile {
+    /// The message-IDs in file order, as `parseNzbFileList` sorts them when every segment is
+    /// numbered.
+    pub fn segments_in_file_order(&self) -> Vec<String> {
+        let mut segments: Vec<(Option<i64>, &String)> =
+            self.numbers.iter().copied().zip(&self.segments).collect();
+        if segments.iter().all(|(number, _)| number.is_some()) {
+            segments.sort_by_key(|(number, _)| *number);
+        }
+        segments.into_iter().map(|(_, id)| id.clone()).collect()
+    }
+}
+
+/// The NZB's files in document order, or `None` where `simplexml_load_string` failed.
+pub fn document_files(xml: &[u8]) -> Option<Vec<DocumentFile>> {
+    let document = read_document(xml)?;
+    Some(
+        document
+            .files
+            .into_iter()
+            .map(|file| DocumentFile {
+                subject: file.subject,
+                numbers: file
+                    .segments
+                    .iter()
+                    .map(|(number, _)| number.as_deref().map(php_int))
+                    .collect(),
+                segments: file.segments.into_iter().map(|(_, id)| id).collect(),
+            })
+            .collect(),
+    )
+}
+
 /// `parseNzbFileList($nzb, ['no-file-key' => false, 'strip-count' => true])`, in `ksort`'s natural
 /// order.
 pub fn parse_file_list(xml: &[u8]) -> Vec<NzbFile> {
