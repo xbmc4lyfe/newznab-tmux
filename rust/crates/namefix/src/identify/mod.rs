@@ -12,6 +12,7 @@
 //! - [`identify_release`] is for a caller with a MariaDB pool.
 //! - [`catalog`] runs over the SQLite import, and backs the `nntmux-identify` binary.
 
+pub mod archive_probe;
 pub mod catalog;
 pub mod donor;
 pub mod ladder;

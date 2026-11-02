@@ -325,13 +325,13 @@ fn timed<T>(step: &'static str, run: impl FnOnce() -> Option<T>) -> Option<T> {
 
 /// The identity a run of names agrees on. Episodes of one show are a pack, and anything else
 /// needs a clear majority, so bonus files or a stray sample don't sink a real name.
-enum Agreement {
+pub(super) enum Agreement {
     One(String),
     Pack(String),
     Split,
 }
 
-fn agree<'a>(names: impl Iterator<Item = &'a str>) -> Option<Agreement> {
+pub(super) fn agree<'a>(names: impl Iterator<Item = &'a str>) -> Option<Agreement> {
     let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
     let mut total = 0;
     for name in names {
@@ -803,6 +803,8 @@ mod tests {
                 .map(|(subject, bytes)| NzbFile {
                     subject: (*subject).to_owned(),
                     bytes: *bytes,
+                    group: None,
+                    first_message_id: None,
                 })
                 .collect(),
             payload_bytes: subjects.iter().map(|(_, bytes)| bytes).sum(),
