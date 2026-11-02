@@ -226,6 +226,8 @@ async fn erasure_anonymizes_retained_records_and_deletes_the_rest() -> Result<()
     // A permanent erasure removes the row and leaves only anonymous records behind.
     let gone = user(&db, "jack").await?;
     seed(&db, gone, "jack").await?;
+    // A live account can't be purged.
+    assert!(erasure::erase(&ctx, gone, true, now).await.is_err());
     let account = users::require(&db.pool, "jack").await?;
     assert!(users::delete(&ctx, &account, now).await?);
     let erased = erasure::erase(&ctx, gone, true, now).await?;
@@ -238,6 +240,7 @@ async fn erasure_anonymizes_retained_records_and_deletes_the_rest() -> Result<()
         scalar(
             &db,
             "SELECT COUNT(*) FROM user_activities WHERE username = 'jack' OR \
+             description LIKE '%jack%' OR \
              (user_id = ? AND username <> CONCAT('deleted_user_', user_id))",
             gone
         )

@@ -135,7 +135,8 @@ pub struct Erased {
 }
 
 /// `eraseForAccountDeletion`: erases the account's data in one transaction, then soft-deletes
-/// it, or removes it for good when `permanent` (`forceDeleteWithErasure`). Changes made here
+/// it, or removes it for good when `permanent` (`forceDeleteWithErasure`, which only takes a
+/// soft-deleted account). Changes made here
 /// record "System" as the actor, as an artisan run did.
 pub async fn erase(ctx: &Ctx, id: u32, permanent: bool, now: NaiveDateTime) -> Result<Erased> {
     let mut tx = ctx.db.begin().await?;
@@ -148,6 +149,12 @@ pub async fn erase(ctx: &Ctx, id: u32, permanent: bool, now: NaiveDateTime) -> R
         .fetch_optional(&mut *tx)
         .await?
         .with_context(|| format!("user {id} doesn't exist"))?;
+    // A permanent delete only takes a soft-deleted account. Checked under the lock, so an
+    // account restored since the caller looked isn't destroyed.
+    anyhow::ensure!(
+        !permanent || deleted_at.is_some(),
+        "{username} isn't deleted; delete it first"
+    );
     let schema = Schema::load(&mut tx).await?;
     // The PHP matched invitations, payments and activity rows on the address and name too.
     // Another account (a new live one, since a deleted account's identifiers are free) may hold
@@ -301,12 +308,20 @@ pub async fn erase(ctx: &Ctx, id: u32, permanent: bool, now: NaiveDateTime) -> R
         .fetch_all(&mut *tx)
         .await?;
         for (row, metadata) in rows {
-            sqlx::query("UPDATE user_activities SET username = ?, metadata = ? WHERE id = ?")
-                .bind(&anonymous_username)
-                .bind(sanitize(metadata.as_deref()))
-                .bind(row)
-                .execute(&mut *tx)
-                .await?;
+            // Descriptions such as "User deleted: <name>" name the account too.
+            sqlx::query(
+                "UPDATE user_activities SET username = ?, metadata = ?, \
+                 description = REPLACE(REPLACE(description, ?, ?), ?, ?) WHERE id = ?",
+            )
+            .bind(&anonymous_username)
+            .bind(sanitize(metadata.as_deref()))
+            .bind(&email)
+            .bind(&anonymous_email)
+            .bind(&username)
+            .bind(&anonymous_username)
+            .bind(row)
+            .execute(&mut *tx)
+            .await?;
         }
     }
     if schema.has("gdpr_audit_logs", "metadata") {
