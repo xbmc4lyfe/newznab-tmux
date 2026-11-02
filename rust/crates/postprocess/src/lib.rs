@@ -224,7 +224,7 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 eprintln!("{}", runner::MULTIPROCESS_HELP);
                 bail!("invalid type: {kind}");
             };
-            runner::multiprocess(&ctx, kind, renamed == "true").await
+            runner::multiprocess(&ctx, kind, renamed == "true", &Shutdown::default()).await
         }
         Command::Update { kind, echo: _ } => {
             if kind == "all" {

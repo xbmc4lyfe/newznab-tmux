@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use nntmux_namefix::update::ReleaseSearch;
-use nntmux_runtime::Ctx;
+use nntmux_runtime::{Ctx, Shutdown};
 use nntmux_search::SearchClient;
 use sqlx::{AssertSqlSafe, MySqlPool};
 
@@ -161,7 +161,7 @@ pub async fn guid(ctx: &Ctx, options: GuidOptions) -> Result<()> {
     let guid = options.guid.as_str();
     let renamed = || tv_pipeline::renamed_argument(options.renamed.as_deref());
     match options.kind.as_str() {
-        "additional" => additional_bucket(ctx, &options).await,
+        "additional" => additional_bucket(ctx, &options, &Shutdown::default()).await,
         "nfo" => {
             nfo_service(ctx)
                 .await?
@@ -211,7 +211,12 @@ pub(crate) async fn nfo_service(ctx: &Ctx) -> Result<nfo::NfoService> {
 
 /// `processAdditional`: claim batches of the bucket until none is left, the batch limit or the
 /// child time limit.
-pub(crate) async fn additional_bucket(ctx: &Ctx, options: &GuidOptions) -> Result<()> {
+/// A requested `stop` ends the loop between batches; a batch already claimed finishes.
+pub(crate) async fn additional_bucket(
+    ctx: &Ctx,
+    options: &GuidOptions,
+    stop: &Shutdown,
+) -> Result<()> {
     let mut services = services(ctx).await?;
     let max_batches = if options.worker {
         options.max_batches.max(1)
@@ -224,7 +229,7 @@ pub(crate) async fn additional_bucket(ctx: &Ctx, options: &GuidOptions) -> Resul
         + std::time::Duration::from_secs(u64::try_from((child_time - 30).max(1)).unwrap_or(1));
     let mut excluded: Vec<i64> = Vec::new();
     let mut batch = 0;
-    while batch < max_batches && Instant::now() < deadline {
+    while batch < max_batches && Instant::now() < deadline && !stop.requested() {
         let result =
             orchestrator::start(&mut services, &options.guid, 0, &worker_token, &excluded).await?;
         batch += 1;

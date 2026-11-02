@@ -122,12 +122,19 @@ pub const UPDATE_HELP: &str = "Available types:
   additional  - Processes previews/mediainfo/etc...
   amazon      - Processes books, music, console, and games";
 
-/// `ForkingService::process*`: one kind over every bucket with work, in parallel.
-pub async fn multiprocess(ctx: &Ctx, kind: Kind, renamed_only: bool) -> Result<()> {
+/// `ForkingService::process*`: one kind over every bucket with work, in parallel. Once `stop` is
+/// requested no further bucket or additional-processing batch starts; work already claimed
+/// finishes.
+pub async fn multiprocess(
+    ctx: &Ctx,
+    kind: Kind,
+    renamed_only: bool,
+    stop: &Shutdown,
+) -> Result<()> {
     let started = Instant::now();
     let outcome = match kind {
-        Kind::Additional => additional(ctx).await,
-        Kind::Nfo => nfo(ctx).await,
+        Kind::Additional => additional(ctx, stop).await,
+        Kind::Nfo => nfo(ctx, stop).await,
         Kind::Movies => nntmux_metadata::process_movie_buckets(ctx, renamed_only).await,
         Kind::Tv => {
             let renamed = if renamed_only {
@@ -210,7 +217,7 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
                     break;
                 }
             };
-            if let Err(failure) = multiprocess(&ctx, kind, false).await {
+            if let Err(failure) = multiprocess(&ctx, kind, false, &stop).await {
                 eprintln!("{} failed: {failure:#}", kind.task_name());
                 failed = Some(failure);
             }
@@ -225,7 +232,7 @@ pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
 }
 
 /// `PostProcessRunner::processAdditional`.
-async fn additional(ctx: &Ctx) -> Result<()> {
+async fn additional(ctx: &Ctx, stop: &Shutdown) -> Result<()> {
     let config = Config::load(&ctx.db).await?;
     let counts = candidates::available_bucket_counts(&ctx.db, &Scope::new(&config)).await?;
     let threads = config.settings.post_threads;
@@ -236,8 +243,9 @@ async fn additional(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     let ctx = ctx.clone();
-    run_buckets(queue, threads, move |bucket| {
-        let ctx = ctx.clone();
+    let worker_stop = stop.clone();
+    run_buckets(queue, threads, stop, move |bucket| {
+        let (ctx, stop) = (ctx.clone(), worker_stop.clone());
         async move {
             commands::additional_bucket(
                 &ctx,
@@ -249,6 +257,7 @@ async fn additional(ctx: &Ctx) -> Result<()> {
                     max_batches: ADDITIONAL_WORKER_MAX_BATCHES,
                     profile: false,
                 },
+                &stop,
             )
             .await
         }
@@ -257,14 +266,14 @@ async fn additional(ctx: &Ctx) -> Result<()> {
 }
 
 /// `PostProcessRunner::processNfo`.
-async fn nfo(ctx: &Ctx) -> Result<()> {
+async fn nfo(ctx: &Ctx, stop: &Shutdown) -> Result<()> {
     let config = Config::load(&ctx.db).await?;
     if !config.settings.lookup_nfo {
         return Ok(());
     }
     let buckets = commands::nfo_service(ctx).await?.buckets().await?;
     let ctx = ctx.clone();
-    run_buckets(buckets, config.settings.nfo_threads, move |bucket| {
+    run_buckets(buckets, config.settings.nfo_threads, stop, move |bucket| {
         let ctx = ctx.clone();
         async move {
             commands::nfo_service(&ctx)
@@ -347,8 +356,14 @@ fn prepare_temp_buckets(config: &Config, chars: &[String]) -> Result<()> {
 }
 
 /// Runs `job` for each bucket, at most `threads` at a time, and waits for all of them. A failed
-/// bucket doesn't stop the others; the pass fails afterwards, naming each failure.
-async fn run_buckets<F, Fut>(buckets: Vec<String>, threads: i64, job: F) -> Result<()>
+/// bucket doesn't stop the others; the pass fails afterwards, naming each failure. Once `stop` is
+/// requested, buckets not yet started are left for the next run.
+async fn run_buckets<F, Fut>(
+    buckets: Vec<String>,
+    threads: i64,
+    stop: &Shutdown,
+    job: F,
+) -> Result<()>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
@@ -360,6 +375,9 @@ where
     let mut running = JoinSet::new();
     for bucket in buckets {
         let permit = Arc::clone(&permits).acquire_owned().await?;
+        if stop.requested() {
+            break;
+        }
         let work = job(bucket.clone());
         running.spawn(async move {
             let outcome = work.await;
@@ -423,7 +441,7 @@ mod tests {
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let buckets = ["a", "b", "c", "d", "e"].map(str::to_owned).to_vec();
-        let outcome = run_buckets(buckets, 2, |bucket| {
+        let outcome = run_buckets(buckets, 2, &Shutdown::default(), |bucket| {
             let (running, peak) = (Arc::clone(&running), Arc::clone(&peak));
             async move {
                 let now = running.fetch_add(1, Ordering::SeqCst) + 1;
@@ -440,6 +458,26 @@ mod tests {
         assert_eq!(peak.load(Ordering::SeqCst), 2);
         let message = format!("{:#}", outcome.unwrap_err());
         assert!(message.contains("bucket c: no news server"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn no_bucket_starts_after_a_stop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let started = Arc::new(AtomicUsize::new(0));
+        let stop = Shutdown::default();
+        let buckets = ["a", "b", "c", "d"].map(str::to_owned).to_vec();
+        let outcome = run_buckets(buckets, 1, &stop, |_| {
+            let (started, stop) = (Arc::clone(&started), stop.clone());
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                // A stop arrives while the first bucket runs; it still finishes.
+                stop.request();
+                Ok(())
+            }
+        })
+        .await;
+        assert!(outcome.is_ok());
+        assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
     #[test]
