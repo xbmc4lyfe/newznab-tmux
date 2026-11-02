@@ -2,7 +2,7 @@
 //! a full XML parse here because one run decodes hundreds of gigabytes of NZB.
 
 /// Enough of a file's start to reach a stream through its archive layers.
-const MAX_HEAD_IDS: usize = 8;
+const MAX_HEAD_IDS: usize = 32;
 
 /// One `<file>` of an NZB.
 #[derive(Clone, Debug, PartialEq, Eq)]
