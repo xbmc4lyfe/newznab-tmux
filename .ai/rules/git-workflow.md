@@ -5,12 +5,12 @@ paths:
 
 # Git workflow and review gates
 
-A human prompt or goal authorizes agents to commit task changes, push feature branches, open pull requests, and squash-merge reviewed feature pull requests into `rust-native`, the default branch, in `xbmc4lyfe/newznab-tmux`. `master` is kept only for the PHP history (see [rust/WORKSTREAMS.md](../../rust/WORKSTREAMS.md)). Stay within the task. Deployment, production changes, dependency changes, force pushes, and changes to repository protections need separate authorization.
+A human prompt or goal authorizes agents to commit task changes, push feature branches, open pull requests, and squash-merge reviewed feature pull requests into `main`, the default branch, in `xbmc4lyfe/newznab-tmux`. `master` is kept only for the PHP history (see [rust/WORKSTREAMS.md](../../rust/WORKSTREAMS.md)). Stay within the task. Deployment, production changes, dependency changes, force pushes, and changes to repository protections need separate authorization.
 
 ## Prepare the branch
 
-- Start each new task in an isolated Git worktree on a new `codex/` branch whose name is absent from the remote. Reuse that task's worktree while continuing it; an explicitly requested existing PR keeps its branch. Workstream branches are `codex/rn-<workstream>-<topic>`. Never develop or push directly on `rust-native` or `master`.
-- Verify the remote points to `xbmc4lyfe/newznab-tmux`, fetch `rust-native` at task start, and create the worktree/branch from that fetched commit. `NNTmux/newznab-tmux:master` is a separate upstream and is not the feature-branch base.
+- Start each new task in an isolated Git worktree on a new `codex/` branch whose name is absent from the remote. Reuse that task's worktree while continuing it; an explicitly requested existing PR keeps its branch. Workstream branches are `codex/rn-<workstream>-<topic>`. Never develop or push directly on `main` or `master`.
+- Verify the remote points to `xbmc4lyfe/newznab-tmux`, fetch `main` at task start, and create the worktree/branch from that fetched commit. `NNTmux/newznab-tmux:master` is a separate upstream and is not the feature-branch base.
 - During active work, fetch and integrate newer base-branch commits every 30–60 minutes. Refresh when resuming a session if the last fetch is older than 30 minutes. Preserve unrelated and uncommitted work; never reset or discard it to synchronize. Resolve conflicts and rerun affected checks.
 - Fetch and integrate the fork's current base branch immediately before local review and PR creation, and recheck it before merging. An advanced destination requires updating the branch, affected verification, and fresh local and PR reviews.
 - After each PR merge, fetch the base branch again before creating the next task's worktree and new branch. Start from the newly fetched commit, not the previous task branch or a stale local copy.
@@ -30,14 +30,14 @@ For a Codex command-line review, use the installed command's supported flags. Fo
 ```bash
 codex exec --model gpt-6.1-sol \
   -c model_reasoning_effort=high -c service_tier=default \
-  --sandbox read-only --ephemeral review --base origin/rust-native
+  --sandbox read-only --ephemeral review --base origin/main
 ```
 
 Record the reviewer (Antigravity or Codex), model, effort, speed (when applicable), base commit hash, head commit hash, findings, and final verdict. Read the result. A successful process exit doesn't prove a clean review.
 
 ## Review the PR before merging
 
-1. Open the PR against `xbmc4lyfe/newznab-tmux:rust-native` and either obtain an independent Antigravity review of the PR or comment `@codex review`.
+1. Open the PR against `xbmc4lyfe/newznab-tmux:main` and either obtain an independent Antigravity review of the PR or comment `@codex review`.
 2. Only fix P0 and P1 findings; P2, P3, P4, and lower-priority findings can be ignored. For P0 and P1 findings, check each finding against the code, reproduce bugs when practical, fix valid findings, run relevant checks, reply in the finding's thread with the fix and evidence (or explain with evidence why the finding doesn't apply), and resolve the thread after replying.
 3. Obtain another review from Antigravity or request `@codex review` again after P0/P1 fixes or replies that explain why a P0/P1 finding doesn't apply. Repeat until the reviewer gives an explicit approval or go-ahead for the current head with no unresolved P0 or P1 findings.
 4. Wait for required checks to pass. Verify that the remote PR head and destination base still match the reviewed revisions, then squash-merge the feature PR. If the destination base has changed, update the branch, rerun relevant checks, and repeat both reviews before merging.
@@ -56,4 +56,4 @@ Use this fallback when the GitHub Codex app reports that review credits have run
 
 ## Upstream synchronization
 
-Upstream is `NNTmux/newznab-tmux:master`. A separate request to synchronize upstream authorizes that workflow. Preserve upstream history with a merge commit. Feature work in this fork squash-merges into `rust-native`. Never merge anything into `master`: the PHP production runtime deploys from it until the cutover, which switches that runtime to `rust-native` rather than merging (see [rust/CUTOVER.md](../../rust/CUTOVER.md)). Apply the same review and verification gates.
+Upstream is `NNTmux/newznab-tmux:master`. A separate request to synchronize upstream authorizes that workflow. Preserve upstream history with a merge commit. Feature work in this fork squash-merges into `main`. Never merge anything into `master`: the PHP production runtime deploys from it until the cutover, which switches that runtime to `main` rather than merging (see [rust/CUTOVER.md](../../rust/CUTOVER.md)). Apply the same review and verification gates.

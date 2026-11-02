@@ -2,7 +2,7 @@
 
 Use macOS or Linux for development, builds, tests, CI, runtime, and deployment. Read [AGENTS.md](AGENTS.md), [.ai/rules/index.md](.ai/rules/index.md) and [rust/WORKSTREAMS.md](rust/WORKSTREAMS.md) before editing.
 
-Create a feature branch from `xbmc4lyfe/newznab-tmux` and target `rust-native`, the default branch (`master` holds only the PHP history). Follow the [Git workflow](.ai/rules/git-workflow.md): obtain a clean independent local review before opening the PR, then obtain review approval for its final head and pass required checks before a squash merge.
+Create a feature branch from `xbmc4lyfe/newznab-tmux` and target `main`, the default branch (`master` holds only the PHP history). Follow the [Git workflow](.ai/rules/git-workflow.md): obtain a clean independent local review before opening the PR, then obtain review approval for its final head and pass required checks before a squash merge.
 
 Before you open a PR, run:
 

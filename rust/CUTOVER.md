@@ -1,13 +1,13 @@
-# Cutover: production moves to rust-native
+# Cutover: production moves to main
 
-`ws-deploy` keeps this file. `rust-native` is the default branch and `master` holds only the PHP
-history. Cutover means switching the production runtime checkout from `master` to `rust-native`,
+`ws-deploy` keeps this file. `main` is the default branch and `master` holds only the PHP
+history. Cutover means switching the production runtime checkout from `master` to `main`,
 after which the deployment owner rolls the Rust stack out against the production database. Nobody starts that
 without xbmc4lyfe's explicit go-ahead. The live MariaDB is the only copy of the data.
 
 ## 1. Gates before anyone schedules the cutover
 
-Every gate is checked on the `rust-native` commit that will be deployed. `just deploy` fast-forwards to the tip of `origin/rust-native`, so recheck the gates against the commit `just deploy-plan` reports.
+Every gate is checked on the `main` commit that will be deployed. `just deploy` fast-forwards to the tip of `origin/main`, so recheck the gates against the commit `just deploy-plan` reports.
 
 | Gate | How to check | Owner |
 | --- | --- | --- |
@@ -36,7 +36,7 @@ These steps are listed in order. Each one waits for xbmc4lyfe's go-ahead.
 
 1. **Freeze the PHP side.** Drain the Horizon fingerprint queue with `php artisan releases:fingerprint-transfer`. If `releases_rt` predates the media fields, run `php artisan nntmux:update-releases-index --add-fields --update-media-ids`. Then drain and stop `horizon`, `scheduler` and `indexer` through the current guarded tooling.
 2. **Back up the database**, as section 1 requires.
-3. **Switch the runtime checkout.** First stop every poll, cron or redeploy loop on the runtime host, and hold deploys until xbmc4lyfe gives the go-ahead for step 5. Then, in the persistent runtime checkout, `git fetch origin rust-native` and `git checkout rust-native`, and set `DEPLOY_GIT_BRANCH=rust-native` in `docker/.env` (the default for the Rust deploy). Note the `master` commit the runtime was on, for rollback.
+3. **Switch the runtime checkout.** First stop every poll, cron or redeploy loop on the runtime host, and hold deploys until xbmc4lyfe gives the go-ahead for step 5. Then, in the persistent runtime checkout, `git fetch origin main` and `git checkout main`, and set `DEPLOY_GIT_BRANCH=main` in `docker/.env` (the default for the Rust deploy). Note the `master` commit the runtime was on, for rollback.
 4. **Prepare the runtime.** In the persistent runtime's `docker/.env`, add `APP_IMAGE=nntmux/rust:local`, `GRAFANA_ADMIN_PASSWORD` and `DEPLOY_HEALTH_TIMEOUT` (`docker/bin/generate-env` fills in missing values without overwriting the ones already set). Keep `COMPOSE_FILE` with the external-database override, plus `DEPLOY_LOCK_DIR`, `DEPLOY_LOG` and `DEPLOY_BY`. `config/app.env` keeps its `DB_*`, `REDIS_*`, `MANTICORESEARCH_*`, `NNTP_*` and `APP_KEY` values, which the Rust config reads under the same names. Then stop and remove the drained PHP containers. Compose no longer knows those services, so use their container names: `docker ps --filter label=com.docker.compose.service=horizon` (and `scheduler`, `indexer`) lists them, then `docker stop --time 1920 <names> && docker rm <names>`. `just deploy` refuses to run while any of them is still running. Stop the remote verification workers too: they still run PHP. Bring them back on the Rust image (`docker/worker`) after step 7; from then on the deploy's verification barrier keeps them out during migrations.
 5. **Plan, then deploy.** With `DEPLOY_BY` set, run `just deploy-plan`. Expect it to refuse because the `redis` and `manticore` containers were created from the PHP-era Compose file, so their definitions differ. With every writer stopped (steps 1 and 4), run `just deploy-plan DEPLOY_RECREATE_DATA=1` and check that "Would recreate data services first" lists only `redis` and `manticore`. Production's MariaDB is external, so `mariadb` must not appear; stop if it does. Then run `just deploy DEPLOY_RECREATE_DATA=1`. Watch `migrate`'s log for "Laravel baseline already present, recording it" followed by migration 3.
 6. **Rebuild derived state**, once each:
