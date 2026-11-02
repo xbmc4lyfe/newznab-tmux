@@ -500,22 +500,41 @@ pub fn run_with_probe(
         donors: &loaded.donors,
         hooks,
     };
+    let offline = Context {
+        predb: &loaded.predb,
+        donors: &loaded.donors,
+        hooks: Hooks::default(),
+    };
     let mut targets = loaded.targets;
     if options.shuffle {
         targets.sort_by_key(|target| sample_order(target.id));
     }
     let target_count = targets.len();
     let answers = for_each_target(&nzbs_path, options.threads, targets, |target| {
-        let (mut outcome, flags) = identify(target, &context);
-        if let Some(probe) = probe
-            && !matches!(outcome, Outcome::Identified(_))
-            && flags.obfuscated_only()
-            && let Some(enriched) = probe.enrich(target)
-        {
-            let (second, _) = identify(&enriched, &context);
-            probe.record_outcome(&second);
-            if matches!(second, Outcome::Identified(_)) {
-                outcome = second;
+        let Some(probe) = probe else {
+            let (outcome, flags) = identify(target, &context);
+            return Answer {
+                outcome,
+                flags,
+                payload_bytes: target.nzb.as_ref().map(|nzb| nzb.payload_bytes),
+            };
+        };
+        // Hooks wait for the archive's evidence, so a release asks srrDB once, knowing the most.
+        let (mut outcome, flags) = identify(target, &offline);
+        if !matches!(outcome, Outcome::Identified(_)) {
+            let enriched = flags
+                .obfuscated_only()
+                .then(|| probe.enrich(target))
+                .flatten();
+            match enriched {
+                Some(enriched) => {
+                    let (second, _) = identify(&enriched, &context);
+                    probe.record_outcome(&second);
+                    if matches!(second, Outcome::Identified(_)) {
+                        outcome = second;
+                    }
+                }
+                None => outcome = identify(target, &context).0,
             }
         }
         Answer {
@@ -1097,6 +1116,57 @@ mod tests {
             )
             .expect("count");
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn with_a_probe_srrdb_is_asked_once_and_after_the_archive_is_read() {
+        use std::sync::Mutex;
+
+        use crate::identify::archive_probe::tests::{Fake, rar4};
+        use crate::identify::ladder::{SrrdbLookup, SrrdbQuery};
+
+        #[derive(Default)]
+        struct Recording(Mutex<Vec<Vec<String>>>);
+        impl SrrdbLookup for Recording {
+            fn lookup(&self, query: &SrrdbQuery) -> Result<Option<String>> {
+                self.0.lock().expect("lock").push(query.crc32s.clone());
+                Ok(None)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        fixture(dir.path());
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+        gzip.write_all(br#"<file subject="&quot;hrdvTRGDFSztvQwEr.part01.rar&quot; yEnc"><groups><group>g</group></groups><segments><segment bytes="9" number="1">id4</segment></segments></file>"#)
+            .expect("gzip");
+        Connection::open(dir.path().join("nzbs.db"))
+            .expect("nzbs")
+            .execute(
+                "INSERT INTO nzbs VALUES (4, 'gzip', ?1)",
+                [gzip.finish().expect("gzip")],
+            )
+            .expect("nzb");
+        let mut fake = Fake::default();
+        fake.0.insert(
+            "id4".to_owned(),
+            rar4(
+                "7d8c650a91cf437a8dd9ecce444c1ddc.mkv",
+                3_000_000_000,
+                0xAABB_CCDD,
+                0,
+            ),
+        );
+        let probe = ArchiveProbe::new(&fake, 10);
+        let srrdb = Recording::default();
+        let hooks = Hooks {
+            srrdb: &srrdb,
+            ..Hooks::default()
+        };
+        run_with_probe(&options(dir.path(), false), hooks, Some(&probe)).expect("run");
+        assert_eq!(
+            *srrdb.0.lock().expect("lock"),
+            [vec!["aabbccdd:3000000000".to_owned()]]
+        );
     }
 
     #[test]

@@ -236,6 +236,16 @@ impl SrrdbClient {
         if asked > 0
             && let Some(name) = agreed
         {
+            // The files not searched for still have to be in that release, which one more
+            // request can check whatever their number.
+            let unchecked = &crcs[asked..];
+            if !unchecked.is_empty() {
+                let theirs = self.crcs_of(&name)?;
+                if !unchecked.iter().all(|crc| theirs.contains(crc)) {
+                    stats.crc_disagree.fetch_add(1, Ordering::Relaxed);
+                    return Ok(None);
+                }
+            }
             stats.crc_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(name));
         }
@@ -300,6 +310,15 @@ impl SrrdbClient {
 
 impl SrrdbLookup for SrrdbClient {
     fn lookup(&self, query: &SrrdbQuery) -> Result<Option<String>> {
+        // Nothing to ask spends no share of the sample.
+        if query.crc32s.is_empty() && query.file_names.is_empty() {
+            if !query.size_candidates.is_empty() {
+                self.stats
+                    .candidates_uncheckable
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(None);
+        }
         let turn = self.stats.releases.fetch_add(1, Ordering::Relaxed);
         if self.config.budget.is_some_and(|budget| turn >= budget) {
             self.stats.releases.fetch_sub(1, Ordering::Relaxed);
@@ -451,6 +470,54 @@ mod tests {
         let (answer, client) =
             ask(setup.config.clone(), ask_about(&["00000011", "00000014"])).await;
         assert_eq!(answer.expect("answer"), None);
+        finish(client).await;
+    }
+
+    #[tokio::test]
+    async fn files_past_the_request_limit_are_checked_against_the_release() {
+        let setup = setup().await;
+        for crc in ["00000031", "00000032", "00000033"] {
+            serve(
+                &setup.server,
+                &format!("/v1/search/archive-crc:{crc}"),
+                results(&[RELEASE]),
+            )
+            .await;
+        }
+        serve(
+            &setup.server,
+            &format!("/v1/details/{RELEASE}"),
+            json!({"archived-files": [
+                {"crc": "00000031"}, {"crc": "00000032"}, {"crc": "00000033"}, {"crc": "00000034"}
+            ]}),
+        )
+        .await;
+        let query = |last: &str| SrrdbQuery {
+            crc32s: ["00000031", "00000032", "00000033", last]
+                .iter()
+                .map(|crc| format!("{crc}:1"))
+                .collect(),
+            ..SrrdbQuery::default()
+        };
+        let (answer, client) = ask(setup.config.clone(), query("00000034")).await;
+        assert_eq!(answer.expect("answer").as_deref(), Some(RELEASE));
+        finish(client).await;
+
+        // A fourth file from another release sinks it.
+        let (answer, client) = ask(setup.config.clone(), query("00000035")).await;
+        assert_eq!(answer.expect("answer"), None);
+        assert_eq!(client.stats.crc_disagree.load(Ordering::Relaxed), 1);
+        finish(client).await;
+    }
+
+    #[tokio::test]
+    async fn an_empty_query_spends_no_budget() {
+        let setup = setup().await;
+        let mut config = setup.config.clone();
+        config.budget = Some(1);
+        let (answer, client) = ask(config, SrrdbQuery::default()).await;
+        assert_eq!(answer.expect("answer"), None);
+        assert_eq!(client.stats.releases.load(Ordering::Relaxed), 0);
         finish(client).await;
     }
 
