@@ -1,19 +1,18 @@
-## Tmux Processing Engine
+## Worker roles
 
-Multi-pane terminal orchestrator at `app/Services/Tmux/`. Components: `TmuxSessionManager`, `TmuxLayoutBuilder`, `TmuxPaneManager`, `TmuxTaskRunner`, `TmuxMonitorService`.
+There is no tmux. Each role is its own Compose service running `nntmux-worker <role>`, and `docker/docker-compose.yml` is the layout. Roles that aren't ported yet sit in the `pending` profile.
 
-**Sequential Modes** (`Settings::settingValue('sequential')`):
-- Mode 0: Full (3 windows, parallel panes)
-- Mode 1: Basic (reduced)
-- Mode 2: Stripped (minimal)
+- `supervisor` runs the scheduled tasks (`rust/crates/supervisor/src/schedule.rs`). It takes a database lease, so a second copy waits instead of running tasks twice.
+- `ingest` and `backfill` fetch headers (`rust/crates/ingest`). `releases` assembles releases and NZBs. `fixnames` and `predb` fix names. `postprocess` does NFO, PAR2, archives and media. `fingerprint` and `verify` collect and check release fingerprints. `search-sync` keeps Manticore current.
+- Roles claim work, process it, commit, and loop (`rust/crates/runtime`). Per-role flags come from `RoleArgs`.
 
-**Commands**: `tmux:start`, `tmux:stop`, `tmux:attach`, `tmux:monitor`, `tmux:health-check`
+### Drain and shutdown
 
-**Config**: `config/tmux.php` + database `settings` table
+- On SIGTERM a role stops claiming work, finishes its in-flight units and exits. `stop_grace_period` is 30 s for `web`, 120 s by default, and 1920 s for `fingerprint`, `verify` and `postprocess`, whose units fetch from NNTP and can run for many minutes.
+- A rollout is `docker compose up -d --wait` with a new image, so this drain is the whole safety mechanism. There is no separate drain command. Never force-kill a worker to speed a rollout.
 
-**Post-process panes** (window 2: panes 2.0–2.3) run `php artisan multiprocessing:postprocess <type>`, which fans out work as multiple `postprocess:guid <type> <char>` child processes via `App\Services\Runners\PostProcessRunner`. Types: `add`/`nfo` (pane 2.0), `tv`/`ani` (2.1), `ama` (2.2 — books+music+console+games), `mov` (2.3). Per-type aliases: `boo`, `mus`, `con`, `gam`.
+### Tuning
 
-- **Live tmux output**: set `STREAM_FORK_OUTPUT=true` in `.env` (`config('nntmux.stream_fork_output')`). When false (default), child output is buffered per batch and the pane may look idle until a batch completes.
-- **Parallelism settings** (all default to `1` in `database/seeders/SettingsTableSeeder.php`; raise via Admin UI or DB): `postthreads` (additional), `nfothreads` (NFO when `post=3`), `postthreadsnon` (TV/anime/movies), `postthreadsamazon` (books/music/console/games and `ama` fan-out). Raising `nfothreads` opens that many parallel NNTP sessions for NFO children.
-- **Batch sizing**: up to 16 distinct first-character GUID buckets per type per cycle (`LIMIT 16` in `PostProcessRunner`); each bucket processes its slice sequentially inside `postprocess:guid`. Additional processing also respects `maxaddprocessed` (default 25) per bucket.
-- **Direct CLI**: `update:postprocess <type>` remains available for single-process runs outside tmux; tmux panes use the multiprocessing command only.
+- Behavior settings live in the database `settings` table, as before. Seed values are in `docker/config/seed/tuning.sql`.
+- Resource limits (`WORKER_MEMORY`, `POSTPROCESS_MEMORY`) are in `docker/.env`. NNTP and verification settings are in `docker/config/app.env`.
+- Operator commands that used to be `php artisan` run through `nntmux-ctl`. Locally, `cargo run -p nntmux-ctl -- <command>` from `rust/`. On the stack, `just docker ctl cmd="<command>"`.

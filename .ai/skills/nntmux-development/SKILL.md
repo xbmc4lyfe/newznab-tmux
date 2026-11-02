@@ -1,18 +1,18 @@
 ---
 name: nntmux-development
-description: Apply NNTmux-specific contracts when changing application code, tests, tmux processing, search, monitoring integrations, or authentication.
+description: Apply NNTmux-specific contracts when changing application code, tests, worker roles, search, monitoring integrations, or authentication.
 ---
 
 # NNTmux development
 
-Read repository `AGENTS.md` and matching `.ai/rules` first. Paths in code spans in these references are relative to the repository root.
+Read repository `AGENTS.md`, `rust/WORKSTREAMS.md` and matching `.ai/rules` first. Paths in code spans in these references are relative to the repository root.
 
 Load the reference for the area being changed; load more than one when the task spans areas:
 
-- [Architecture](references/architecture.md): service/pipeline layout, status probes, Grafana integration, passkeys, and key directories. Read the relevant subsection when working on these integrations.
-- [Processing](references/processing.md): tmux modes, pane assignments, child output, batch limits, and parallelism settings.
-- [Testing](references/testing.md): PHPUnit conventions, SQLite bootstrap settings, shared composer state, and existing harnesses.
-- [Conventions](references/conventions.md): model/config contracts, API/RSS routing, signed Manticore columns, and admin content ordering.
-- [Frontend](references/frontend.md): CSP-safe Alpine loading, Blade/Livewire boundaries, and Vite entry points.
+- [Architecture](references/architecture.md): crates, binaries, roles, data flow, and the metrics and Grafana setup.
+- [Processing](references/processing.md): worker roles, the supervisor, drain and shutdown, and where tuning lives.
+- [Testing](references/testing.md): `just test`, the shared test services, `TestDb`, fixtures and the ledger.
+- [Conventions](references/conventions.md): configuration, the database schema, API routes, signed Manticore columns, and `nntmux-ctl`.
+- [Frontend](references/frontend.md): the Vite build, CSP-safe Alpine, and the askama templates.
 
 These references describe project contracts; operational commands and tuning examples do not authorize production changes. Use the production operations skill for authorized runtime work and the performance validation skill when making ingestion/storage performance claims.
