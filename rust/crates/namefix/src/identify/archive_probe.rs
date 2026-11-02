@@ -181,7 +181,7 @@ fn volume_rank(name: &str) -> u8 {
 }
 
 /// The file's place in its post, from a `[3/10]` before the yEnc trailer.
-fn post_position(subject: &str) -> Option<u32> {
+pub(super) fn post_position(subject: &str) -> Option<u32> {
     static POSITION: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"[\[\(]\s*(\d+)\s*/\s*\d+\s*[\]\)]").expect("static pattern"));
     let before = subject.split("yEnc").next().unwrap_or(subject);

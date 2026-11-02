@@ -7,17 +7,18 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::Result;
 use nntmux_formats::archive::FormatHeader;
 use nntmux_mediaprobe::mp4::{self, Mp4Probe};
 use nntmux_mediaprobe::summary::MediaSummary;
 use nntmux_mediaprobe::{Limits, Probe, probe_prefix};
+use regex::Regex;
 use rusqlite::Connection;
 
-use super::archive_probe::{ArticleFetch, last_volume, volumes_to_try};
+use super::archive_probe::{ArticleFetch, last_volume, post_position, volumes_to_try};
 use super::catalog::{Options, for_each_target, load, open_read_only, text};
 use super::ladder::{Context, Evidence, Hooks, Outcome, identify};
 use super::local_predb::LocalPredb;
@@ -610,7 +611,12 @@ impl Sampler<'_> {
                 if let Some(found) = names.iter().find_map(|inner| scene_name(inner, self.predb)) {
                     row.inner_name = Some(found);
                 }
-                row.gained_inner.clone_from(&names);
+                // Keep what earlier files gave: a later file that says nothing can't unsay it.
+                for found in names {
+                    if !row.gained_inner.contains(&found) {
+                        row.gained_inner.push(found);
+                    }
+                }
                 row.layers = layers;
                 if current == End::NeedMore {
                     continue;
@@ -856,6 +862,12 @@ fn unknown_line(release_id: i64, file: &NzbFile, stream: &[u8]) -> String {
 
 /// Whether two names are the same show episode or film, ignoring release tags.
 fn same_content(left: &str, right: &str) -> bool {
+    static DATE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?:19|20)\d\d[._ -]\d\d[._ -]\d\d").expect("static pattern"));
+    let date = |text: &str| DATE.find(text).map(|found| folded(found.as_str()));
+    if date(left) != date(right) {
+        return false;
+    }
     let (left, right) = (name::parse(left), name::parse(right));
     let title = folded(&left.title);
     title.len() >= 2
@@ -863,6 +875,21 @@ fn same_content(left: &str, right: &str) -> bool {
         && left.season == right.season
         && left.episode == right.episode
         && (left.year.is_none() || right.year.is_none() || left.year == right.year)
+}
+
+/// A subject with its name gone, keeping what opening the set relies on: the file's place in the
+/// post, and its volume suffix on a name shared by the whole set.
+fn masked_subject(subject: &str) -> String {
+    static SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(\.part\d+\.rar|(?:\.7z|\.zip)?\.\d{3}|\.[a-z0-9]{1,5})$")
+            .expect("static pattern")
+    });
+    let shown = name::name_from_subject(subject).unwrap_or_default();
+    let suffix = SUFFIX.find(&shown).map_or("", |found| found.as_str());
+    match post_position(subject) {
+        Some(position) => format!(r#"[{position}/999] "hidden{suffix}" yEnc"#),
+        None => format!(r#""hidden{suffix}" yEnc"#),
+    }
 }
 
 /// What the stream's evidence says about releases whose names are known, with the names hidden.
@@ -920,14 +947,8 @@ pub fn holdout(
             hidden.media_names.clear();
             hidden.facts.clear();
             if let Some(nzb) = &mut hidden.nzb {
-                // The subjects spell the name out on these. Only the order of files is needed.
-                for (index, file) in nzb.files.iter_mut().enumerate() {
-                    let ending = name::name_from_subject(&file.subject)
-                        .and_then(|shown| {
-                            shown.rsplit_once('.').map(|(_, ending)| ending.to_owned())
-                        })
-                        .unwrap_or_default();
-                    file.subject = format!(r#""hidden{index}.{ending}" yEnc"#);
+                for file in &mut nzb.files {
+                    file.subject = masked_subject(&file.subject);
                 }
             }
             if let Some(row) = sampler.read_release(&hidden) {
@@ -1547,6 +1568,21 @@ mod tests {
         let mut packed = rar4_method("packed.mkv", 100, 1, 0, 0x33);
         packed.extend_from_slice(&mkv());
         assert_eq!(peel(&packed).chain, ["rar4(compressed)"]);
+    }
+
+    #[test]
+    fn masking_keeps_a_set_together_and_the_name_out() {
+        let first = masked_subject(r#"Secret.Name [01/10] "Secret.Name.7z.001" yEnc (1/90)"#);
+        assert_eq!(first, r#"[1/999] "hidden.7z.001" yEnc"#);
+        assert_eq!(
+            masked_subject(r#""Secret.Name.part02.rar" yEnc"#),
+            r#""hidden.part02.rar" yEnc"#
+        );
+        assert_eq!(
+            masked_subject(r#""Secret.Name.mkv" yEnc"#),
+            r#""hidden.mkv" yEnc"#
+        );
+        assert_eq!(masked_subject("Secret Name"), r#""hidden" yEnc"#);
     }
 
     #[test]
