@@ -351,7 +351,8 @@ for svc in ${stopped[@]+"${stopped[@]}"}; do
     has "$targets" "$svc" || restart+=("$svc")
 done
 if [ ${#restart[@]} -gt 0 ]; then
-    "$compose" start ${restart[@]+"${restart[@]}"}
+    # --no-recreate starts the existing containers; --wait holds the barrier check until healthy.
+    "$compose" up -d --wait --wait-timeout "$timeout" --no-deps --no-recreate "${restart[@]}"
 fi
 if [ ${#recreate[@]} -gt 0 ]; then
     echo "Recreating for changed mounted config: ${recreate[*]}."
