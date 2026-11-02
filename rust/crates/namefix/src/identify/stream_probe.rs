@@ -7,17 +7,18 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::Result;
 use nntmux_formats::archive::FormatHeader;
 use nntmux_mediaprobe::mp4::{self, Mp4Probe};
 use nntmux_mediaprobe::summary::MediaSummary;
 use nntmux_mediaprobe::{Limits, Probe, probe_prefix};
+use regex::Regex;
 use rusqlite::Connection;
 
-use super::archive_probe::{ArticleFetch, last_volume, volumes_to_try};
+use super::archive_probe::{ArticleFetch, last_volume, post_position, volumes_to_try};
 use super::catalog::{Options, for_each_target, load, open_read_only, text};
 use super::ladder::{Context, Evidence, Hooks, Outcome, identify};
 use super::local_predb::LocalPredb;
@@ -295,6 +296,7 @@ pub fn peel(bytes: &[u8]) -> Peeled<'_> {
 /// A stored fingerprint of a release that already has a name.
 #[derive(Clone, Debug)]
 struct Known {
+    release_id: i64,
     name: String,
     width: i64,
     audio: usize,
@@ -375,6 +377,7 @@ fn load_known(catalog: &Connection) -> Result<KnownReleases> {
             .entry((height, seconds))
             .or_default()
             .push(Known {
+                release_id,
                 name: shown.clone(),
                 width,
                 audio: audio.get(&release_id).copied().unwrap_or(0),
@@ -401,6 +404,7 @@ fn fingerprint_matches<'a>(
     known: &'a KnownReleases,
     summary: &MediaSummary,
     payload_bytes: u64,
+    own_id: i64,
 ) -> Vec<&'a Known> {
     let (Some(video), Some(duration)) = (&summary.video, summary.duration_ms) else {
         return Vec::new();
@@ -418,7 +422,8 @@ fn fingerprint_matches<'a>(
             .flatten()
         {
             let ratio = payload_bytes as f64 / candidate.size_bytes.max(1) as f64;
-            if candidate.width == width as i64
+            if candidate.release_id != own_id
+                && candidate.width == width as i64
                 && candidate.audio == summary.audio.len()
                 && (0.8..=1.25).contains(&ratio)
             {
@@ -495,6 +500,12 @@ struct Row {
     missing: bool,
     fetched_bytes: u64,
     over_budget: bool,
+    /// Names the walk and the stream gave, for a second climb of the ladder.
+    gained_inner: Vec<String>,
+    gained_stream: Vec<String>,
+    height: Option<i64>,
+    /// What the ladder made of them: method, scope and name.
+    identified: Option<(&'static str, &'static str, String)>,
     /// How the walk went, as `rar5(stored)>mkv`.
     chain: String,
     /// Sampled for a read of its stream.
@@ -513,6 +524,8 @@ struct Row {
 struct Sampler<'a> {
     fetch: &'a dyn ArticleFetch,
     predb: &'a LocalPredb,
+    /// The ladder to run again with what the stream gave. `None` only reports.
+    ladder: Option<&'a Context<'a>>,
     known: &'a KnownReleases,
     media_budget: usize,
     media_taken: AtomicUsize,
@@ -598,6 +611,12 @@ impl Sampler<'_> {
                 if let Some(found) = names.iter().find_map(|inner| scene_name(inner, self.predb)) {
                     row.inner_name = Some(found);
                 }
+                // Keep what earlier files gave: a later file that says nothing can't unsay it.
+                for found in names {
+                    if !row.gained_inner.contains(&found) {
+                        row.gained_inner.push(found);
+                    }
+                }
                 row.layers = layers;
                 if current == End::NeedMore {
                     continue;
@@ -675,7 +694,29 @@ impl Sampler<'_> {
             }
         }
         row.end = best;
+        self.climb_again(evidence, &mut row);
         Some(row)
+    }
+
+    /// Climbs the ladder again with what the stream gave, as an inner file listing and media info.
+    fn climb_again(&self, evidence: &Evidence, row: &mut Row) {
+        let Some(context) = self.ladder else {
+            return;
+        };
+        if row.gained_inner.is_empty() && row.gained_stream.is_empty() {
+            return;
+        }
+        let mut enriched = evidence.clone();
+        enriched
+            .listing
+            .extend(row.gained_inner.iter().map(|name| (name.clone(), 0)));
+        enriched
+            .media_names
+            .extend(row.gained_stream.iter().cloned());
+        enriched.height = row.height.or(evidence.height);
+        if let (Outcome::Identified(found), _) = identify(&enriched, context) {
+            row.identified = Some((found.method, found.scope.as_str(), found.name));
+        }
     }
 
     /// One article, counted against the release's download budget.
@@ -751,18 +792,23 @@ impl Sampler<'_> {
             .iter()
             .map(|track| format!("{}/{}", track.language, track.name.as_deref().unwrap_or("")))
             .collect();
-        row.title_name = stream_names(summary)
-            .iter()
-            .find_map(|text| scene_name(text, self.predb));
+        let texts = stream_names(summary);
+        row.title_name = texts.iter().find_map(|text| scene_name(text, self.predb));
+        // Only the file's own title. Track names are mostly languages and codecs.
+        row.gained_stream = summary.title.iter().cloned().collect();
+        row.height = video
+            .and_then(|video| video.height)
+            .map(|height| height as i64);
         if let Some(uid) = summary.segment_uid.as_deref().and_then(uid_as_decimal) {
             for (_, shown) in self.known.uids.get(&uid).into_iter().flatten() {
                 row.uid_names.insert(shown.clone());
             }
         }
-        row.fingerprint_names = fingerprint_matches(self.known, summary, payload_bytes)
-            .iter()
-            .map(|known| known.name.clone())
-            .collect();
+        row.fingerprint_names =
+            fingerprint_matches(self.known, summary, payload_bytes, row.release_id)
+                .iter()
+                .map(|known| known.name.clone())
+                .collect();
         row.predb_candidates =
             predb_candidates(self.predb, summary, payload_bytes, posted_at).len();
         row.line = format!(
@@ -814,6 +860,175 @@ fn unknown_line(release_id: i64, file: &NzbFile, stream: &[u8]) -> String {
     )
 }
 
+/// Whether two names are the same show episode or film, ignoring release tags.
+fn same_content(left: &str, right: &str) -> bool {
+    static DATE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?:19|20)\d\d[._ -]\d\d[._ -]\d\d").expect("static pattern"));
+    let date = |text: &str| DATE.find(text).map(|found| folded(found.as_str()));
+    if date(left) != date(right) {
+        return false;
+    }
+    let (left, right) = (name::parse(left), name::parse(right));
+    let title = folded(&left.title);
+    title.len() >= 2
+        && title == folded(&right.title)
+        && left.season == right.season
+        && left.episode == right.episode
+        && (left.year.is_none() || right.year.is_none() || left.year == right.year)
+}
+
+/// A subject with its name gone, keeping what opening the set relies on: the file's place in the
+/// post, and its volume suffix on a name shared by the whole set.
+fn masked_subject(subject: &str) -> String {
+    static SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)(\.part\d+\.rar|(?:\.7z|\.zip)?\.\d{3}|\.[a-z0-9]{1,5})$")
+            .expect("static pattern")
+    });
+    let shown = name::name_from_subject(subject).unwrap_or_default();
+    let suffix = SUFFIX.find(&shown).map_or("", |found| found.as_str());
+    match post_position(subject) {
+        Some(position) => format!(r#"[{position}/999] "hidden{suffix}" yEnc"#),
+        None => format!(r#""hidden{suffix}" yEnc"#),
+    }
+}
+
+/// What the stream's evidence says about releases whose names are known, with the names hidden.
+pub fn holdout(
+    options: &Options,
+    settings: &SampleOptions,
+    fetch: &dyn ArticleFetch,
+) -> Result<String> {
+    let catalog_path = options.data_dir.join("catalog.db");
+    let catalog = open_read_only(&catalog_path)?;
+    let filter = "(r.predb_id IS NOT NULL OR r.is_renamed = 1)
+                  AND (r.legacy_category BETWEEN 2000 AND 2999
+                       OR r.legacy_category BETWEEN 5000 AND 5999)";
+    let loaded = load(&catalog, filter, options.limit)?;
+    let known = load_known(&catalog)?;
+    drop(catalog);
+    // The names to check against, then nothing of them left for the ladder to see.
+    let truth: HashMap<i64, String> = loaded
+        .targets
+        .iter()
+        .map(|target| (target.id, name::stem(&target.search_name)))
+        .collect();
+    let empty_donors = super::donor::DonorIndex::default();
+    let context = Context {
+        predb: &loaded.predb,
+        donors: &empty_donors,
+        hooks: Hooks::default(),
+    };
+    let sampler = Sampler {
+        fetch,
+        predb: &loaded.predb,
+        ladder: Some(&context),
+        known: &known,
+        media_budget: settings.sample,
+        media_taken: AtomicUsize::new(0),
+        byte_budget: settings.byte_budget,
+    };
+    let taken = AtomicUsize::new(0);
+    let rows = Mutex::new(Vec::new());
+    let mut targets = loaded.targets;
+    targets.sort_by_key(|target| super::catalog::sample_order(target.id));
+    for_each_target(
+        &options.data_dir.join("nzbs.db"),
+        options.threads,
+        targets,
+        |target| {
+            if taken.fetch_add(1, Ordering::Relaxed) >= settings.sample {
+                return;
+            }
+            let mut hidden = target.clone();
+            hidden.name = String::new();
+            hidden.search_name = String::new();
+            hidden.par2_names.clear();
+            hidden.listing.clear();
+            hidden.media_names.clear();
+            hidden.facts.clear();
+            if let Some(nzb) = &mut hidden.nzb {
+                for file in &mut nzb.files {
+                    file.subject = masked_subject(&file.subject);
+                }
+            }
+            if let Some(row) = sampler.read_release(&hidden) {
+                rows.lock().expect("no panic while holding this").push(row);
+            }
+        },
+    )?;
+    let rows = rows.into_inner().expect("no panic while holding this");
+    Ok(render_holdout(&rows, &truth))
+}
+
+fn render_holdout(rows: &[Row], truth: &HashMap<i64, String>) -> String {
+    let is_right = |row: &Row, shown: &str| {
+        truth
+            .get(&row.release_id)
+            .is_some_and(|known| same_content(shown, known))
+    };
+    let mut out = format!("# Stream hold-out\n\nReleases sampled: {}\n\n", rows.len());
+    let video = rows
+        .iter()
+        .filter(|row| row.end.is_some_and(End::is_video))
+        .count();
+    let _ = writeln!(
+        out,
+        "Reached a video stream: {video}. Header read: {}.\n",
+        rows.iter().filter(|row| row.header_read).count()
+    );
+    let mut names: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut wrong = Vec::new();
+    for row in rows {
+        if let Some((method, _, shown)) = &row.identified {
+            let entry = names.entry(method).or_default();
+            entry.0 += 1;
+            if is_right(row, shown) {
+                entry.1 += 1;
+            } else {
+                wrong.push(format!(
+                    "- {} {method}: `{shown}`, really `{}`",
+                    row.release_id,
+                    truth.get(&row.release_id).map_or("?", String::as_str)
+                ));
+            }
+        }
+    }
+    let _ = writeln!(out, "| Rung | Answers | Right |\n|---|---|---|");
+    for (method, (answers, right)) in &names {
+        let _ = writeln!(out, "| {method} | {answers} | {right} |");
+    }
+    let (mut unique, mut unique_right, mut several) = (0, 0, 0);
+    for row in rows {
+        let distinct: HashSet<String> = row
+            .fingerprint_names
+            .iter()
+            .map(|shown| folded(shown))
+            .collect();
+        match distinct.len() {
+            0 => {}
+            1 => {
+                unique += 1;
+                if row
+                    .fingerprint_names
+                    .iter()
+                    .any(|shown| is_right(row, shown))
+                {
+                    unique_right += 1;
+                }
+            }
+            _ => several += 1,
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\n## Fingerprint against other named releases\n\nFits exactly one: {unique}, of which the same content: {unique_right}. Fits several: {several}.\n\n## Wrong answers from names\n"
+    );
+    for line in wrong {
+        let _ = writeln!(out, "{line}");
+    }
+    out
+}
+
 pub struct SampleOptions {
     /// Releases with no other evidence to classify.
     pub sample: usize,
@@ -843,6 +1058,7 @@ pub fn sample(
     let sampler = Sampler {
         fetch,
         predb: &loaded.predb,
+        ladder: Some(&offline),
         known: &known,
         media_budget: settings.media,
         media_taken: AtomicUsize::new(0),
@@ -929,7 +1145,7 @@ fn render(rows: &[Row]) -> (String, String) {
          | Title or track name gives a scene name | {} (in PreDB: {}) |\n\
          | Inner archive name gives a scene name | {} (in PreDB: {}) |\n\
          | SegmentUID matches a named release | {} |\n\
-         | Fingerprint fits exactly one named release | {} |\n\
+         | Fingerprint fits one named release (unproven: 9 of 32 right in the hold-out) | {} |\n\
          | Fingerprint fits several | {} |\n\
          | Exactly one PreDB size candidate after stream filter | {} |\n\
          | Several PreDB size candidates | {} |\n",
@@ -952,6 +1168,24 @@ fn render(rows: &[Row]) -> (String, String) {
         count(&|row| row.predb_candidates == 1),
         count(&|row| row.predb_candidates > 1),
     );
+    let mut climbed: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    for found in rows.iter().filter_map(|row| row.identified.as_ref()) {
+        *climbed.entry((found.0, found.1)).or_default() += 1;
+    }
+    let _ = writeln!(
+        out,
+        "\n## Identified by the ladder from these names\n\nReleases: {}\n\n| Method | Scope | Releases |\n|---|---|---|",
+        rows.iter().filter(|row| row.identified.is_some()).count()
+    );
+    for ((method, scope), total) in &climbed {
+        let _ = writeln!(out, "| {method} | {scope} | {total} |");
+    }
+    let _ = writeln!(out, "\n## Identifications\n");
+    for row in rows {
+        if let Some((method, scope, shown)) = &row.identified {
+            let _ = writeln!(out, "- {} {method} {scope}: {shown}", row.release_id);
+        }
+    }
     let _ = writeln!(out, "\n## Names found\n");
     for row in &read {
         for (label, found) in [("title", &row.title_name), ("inner", &row.inner_name)] {
@@ -1151,6 +1385,7 @@ mod tests {
         let sampler = Sampler {
             fetch: &fake,
             predb: &predb,
+            ladder: None,
             known: &known,
             media_budget: 0,
             media_taken: AtomicUsize::new(0),
@@ -1179,6 +1414,7 @@ mod tests {
         let sampler = Sampler {
             fetch: fake,
             predb: &predb,
+            ladder: None,
             known: &known,
             media_budget: 10,
             media_taken: AtomicUsize::new(0),
@@ -1236,6 +1472,58 @@ mod tests {
     }
 
     #[test]
+    fn a_name_inside_a_stream_goes_back_through_the_ladder() {
+        let inner = "Some.Film.2021.1080p.WEB-DL.H264-GRP.mkv";
+        let archive = sevenzip::tests::archive(EncoderMethod::COPY, inner, &mkv());
+        let mut fake = Fake::default();
+        fake.0.insert("a".to_owned(), archive);
+        fake.0.insert("b".to_owned(), mkv());
+        let predb = LocalPredb::default();
+        let known = KnownReleases::default();
+        let donors = crate::identify::DonorIndex::default();
+        let context = Context {
+            predb: &predb,
+            donors: &donors,
+            hooks: Hooks::default(),
+        };
+        let sampler = Sampler {
+            fetch: &fake,
+            predb: &predb,
+            ladder: Some(&context),
+            known: &known,
+            media_budget: 10,
+            media_taken: AtomicUsize::new(0),
+            byte_budget: 64 * 1024 * 1024,
+        };
+        let release = |file| Evidence {
+            nzb: Some(NzbSummary {
+                files: vec![file],
+                ..NzbSummary::default()
+            }),
+            ..Evidence::default()
+        };
+        // A name in an archive's index.
+        let row = sampler
+            .read_release(&release(volume(r#""x.7z" yEnc"#, "a", "a")))
+            .expect("row");
+        let (method, scope, name) = row.identified.expect("identified");
+        assert_eq!(
+            (method, scope, name.as_str()),
+            (
+                "archive_listing_regex",
+                "in_scope",
+                "Some.Film.2021.1080p.WEB-DL.H264-GRP"
+            )
+        );
+        // The bare fixture's title is "Sample Movie 2024 2160p UHD BluRay REMUX".
+        let row = sampler
+            .read_release(&release(volume(r#""abc.mkv" yEnc"#, "b", "b")))
+            .expect("row");
+        let (method, scope, _) = row.identified.expect("identified");
+        assert_eq!((method, scope), ("media_info_regex", "in_scope"));
+    }
+
+    #[test]
     fn a_stored_7z_is_walked_through_too() {
         let archive = sevenzip::tests::archive(EncoderMethod::COPY, "a.mkv", &mkv());
         let mut fake = Fake::default();
@@ -1254,6 +1542,7 @@ mod tests {
         let sampler = Sampler {
             fetch: &fake,
             predb: &predb,
+            ladder: None,
             known: &known,
             media_budget: 10,
             media_taken: AtomicUsize::new(0),
@@ -1279,6 +1568,45 @@ mod tests {
         let mut packed = rar4_method("packed.mkv", 100, 1, 0, 0x33);
         packed.extend_from_slice(&mkv());
         assert_eq!(peel(&packed).chain, ["rar4(compressed)"]);
+    }
+
+    #[test]
+    fn masking_keeps_a_set_together_and_the_name_out() {
+        let first = masked_subject(r#"Secret.Name [01/10] "Secret.Name.7z.001" yEnc (1/90)"#);
+        assert_eq!(first, r#"[1/999] "hidden.7z.001" yEnc"#);
+        assert_eq!(
+            masked_subject(r#""Secret.Name.part02.rar" yEnc"#),
+            r#""hidden.part02.rar" yEnc"#
+        );
+        assert_eq!(
+            masked_subject(r#""Secret.Name.mkv" yEnc"#),
+            r#""hidden.mkv" yEnc"#
+        );
+        assert_eq!(masked_subject("Secret Name"), r#""hidden" yEnc"#);
+    }
+
+    #[test]
+    fn content_compares_by_title_and_episode_not_tags() {
+        assert!(same_content(
+            "Zmora.S01E05.1080p.WEB.h264-AAA",
+            "zmora s01e05 720p amzn web-dl-BBB"
+        ));
+        assert!(!same_content(
+            "Zmora.S01E05.1080p.WEB-AAA",
+            "Zmora.S01E06.1080p.WEB-AAA"
+        ));
+        assert!(!same_content(
+            "Zmora.S01E05.1080p.WEB-AAA",
+            "Other.S01E05.1080p.WEB-AAA"
+        ));
+        assert!(!same_content(
+            "Film.2020.1080p.WEB-AAA",
+            "Film.2021.1080p.WEB-AAA"
+        ));
+        assert!(same_content(
+            "Toy Story 2 (1999)",
+            "Toy.Story.2.1999.1080p.BluRay.x264-GRP"
+        ));
     }
 
     #[test]
