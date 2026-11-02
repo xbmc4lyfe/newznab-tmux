@@ -9,3 +9,6 @@
 rust/frontend/node_modules/
 rust/frontend/public/build/
 rust/crates/**/target/
+# Integration tests aren't built into the image; keeping them out means a test-only change
+# rebuilds nothing (see docker/bin/source-revision).
+rust/crates/*/tests/

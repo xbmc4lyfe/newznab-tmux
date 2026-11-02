@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Prints the newest commit that changed what goes into the image: the Dockerfile and the parts of
+# rust/ that .dockerignore lets in, minus tests. The image is labelled with it instead of HEAD, so
+# a commit that only touches docs, tests or tooling builds the identical cached image and the
+# deploy recreates nothing.
+set -euo pipefail
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+git -C "$repo" log -1 --format=%H -- Dockerfile .dockerignore rust/Cargo.toml rust/Cargo.lock \
+    rust/rust-toolchain.toml rust/crates rust/migrations rust/frontend \
+    ':(exclude,glob)rust/crates/*/tests/**'

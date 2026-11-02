@@ -5,13 +5,14 @@
   deploy-inspect services           every service, in any profile
   deploy-inspect image-users IMAGE  services that run IMAGE
   deploy-inspect image-of SERVICE   the image SERVICE runs
-  deploy-inspect configs ROOT...    one "service hash" line per service that bind-mounts config
+  deploy-inspect configs            one "service hash" line per service that bind-mounts config
   deploy-inspect interpolated FILE  keys of a dotenv FILE whose value Compose would interpolate
 
 A service's config hash covers the content of every bind-mounted file, and of every file under a
-read-only bind-mounted directory inside one of the ROOT directories (the stack's own directories).
-Writable directories are data (database files, storage) and are skipped, and so are read-only
-host paths outside the roots, such as node-exporter's /proc, /sys and /. Compose recreates a service only when its definition changes, so deploy uses these hashes
+read-only bind-mounted directory, wherever it lives (a persistent runtime directory outside the
+checkout too) and following symlinks. Writable directories are data (database files, storage)
+and are skipped, and so are host system paths (/, /proc, /sys, /dev, /run, Docker's own state),
+such as node-exporter's mounts. Compose recreates a service only when its definition changes, so deploy uses these hashes
 to recreate a service whose mounted config changed.
 """
 import hashlib
@@ -38,12 +39,20 @@ def tree_digest(path: str, digest) -> None:
             tree_digest(os.path.join(root, name), digest)
 
 
+SYSTEM = ("/proc", "/sys", "/dev", "/run", "/var/run", "/var/lib/docker", "/private/var/run")
+
+
 def inside(path: str, roots: list[str]) -> bool:
     real = os.path.realpath(path)
     return any(real == root or real.startswith(root + os.sep) for root in roots)
 
 
-def config_sources(service: dict, roots: list[str]) -> list[str]:
+def system_path(path: str) -> bool:
+    real = os.path.realpath(path)
+    return real == "/" or inside(real, list(SYSTEM))
+
+
+def config_sources(service: dict) -> list[str]:
     sources = []
     for volume in service.get("volumes") or []:
         if volume.get("type") != "bind":
@@ -51,7 +60,7 @@ def config_sources(service: dict, roots: list[str]) -> list[str]:
         source = volume.get("source", "")
         if os.path.isfile(source):
             sources.append(source)
-        elif os.path.isdir(source) and volume.get("read_only") and inside(source, roots):
+        elif os.path.isdir(source) and volume.get("read_only") and not system_path(source):
             sources.append(source)
     return sorted(sources)
 
@@ -83,9 +92,8 @@ def main() -> None:
         image = sys.argv[2]
         print("\n".join(sorted(name for name, svc in services.items() if svc.get("image") == image)))
     elif command == ["configs"]:
-        roots = [os.path.realpath(root) for root in sys.argv[2:]]
         for name in sorted(services):
-            sources = config_sources(services[name], roots)
+            sources = config_sources(services[name])
             if not sources:
                 continue
             digest = hashlib.sha256()

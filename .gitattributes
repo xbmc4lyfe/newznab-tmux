@@ -56,6 +56,7 @@ Dockerfile		-binary text
 Justfile		-binary text eol=lf
 docker/bin/deploy	-binary text eol=lf
 docker/bin/deploy-inspect	-binary text eol=lf
+docker/bin/source-revision	-binary text eol=lf
 docker/Justfile		-binary text eol=lf
 /scripts/nzb_fingerprint.py	-binary text eol=lf
 /tests/Unit/test_nzb_fingerprint.py	-binary text eol=lf

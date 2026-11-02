@@ -54,7 +54,7 @@ build *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    rev=$(git -C "{{CURDIR}}" rev-parse --short=12 HEAD)
+    rev=$("{{CURDIR}}/bin/source-revision")
     docker build --label "org.opencontainers.image.revision=$rev" -t "${APP_IMAGE:-nntmux/rust:local}" "{{CURDIR}}/.."
 
 # Guarded rollout: lock, branch check, build, migrate, recreate changed services, wait healthy
@@ -92,11 +92,17 @@ seed-db *args:
     "{{COMPOSE}}" exec -T mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE:-nntmux}" < "{{CURDIR}}/config/seed/groups.sql"
     "{{COMPOSE}}" exec -T mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE:-nntmux}" < "{{CURDIR}}/config/seed/tuning.sql"
 
-# Start the stack as built (no build, no git checks); use deploy for a rollout
+# First start of a new stack. An existing stack changes only through the guarded deploy.
 up *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
+    # `up` recreates whatever changed, without the deploy's lock, preflight or writer quiesce.
+    if [ -n "$("{{COMPOSE}}" ps -aq)" ]; then
+        echo "The stack already has containers. Roll changes out with 'just deploy', or use" >&2
+        echo "'just restart' to restart services as they are." >&2
+        exit 1
+    fi
     "{{COMPOSE}}" up -d --wait ${ARGS[@]+"${ARGS[@]}"}
 
 # Stop the stack. Workers drain in-flight work within their stop grace.
