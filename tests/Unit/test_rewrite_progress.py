@@ -94,7 +94,7 @@ class RewriteProgressTest(unittest.TestCase):
         self.assertIn('rust-native', page)
         report['rust_native'] = None
         path.write_text(json.dumps(report))
-        self.assertIn('master', docs.rewrite_progress(path))
+        self.assertIn('rust-native', docs.rewrite_progress(path))
 
     def test_marker_replaced_with_notice_when_no_report(self):
         source = self.root / 'source'

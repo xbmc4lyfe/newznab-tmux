@@ -4,7 +4,7 @@ The goal is zero PHP, with every entry point in Rust: all routes, commands, jobs
 
 ## How the branch works
 
-- All work lands on `rust-native`. Open PRs against it, not `master`. Master stays deployable, and merging `rust-native` into it is the final cutover.
+- `rust-native` is the default branch, and all work lands on it. `master` is kept only for history, so never base work on it or target it. The final cutover moves production onto `rust-native`.
 - The PHP is at the `php-final` tag. On this Mac it's checked out at `~/git.xbmc4lyfe/newznab-tmux-php-ref`, with `vendor/` in place and a `.env` that points only at local services. Read it there or with `git show php-final:<path>`. Never edit it. To run it, start `rust/compose.test.yml` and run `rust/porting/php-ref-setup.sh`, which builds its `nntmux` database on the test MariaDB, once.
 - The database schema doesn't change shape. `rust/migrations/0001` and `0002` are generated from Laravel's migrations and seeders. Add a new migration only when a workstream truly needs it, as the next number in `crates/db/src/migrate.rs`.
 - No deploys, restarts or production writes. The deployment owner handles rollouts. Reading production through a read-only login is fine when a workstream needs real samples, but never write there.
@@ -45,9 +45,8 @@ Order: `ws-formats` first if threads must be staggered, since `ws-ingest`, `ws-r
 
 ## Cutover requirements
 
-Merging `rust-native` into `master` is the last step, and `ws-deploy` owns getting it ready:
+Moving production onto `rust-native` is the last step, and `ws-deploy` owns getting it ready:
 
-- Keep GitHub Pages deploying. This branch deleted `.github/workflows/benchmark-pages.yml`, which also publishes the rewrite's progress figure. Restore it and its scripts from `master`, including `scripts/rewrite-metrics/`, and remove any PHP steps it no longer needs.
 - The progress metric reads the ledger, so keep two conventions stable: entries whose `source` is a `.rs` file don't count toward the headline, and `rust/porting/ledger/dropped.toml` holds vendor routes and is excluded. Record other dropped entries in the owning workstream's file, not there.
 - Rebuild the PreDB identity index once at cutover with `nntmux-ctl predb identity-rebuild`. Put this in the deployment owner's handoff, because it runs against production.
 - Before PHP stops, drain the Horizon fingerprint queue with `php artisan releases:fingerprint-transfer`, and migrate any `releases_rt` index older than the media fields with `php artisan nntmux:update-releases-index --add-fields --update-media-ids`. Neither has a Rust port: a release whose job was never transferred is picked up by `nntmux-ctl fingerprint backfill` once its NZB is in the database, and rebuilding the index replaces the migration once ws-search ports its rebuild. Both belong in the deployment owner's handoff.
