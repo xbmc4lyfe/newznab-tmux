@@ -11,6 +11,7 @@ pub mod ebml;
 pub mod ident;
 pub mod lang;
 pub mod matroska;
+pub mod pipeline;
 pub mod posting;
 pub mod summary;
 pub mod video;
