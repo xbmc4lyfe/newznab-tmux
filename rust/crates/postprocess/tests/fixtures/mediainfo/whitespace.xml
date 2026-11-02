@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- a comment -->
+<Mediainfo version="21.09">
+<File>
+<track type="General">
+<Format>Matroska</Format>
+<Format>Matroska</Format>
+<Movie_name> </Movie_name>
+<File_name>Tom &amp; Jerry <!-- inline --> S01</File_name>
+<Unique_ID>42</Unique_ID>
+<Unique_ID>42 (0x2A)</Unique_ID>
+<Unique_ID>third</Unique_ID>
+<unique_id>dup</unique_id>
+</track>
+<track type="Video">
+<Duration>
+</Duration>
+<Format>A<Nested>x</Nested>B</Format>
+</track>
+<track type="Audio">
+<ID>7</ID>
+<ID>7 (0x7)</ID>
+<Format>DTS</Format>
+<Format>DTS XLL</Format>
+<Encoded_library>lib</Encoded_library>
+<Encoded_Library>LIB2</Encoded_Library>
+<Language><![CDATA[de]]></Language>
+<Language>German</Language>
+<Channel_s_>2</Channel_s_>
+<Channel_s_>2 channels</Channel_s_>
+</track>
+<track type="Text">
+<ID>9</ID>
+<ID>9</ID>
+<Language>English</Language>
+<Language>German</Language>
+</track>
+</File>
+</Mediainfo>

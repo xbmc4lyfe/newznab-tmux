@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Mediainfo version="18.05">
+<File>
+<track type="General">
+<Format>AVI</Format>
+<Movie_name></Movie_name>
+<File_name>  spaced  </File_name>
+</track>
+<track type="Video">
+<Format>XviD</Format>
+<Duration>612000</Duration>
+<Width>720</Width>
+<Width>720 pixels</Width>
+<Height>576</Height>
+<Height>576 pixels</Height>
+<Writing_library>XviD 1.2.1</Writing_library>
+<Writing_library>XviD 64</Writing_library>
+<Frame_rate>25.000</Frame_rate>
+<Frame_rate>25.000 FPS</Frame_rate>
+</track>
+<track type="Video">
+<Format>Second</Format>
+<Format>Second video</Format>
+</track>
+<track type="Audio">
+<ID>1</ID>
+<Format>MPEG Audio</Format>
+<Format>MPEG Audio</Format>
+<Language>en</Language>
+</track>
+<track type="Audio">
+<ID>2</ID>
+<ID>2</ID>
+<Format>AAC</Format>
+<Format>AAC LC</Format>
+</track>
+<track type="Text">
+</track>
+</File>
+</Mediainfo>

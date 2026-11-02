@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Mediainfo version="20.03">
+<File>
+<track type="General">
+<Unique_ID>0</Unique_ID>
+<Unique_ID>0 (0x0)</Unique_ID>
+<Complete_name>/tmp/x.mp4</Complete_name>
+<File_name>Show.Name.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP</File_name>
+<Format>MPEG-4</Format>
+<Format>MPEG-4</Format>
+<Codec_ID>isom</Codec_ID>
+<Duration>2712345</Duration>
+<Duration>45 min 12 s</Duration>
+</track>
+<track type="Video">
+<ID>1</ID>
+<ID>1</ID>
+<Format>AVC</Format>
+<Format>AVC</Format>
+<Codec_ID>avc1</Codec_ID>
+<Duration>2712300</Duration>
+<Duration>45 min 12 s</Duration>
+<Bit_rate>7000000</Bit_rate>
+<Bit_rate>7 000 kb/s</Bit_rate>
+<Nominal_bit_rate>8000000</Nominal_bit_rate>
+<Nominal_bit_rate>8 000 kb/s</Nominal_bit_rate>
+<Width>1920</Width>
+<Width>1 920 pixels</Width>
+<Height>1080</Height>
+<Height>1 080 pixels</Height>
+<Display_aspect_ratio>1.778</Display_aspect_ratio>
+<Display_aspect_ratio>16:9</Display_aspect_ratio>
+<Frame_rate>23.976</Frame_rate>
+<Frame_rate>23.976 FPS</Frame_rate>
+<Encoded_Library>x264</Encoded_Library>
+<Encoded_Library_Version>core 164</Encoded_Library_Version>
+</track>
+<track type="Audio">
+<Format>E-AC-3</Format>
+<Format>E-AC-3</Format>
+<Format_settings__SBR>No</Format_settings__SBR>
+<Format_settings__SBR>No (Explicit)</Format_settings__SBR>
+<Bit_rate>640000</Bit_rate>
+<Bit_rate>640 kb/s</Bit_rate>
+<Channel_s_>6</Channel_s_>
+<Channel_s_>6 channels</Channel_s_>
+<Sampling_rate>48000</Sampling_rate>
+<Sampling_rate>48.0 kHz</Sampling_rate>
+<Encoded_Library>Dolby</Encoded_Library>
+<Language>English</Language>
+</track>
+<track type="Other">
+<Type>Time code</Type>
+</track>
+<track type="Unknown">
+<Foo>Bar</Foo>
+</track>
+</File>
+</Mediainfo>
