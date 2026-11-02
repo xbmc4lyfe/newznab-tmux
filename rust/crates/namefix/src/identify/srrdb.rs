@@ -64,6 +64,8 @@ pub struct SrrdbStats {
     pub crc_asked: AtomicUsize,
     pub crc_hits: AtomicUsize,
     pub crc_ambiguous: AtomicUsize,
+    /// A post whose files named different releases, or only some of them one.
+    pub crc_disagree: AtomicUsize,
     pub name_asked: AtomicUsize,
     pub name_hits: AtomicUsize,
     pub candidates_asked: AtomicUsize,
@@ -202,20 +204,40 @@ impl SrrdbClient {
         if !crcs.is_empty() {
             stats.crc_asked.fetch_add(1, Ordering::Relaxed);
         }
+        // One file's release only names the post if the other files agree. A pack can hold
+        // episodes released apart, and a miss may be an episode srrDB doesn't know.
+        let mut agreed: Option<String> = None;
+        let mut asked = 0;
         for crc in crcs.iter().take(MAX_CRCS) {
+            asked += 1;
             let mut names = self.search(&format!("archive-crc:{crc}"))?;
             names.dedup_by_key(|name| folded(name));
             match names.as_slice() {
+                [name]
+                    if agreed
+                        .as_ref()
+                        .is_none_or(|known| folded(known) == folded(name)) =>
+                {
+                    agreed = Some(name.clone());
+                    continue;
+                }
                 [] => {}
-                [name] => {
-                    stats.crc_hits.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Some(name.clone()));
+                [_] => {
+                    stats.crc_disagree.fetch_add(1, Ordering::Relaxed);
                 }
                 // Several releases can share a file, such as a sample or a subtitle.
                 _ => {
                     stats.crc_ambiguous.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            agreed = None;
+            break;
+        }
+        if asked > 0
+            && let Some(name) = agreed
+        {
+            stats.crc_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(name));
         }
 
         if !query.file_names.is_empty() {
@@ -238,11 +260,9 @@ impl SrrdbClient {
             stats.candidates_asked.fetch_add(1, Ordering::Relaxed);
             let mine: HashSet<&String> = crcs.iter().collect();
             for candidate in query.size_candidates.iter().take(MAX_CANDIDATES) {
-                if self
-                    .crcs_of(candidate)?
-                    .iter()
-                    .any(|crc| mine.contains(crc))
-                {
+                // Every file of this post has to be in the candidate, not just one of them.
+                let theirs = self.crcs_of(candidate)?;
+                if mine.iter().all(|crc| theirs.contains(*crc)) {
                     stats.candidates_hits.fetch_add(1, Ordering::Relaxed);
                     return Ok(Some(candidate.clone()));
                 }
@@ -257,7 +277,7 @@ impl SrrdbClient {
         format!(
             "# srrDB run\n\nReleases asked about: {}. Requests: {}. From cache: {}. Errors: {}.\n\n\
              | Evidence | Releases asked | Hits |\n|---|---|---|\n\
-             | CRC32 | {} | {} ({} more matched several releases) |\n\
+             | CRC32 | {} | {} ({} matched several releases, {} files disagreed) |\n\
              | Readable name | {} | {} |\n\
              | PreDB size candidates checked by CRC32 | {} | {} |\n\n\
              Releases with size candidates but no CRC32 to check them against: {}.\n",
@@ -268,6 +288,7 @@ impl SrrdbClient {
             read(&stats.crc_asked),
             read(&stats.crc_hits),
             read(&stats.crc_ambiguous),
+            read(&stats.crc_disagree),
             read(&stats.name_asked),
             read(&stats.name_hits),
             read(&stats.candidates_asked),
@@ -378,6 +399,83 @@ mod tests {
         let (answer, client) = ask(setup.config.clone(), query).await;
         assert_eq!(answer.expect("answer").as_deref(), Some(RELEASE));
         assert_eq!(client.stats.crc_hits.load(Ordering::Relaxed), 1);
+        finish(client).await;
+    }
+
+    #[tokio::test]
+    async fn files_of_a_post_must_agree_on_the_release() {
+        let setup = setup().await;
+        let other = "Andor.S01E07.2160p.UHD.BluRay.x265-STORiES";
+        serve(
+            &setup.server,
+            "/v1/search/archive-crc:00000011",
+            results(&[RELEASE]),
+        )
+        .await;
+        serve(
+            &setup.server,
+            "/v1/search/archive-crc:00000012",
+            results(&[RELEASE]),
+        )
+        .await;
+        serve(
+            &setup.server,
+            "/v1/search/archive-crc:00000013",
+            results(&[other]),
+        )
+        .await;
+        serve(
+            &setup.server,
+            "/v1/search/archive-crc:00000014",
+            results(&[]),
+        )
+        .await;
+        let ask_about = |crcs: &[&str]| SrrdbQuery {
+            crc32s: crcs.iter().map(|crc| format!("{crc}:1")).collect(),
+            ..SrrdbQuery::default()
+        };
+
+        let (answer, client) =
+            ask(setup.config.clone(), ask_about(&["00000011", "00000012"])).await;
+        assert_eq!(answer.expect("answer").as_deref(), Some(RELEASE));
+        finish(client).await;
+
+        // A pack of episodes released apart.
+        let (answer, client) =
+            ask(setup.config.clone(), ask_about(&["00000011", "00000013"])).await;
+        assert_eq!(answer.expect("answer"), None);
+        assert_eq!(client.stats.crc_disagree.load(Ordering::Relaxed), 1);
+        finish(client).await;
+
+        // A pack with an episode srrDB doesn't know.
+        let (answer, client) =
+            ask(setup.config.clone(), ask_about(&["00000011", "00000014"])).await;
+        assert_eq!(answer.expect("answer"), None);
+        finish(client).await;
+    }
+
+    #[tokio::test]
+    async fn a_size_candidate_must_hold_every_file_of_the_post() {
+        let setup = setup().await;
+        serve(
+            &setup.server,
+            "/v1/search/archive-crc:00000021",
+            results(&[]),
+        )
+        .await;
+        serve(
+            &setup.server,
+            &format!("/v1/details/{RELEASE}"),
+            json!({"archived-files": [{"name": "a.mkv", "crc": "00000021"}]}),
+        )
+        .await;
+        let query = SrrdbQuery {
+            crc32s: vec!["00000021:1".to_owned(), "00000022:1".to_owned()],
+            size_candidates: vec![RELEASE.to_owned()],
+            ..SrrdbQuery::default()
+        };
+        let (answer, client) = ask(setup.config.clone(), query).await;
+        assert_eq!(answer.expect("answer"), None);
         finish(client).await;
     }
 
@@ -533,13 +631,13 @@ mod tests {
         serve(
             &setup.server,
             "/v1/search/archive-crc:00000004",
-            results(&[]),
+            results(&[RELEASE]),
         )
         .await;
         serve(
             &setup.server,
             "/v1/search/archive-crc:00000005",
-            results(&[]),
+            results(&[RELEASE]),
         )
         .await;
         let mut config = setup.config.clone();
@@ -550,7 +648,7 @@ mod tests {
         };
         let started = Instant::now();
         let (answer, client) = ask(config, query).await;
-        assert_eq!(answer.expect("answer"), None);
+        assert_eq!(answer.expect("answer").as_deref(), Some(RELEASE));
         assert!(started.elapsed() >= Duration::from_millis(200));
         finish(client).await;
     }
