@@ -203,7 +203,7 @@ class PagesTest(unittest.TestCase):
                 pages.validate_summary({**summary, **metadata}, self.run_row(), 'cpp', 'ubuntu-latest')
 
     def run_row(self, **changes):
-        return dict(id=12, run_attempt=2, head_sha=SHA, head_branch='rust-native', event='push',
+        return dict(id=12, run_attempt=2, head_sha=SHA, head_branch='main', event='push',
                     status='completed', conclusion='failure', head_repository={'full_name': pages.REPOSITORY}, **changes)
 
     def test_failed_latest_run_supersedes_success_and_dispatch_is_excluded(self):
