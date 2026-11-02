@@ -4,7 +4,7 @@
 //! PHP built a producer-naming claim from `additional_pp_claimed_at` when the release row carried
 //! it, but the batch claim never selects that column, so the claim was always absent and every
 //! branch on it was dead. It is left out here, with the `producerNamingAttempted` flag that only
-//! mattered alongside it. The archived media slots belong to media extraction and arrive with it.
+//! mattered alongside it.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use super::media_source::{MediaByteBudget, MediaSourcePlan};
 use super::nzb_contents::SourceFile;
 use super::planner::{NzbFile, WorkPlan};
 use crate::archive_info::ListEntry;
+use crate::media::slicer::ArchivedMediaEntry;
 
 const MAX_RETAINED_ARCHIVES: usize = 2;
 const MAX_RETAINED_ARCHIVE_BYTES: usize = 16_777_216;
@@ -173,6 +174,8 @@ pub struct ReleaseContext {
     pub media_plan: Option<MediaSourcePlan>,
     pub media_budget: Option<MediaByteBudget>,
     pub downloaded_archives: Vec<DownloadedArchive>,
+    /// Videos stored in downloaded archive volumes, samples first.
+    pub archived_media: Vec<ArchivedMediaEntry>,
     retained_archive_bytes: usize,
 
     pub sample_message_ids: Vec<String>,
@@ -265,6 +268,7 @@ impl ReleaseContext {
             media_plan: None,
             media_budget: None,
             downloaded_archives: Vec::new(),
+            archived_media: Vec::new(),
             retained_archive_bytes: 0,
             sample_message_ids: Vec::new(),
             jpg_message_ids: Vec::new(),
@@ -400,6 +404,7 @@ impl ReleaseContext {
         self.reverse_archive_summary = None;
         self.media_plan = None;
         self.media_budget = None;
+        self.archived_media.clear();
         self.release_downloaded_archives();
         self.reset_message_ids();
         self.reset_counters();
@@ -547,6 +552,40 @@ impl ReleaseContext {
             .ok()
             .filter(|seconds| *seconds > 0)
             .is_some_and(|seconds| self.started.elapsed() > Duration::from_secs(seconds))
+    }
+
+    /// When this attempt started.
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// `rememberArchivedMedia`: keeps at most two stored videos, a sample taking a feature's
+    /// place, samples first. False when the video was already known or there was no room.
+    pub fn remember_archived_media(&mut self, entry: ArchivedMediaEntry) -> bool {
+        if self
+            .archived_media
+            .iter()
+            .any(|known| known.name == entry.name)
+        {
+            return false;
+        }
+        if self.archived_media.len() >= MAX_RETAINED_ARCHIVES {
+            if !entry.is_sample {
+                return false;
+            }
+            let Some(replace) = self
+                .archived_media
+                .iter()
+                .position(|known| !known.is_sample)
+            else {
+                return false;
+            };
+            self.archived_media.remove(replace);
+        }
+        self.archived_media.push(entry);
+        // Stable, as PHP 8's `usort` is.
+        self.archived_media.sort_by_key(|known| !known.is_sample);
+        true
     }
 
     pub fn elapsed_seconds(&self) -> u64 {

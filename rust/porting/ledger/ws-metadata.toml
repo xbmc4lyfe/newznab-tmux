@@ -23,7 +23,8 @@ note = "Books are out of scope: the indexer keeps only TV and movies."
 kind = "command"
 id = "cbp:optimize-storage"
 source = "app/Console/Commands/OptimizeCbpStorage.php"
-status = "todo"
+status = "dropped"
+note = "a one-time migration to the compact collections/binaries/parts layout, which migrations/0001 already has and the Rust ingest requires; the cutover checks the live schema instead"
 
 [[entry]]
 kind = "command"

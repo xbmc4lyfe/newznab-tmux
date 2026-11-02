@@ -8,6 +8,7 @@ pub mod context;
 pub mod diagnose;
 pub mod download;
 pub mod media_source;
+pub mod media_stage;
 pub mod nzb_contents;
 pub mod par2_mapping;
 pub mod planner;
