@@ -235,12 +235,9 @@ database_identity() {
         | tail -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r'
 }
 
-# Takes the barrier on the current database. Returns non-zero, with the reason, when it isn't held.
-take_barrier() {
-    docker rm -f "$barrier" > /dev/null 2>&1 || true
-    echo "Holding the verification barrier on $database (remote workers drain within ${remote_drain}s)."
-    "$compose" run -d --no-deps --name "$barrier" --label "$barrier_label=$database" migrate \
-        nntmux-ctl verify barrier --timeout "$remote_drain" > /dev/null
+# Waits until the barrier container reports that remote workers have drained. Returns non-zero,
+# with the reason, when it stops first.
+wait_barrier() {
     until docker logs "$barrier" 2>&1 | grep -q '^barrier held'; do
         if [ "$(docker inspect --format '{{.State.Running}}' "$barrier")" != true ]; then
             docker logs --tail 20 "$barrier" >&2
@@ -249,6 +246,15 @@ take_barrier() {
         fi
         sleep 2
     done
+}
+
+# Takes the barrier on the current database. Returns non-zero, with the reason, when it isn't held.
+take_barrier() {
+    docker rm -f "$barrier" > /dev/null 2>&1 || true
+    echo "Holding the verification barrier on $database (remote workers drain within ${remote_drain}s)."
+    "$compose" run -d --no-deps --name "$barrier" --label "$barrier_label=$database" migrate \
+        nntmux-ctl verify barrier --timeout "$remote_drain" > /dev/null
+    wait_barrier
 }
 
 # Reads `migrate --pending` for the current database into $pending and $empty.
@@ -302,7 +308,12 @@ if [ "$quiesce" = 1 ]; then
         "$compose" stop "${stopped[@]}"
     fi
     if [ -n "$(docker ps -q --filter "name=^${barrier}\$")" ]; then
-        echo "Adopting the verification barrier an earlier deploy left held."
+        # An interrupted deploy can leave one still waiting for remote workers to drain.
+        echo "Adopting the verification barrier an earlier deploy left running."
+        if ! wait_barrier; then
+            echo "The stopped writers stay stopped; rerun the deploy once remote workers can drain." >&2
+            exit 1
+        fi
     elif [ "$empty" = 1 ]; then
         echo "The database has no tables yet, so no verification worker can be using it."
     elif ! take_barrier; then
@@ -315,7 +326,9 @@ if [ ${#data_recreate[@]} -gt 0 ]; then
     echo "Recreating data services, as DEPLOY_RECREATE_DATA=1 allows: ${data_recreate[*]}."
     "$compose" up -d --wait --wait-timeout "$timeout" --no-deps --force-recreate "${data_recreate[@]}"
     # The barrier's session died with the old database (and its pause may live only in the old
-    # storage), so the replacement is fenced by a fresh barrier before anything migrates it.
+    # storage), so the replacement is fenced by a fresh barrier before anything migrates it, and
+    # it is migrated whatever the targets are, before any writer starts again.
+    need_migrate=1
     read_pending
     if [ "$empty" = 1 ]; then
         docker rm -f "$barrier" > /dev/null 2>&1 || true
