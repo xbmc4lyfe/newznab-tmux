@@ -1,4 +1,8 @@
-//! Queueing listed files and finalizing a release against a real database.
+//! Queueing listed files, PAR2 and NFO evidence, naming from inner names, and finalizing a
+//! release against a real database.
+
+#[allow(dead_code)]
+mod support;
 
 use std::sync::{Arc, Mutex};
 
@@ -11,9 +15,11 @@ use nntmux_namefix::service::NameFixer;
 use nntmux_namefix::update::{ReleaseSearch, ReleaseUpdater};
 use nntmux_postprocess::additional::candidates::ClaimedRelease;
 use nntmux_postprocess::additional::context::ReleaseContext;
+use nntmux_postprocess::additional::planner::NzbFile;
 use nntmux_postprocess::additional::release_files::{ReleaseFiles, Settings};
 use nntmux_postprocess::additional::search_sync::SearchSync;
-use nntmux_postprocess::archive_info::{FileRecord, ListEntry};
+use nntmux_postprocess::archive_info::{FileRecord, ListEntry, Summary};
+use nntmux_postprocess::nfo::{self, NfoService};
 use nntmux_predb::filename::fixer_cleaner;
 use nntmux_predb::identity::{self, InsertOutcome, NewPredb};
 use nntmux_testkit::TestDb;
@@ -95,6 +101,8 @@ async fn manager(
     let settings = Settings {
         inner_file_blacklist: Some("/sample/i".to_owned()),
         add_par2_files: true,
+        rename_par2: true,
+        echo_cli: true,
         season_pack_max_release_files: 50,
         archive_retry_delay_seconds: 600,
         claim_ttl_seconds: 3600,
@@ -515,5 +523,294 @@ async fn an_episode_name_held_for_the_inventory_names_the_release_after_finalizi
             .fetch_one(pool)
             .await?;
     assert_eq!((searchname.as_str(), linked), (episode, predb_id as i64));
+    db.drop_database().await
+}
+
+/// One PAR2 packet with a valid checksum.
+fn par2_packet(kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
+    use md5::{Digest, Md5};
+    let mut tail = Vec::new();
+    tail.extend_from_slice(&[7u8; 16]);
+    tail.extend_from_slice(kind);
+    tail.extend_from_slice(body);
+    let mut packet = b"PAR2\0PKT".to_vec();
+    packet.extend_from_slice(&(64 + body.len() as u64).to_le_bytes());
+    packet.extend_from_slice(&Md5::digest(&tail));
+    packet.extend_from_slice(&tail);
+    packet
+}
+
+fn par2_file_desc(id: u8, name: &str, length: u64) -> Vec<u8> {
+    let mut body = vec![id; 16];
+    body.extend_from_slice(&[0xAB; 16]);
+    body.extend_from_slice(&[0xCD; 16]);
+    body.extend_from_slice(&length.to_le_bytes());
+    body.extend_from_slice(name.as_bytes());
+    while !body.len().is_multiple_of(4) {
+        body.push(0);
+    }
+    par2_packet(b"PAR 2.0\0FileDesc", &body)
+}
+
+#[tokio::test]
+async fn a_par2_file_queues_its_files_and_hashes_and_names_an_other_release() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let covers = tempfile::tempdir()?;
+    let scratch = tempfile::tempdir()?;
+    let (claimed, digest) = release(pool, "a1").await?;
+    let id = claimed.id;
+    let (mut manager, _) = manager(pool, covers.path()).await?;
+    let mut context = context(claimed, &digest);
+
+    // One big file, as a single remux would be, plus its sample.
+    let mut data = par2_file_desc(1, &format!("{SCENE}.mkv"), 60_000_000_000);
+    data.extend(par2_file_desc(2, "sample.mkv", 1_000));
+    let path = scratch.path().join("x.par2");
+    std::fs::write(&path, &data)?;
+    assert!(manager.process_par2_file(&path, &mut context).await?);
+    assert!(context.found_par2_info);
+    let names: Vec<&String> = context.pending_release_files.keys().iter().collect();
+    assert_eq!(names, [&format!("{SCENE}.mkv"), &"sample.mkv".to_owned()]);
+    let queued = context
+        .pending_release_files
+        .values()
+        .next()
+        .expect("a queued file");
+    assert_eq!(queued.size, 60_000_000_000);
+    assert_eq!(queued.created_at, "2026-01-01 00:00:00");
+    assert_eq!(context.pending_par_hashes.keys(), ["cd".repeat(16)]);
+    let full: Vec<_> = context.pending_full_par_hashes.values().cloned().collect();
+    assert_eq!(full.len(), 2);
+    assert_eq!(full[0].full_md5, "ab".repeat(16));
+    assert_eq!(full[0].size.as_deref(), Some("60000000000"));
+    // PreDB is matched on whole titles, and the extension spoils that, so the file name
+    // extractor names it without a link, as PHP's check did.
+    let (searchname, linked): (String, i64) =
+        sqlx::query_as("SELECT searchname, CAST(predb_id AS SIGNED) FROM releases WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await?;
+    assert_eq!((searchname.as_str(), linked), (SCENE, 0));
+    assert!(!context.full_par2_evidence_deferred);
+
+    // A packet that fails its checksum, or a missing file, adds nothing.
+    let mut broken = data.clone();
+    let last = broken.len() - 1;
+    broken[last] ^= 1;
+    std::fs::write(&path, &broken)?;
+    let (claimed, digest) = release(pool, "b1").await?;
+    let mut other = self::context(claimed, &digest);
+    assert!(!manager.process_par2_file(&path, &mut other).await?);
+    assert!(
+        !manager
+            .process_par2_file(&scratch.path().join("gone.par2"), &mut other)
+            .await?
+    );
+    assert!(other.pending_release_files.is_empty() && !other.found_par2_info);
+    db.drop_database().await
+}
+
+const NFO_TEXT: &[u8] = b"\xb0\xb1\xb2 GROUP \xb2\xb1\xb0\r\n  Release Date ....: 2021-05-01\r\n  \
+    Source ..........: UHD BluRay\r\n  Video ...........: HEVC 10bit HDR\r\n  \
+    Audio ...........: English TrueHD Atmos 7.1\r\n  \
+    IMDB ............: https://www.imdb.com/title/tt0000001/\r\n";
+
+#[tokio::test]
+async fn a_downloaded_nfo_is_converted_from_cp437_and_stored() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let covers = tempfile::tempdir()?;
+    let scratch = tempfile::tempdir()?;
+    let (claimed, digest) = release(pool, "a1").await?;
+    let id = claimed.id;
+    let (manager, _) = manager(pool, covers.path()).await?;
+    let mut context = context(claimed, &digest);
+    context.release_has_no_nfo = true;
+    let mut service = NfoService::new(
+        pool.clone(),
+        nfo::Settings {
+            batch: 1,
+            lowest_status: nfo::lowest_status(5),
+            max_size: 0,
+            min_size: 0,
+            lookup_par2: false,
+            alternate: false,
+            unrar: None,
+            tmp_path: scratch.path().to_owned(),
+            command_timeout: std::time::Duration::from_secs(5),
+        },
+        support::client(1),
+    );
+
+    let junk = scratch.path().join("junk.nfo");
+    std::fs::write(&junk, [0x01u8; 200])?;
+    assert!(
+        !manager
+            .process_nfo_file(&junk, &mut context, &mut service)
+            .await?
+    );
+    assert!(
+        !manager
+            .process_nfo_file(&scratch.path().join("gone.nfo"), &mut context, &mut service)
+            .await?
+    );
+    assert!(context.release_has_no_nfo);
+
+    let path = scratch.path().join("x.nfo");
+    std::fs::write(&path, NFO_TEXT)?;
+    assert!(
+        manager
+            .process_nfo_file(&path, &mut context, &mut service)
+            .await?
+    );
+    assert!(!context.release_has_no_nfo);
+    let (status, stored): (i64, Vec<u8>) = sqlx::query_as(
+        "SELECT CAST(r.nfostatus AS SIGNED), UNCOMPRESS(n.nfo) FROM releases r \
+         JOIN release_nfos n ON n.releases_id = r.id WHERE r.id = ?",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(status, nfo::NFO_FOUND);
+    let stored = String::from_utf8(stored)?;
+    assert!(stored.starts_with("░▒▓ GROUP ▓▒░\r\n"), "{stored}");
+    db.drop_database().await
+}
+
+fn summary(names: &[&str], archives: Vec<(&str, Summary)>) -> Summary {
+    Summary {
+        file_list: names.iter().map(|name| file(name, 100, 0)).collect(),
+        archives: archives
+            .into_iter()
+            .map(|(name, inner)| (name.as_bytes().to_vec(), inner))
+            .collect(),
+        ..Summary::default()
+    }
+}
+
+async fn searchname(pool: &MySqlPool, id: i64) -> Result<(String, i64)> {
+    Ok(
+        sqlx::query_as("SELECT searchname, CAST(predb_id AS SIGNED) FROM releases WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+#[tokio::test]
+async fn the_first_inner_file_names_the_release() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let predb = NewPredb {
+        title: SCENE.to_owned(),
+        source: "t".to_owned(),
+        ..NewPredb::default()
+    };
+    let InsertOutcome::Inserted(predb_id) = identity::insert_feed(pool, &predb).await? else {
+        panic!("predb row rejected");
+    };
+    certify(pool).await?;
+    let covers = tempfile::tempdir()?;
+    let (mut manager, _) = manager(pool, covers.path()).await?;
+
+    // A PreDB title, matched case-insensitively, names the release with its link.
+    let (claimed, digest) = release(pool, "a1").await?;
+    let id = claimed.id;
+    let mut context = context(claimed, &digest);
+    let lower = format!("{}.mkv", SCENE.to_lowercase());
+    manager
+        .process_release_name_from_rar(&summary(&[&lower, "x.nfo"], vec![]), &mut context)
+        .await?;
+    assert_eq!(
+        searchname(pool, id).await?,
+        (SCENE.to_owned(), predb_id as i64)
+    );
+    assert_eq!(context.release.searchname, SCENE);
+
+    // An unreadable outer name falls through to the archive stored under it.
+    let (claimed, digest) = release(pool, "b1").await?;
+    let nested_id = claimed.id;
+    let mut nested = self::context(claimed, &digest);
+    let inner = summary(&[&format!("{SCENE}.mkv")], vec![]);
+    manager
+        .process_release_name_from_rar(
+            &summary(&["abc123.rar"], vec![("abc123.rar", inner)]),
+            &mut nested,
+        )
+        .await?;
+    assert_eq!(searchname(pool, nested_id).await?.0, SCENE);
+
+    // A possible season pack, or an implausible name, leaves the release alone.
+    let (claimed, digest) = release(pool, "c1").await?;
+    let held_id = claimed.id;
+    let mut held = self::context(claimed, &digest);
+    held.season_pack_probable = true;
+    manager
+        .process_release_name_from_rar(&summary(&[&format!("{SCENE}.mkv")], vec![]), &mut held)
+        .await?;
+    held.season_pack_probable = false;
+    manager
+        .process_release_name_from_rar(&summary(&["Movie.2021.mkv.mkv"], vec![]), &mut held)
+        .await?;
+    assert_eq!(searchname(pool, held_id).await?, ("s".to_owned(), 0));
+    db.drop_database().await
+}
+
+#[tokio::test]
+async fn an_nzbsplit_wrapped_release_is_named_from_its_nzb_titles() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let covers = tempfile::tempdir()?;
+    let (mut manager, _) = manager(pool, covers.path()).await?;
+    let wrapped = |title: &str| NzbFile {
+        title: title.to_owned(),
+        ..NzbFile::default()
+    };
+    let files = [
+        wrapped(""),
+        wrapped("TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__setup.7z.001"),
+        wrapped(
+            "MOVIE__NZBSPLIT__bdab31d6f79989608009e7e8eadcbe66__NZBSPLIT__Some_Movie_2021_2160p_BluRay_x265-GROUP.7z.001",
+        ),
+    ];
+
+    let (claimed, digest) = release(pool, "a1").await?;
+    let id = claimed.id;
+    let mut plain = context(claimed, &digest);
+    assert!(
+        !manager
+            .process_release_name_from_nzb_contents(&files, &mut plain)
+            .await?
+    );
+    assert_eq!(searchname(pool, id).await?.0, "s");
+
+    let (mut claimed, digest) = release(pool, "b1").await?;
+    let wrapped_id = claimed.id;
+    let name = "MOVIE__NZBSPLIT__bdab31d6f79989608009e7e8eadcbe66__NZBSPLIT__x";
+    sqlx::query("UPDATE releases SET name = ? WHERE id = ?")
+        .bind(name)
+        .bind(wrapped_id)
+        .execute(pool)
+        .await?;
+    claimed.name = name.to_owned();
+    let mut context = self::context(claimed, &digest);
+    assert!(
+        manager
+            .process_release_name_from_nzb_contents(&files, &mut context)
+            .await?
+    );
+    assert_eq!(
+        searchname(pool, wrapped_id).await?.0,
+        "Some.Movie.2021.2160p.BluRay.x265-GROUP"
+    );
     db.drop_database().await
 }

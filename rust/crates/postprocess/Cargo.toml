@@ -13,6 +13,7 @@ clap.workspace = true
 crc32fast.workspace = true
 hex.workspace = true
 md-5.workspace = true
+nntmux-categorize.workspace = true
 nntmux-core.workspace = true
 nntmux-metadata.workspace = true
 nntmux-namefix.workspace = true
@@ -31,7 +32,6 @@ tempfile.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-nntmux-categorize.workspace = true
 nntmux-testkit.workspace = true
 
 [lints]
