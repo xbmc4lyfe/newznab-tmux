@@ -122,13 +122,17 @@ services:
 
   # Header ingest and backfill fetch from NNTP. On SIGTERM they finish the header ranges in
   # flight and defer the rest to the next pass.
+  # A header job may run for NN_MULTIPROCESSING_MAX_CHILD_TIME (1800 s by default). On SIGTERM
+  # these roles stop claiming and finish the jobs in flight, so the grace covers a whole job.
   ingest:
     <<: [*app, *worker-memory]
     command: ["nntmux-worker", "ingest"]
+    stop_grace_period: 1920s
 
   backfill:
     <<: [*app, *worker-memory]
     command: ["nntmux-worker", "backfill"]
+    stop_grace_period: 1920s
 
   # ── Pending: postprocess isn't ported yet (ws-postprocess); mail waits until account mail is
   #    configured. `--profile pending` starts them. ──

@@ -2,6 +2,8 @@
 .deploy.lock/
 .deploy.log
 .deploy.config
+.deploy.project
+.deploy.barrier-owed
 # Left behind by the PHP-era deploy guard on existing installs
 .deploy.lock.claim/
 .deploy.lock.recovery-hold
