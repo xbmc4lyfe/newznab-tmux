@@ -353,7 +353,7 @@ pub async fn remove_bad(db: &MySqlPool) -> Result<(u64, u64)> {
     }
     let marked = reset_releases(
         db,
-        "passwordstatus <> 1 AND EXISTS (SELECT 1 FROM release_files f \
+        "passwordstatus NOT IN (1, 3) AND EXISTS (SELECT 1 FROM release_files f \
          WHERE f.releases_id = releases.id AND f.passworded = 1)",
         &[],
         "passwordstatus = 1",

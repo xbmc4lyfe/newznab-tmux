@@ -22,6 +22,8 @@ pub struct Plan {
     pub already_hidden: usize,
     /// Left alone because a name was found since.
     pub named: usize,
+    /// Left alone for now because a postprocess worker holds it.
+    pub claimed: usize,
     pub missing: usize,
 }
 
@@ -31,7 +33,8 @@ pub async fn plan(pool: &MySqlPool, ids: &[i64]) -> Result<Plan> {
     for batch in ids.chunks(BATCH) {
         let mut query = QueryBuilder::new(
             "SELECT CAST(id AS SIGNED), CAST(passwordstatus AS SIGNED),
-                    CAST(isrenamed AS SIGNED), CAST(predb_id AS SIGNED)
+                    CAST(isrenamed AS SIGNED), CAST(predb_id AS SIGNED),
+                    CAST(additional_pp_claim_token IS NOT NULL AS SIGNED)
              FROM releases WHERE id IN (",
         );
         let mut list = query.separated(", ");
@@ -39,13 +42,15 @@ pub async fn plan(pool: &MySqlPool, ids: &[i64]) -> Result<Plan> {
             list.push_bind(*id);
         }
         list.push_unseparated(")");
-        let rows: Vec<(i64, i64, i64, i64)> = query.build_query_as().fetch_all(pool).await?;
+        let rows: Vec<(i64, i64, i64, i64, i64)> = query.build_query_as().fetch_all(pool).await?;
         plan.missing += batch.len() - rows.len();
-        for (id, status, renamed, predb) in rows {
+        for (id, status, renamed, predb, claimed) in rows {
             if status == i64::from(PASSWD_UNIDENTIFIABLE) {
                 plan.already_hidden += 1;
             } else if renamed != 0 || predb != 0 {
                 plan.named += 1;
+            } else if claimed != 0 {
+                plan.claimed += 1;
             } else {
                 plan.eligible.push(id);
             }
@@ -54,8 +59,9 @@ pub async fn plan(pool: &MySqlPool, ids: &[i64]) -> Result<Plan> {
     Ok(plan)
 }
 
-/// Sets the flag, checking again in the write that nothing has named a release since the plan.
-/// Returns how many changed.
+/// Sets the flag, checking again in the write that nothing has named a release since the plan,
+/// and leaving alone any release a postprocess worker holds, since it would write its own status
+/// over this one. A later run picks those up. Returns how many changed.
 pub async fn apply(pool: &MySqlPool, ids: &[i64]) -> Result<u64> {
     let mut changed = 0;
     for batch in ids.chunks(BATCH) {
@@ -63,7 +69,8 @@ pub async fn apply(pool: &MySqlPool, ids: &[i64]) -> Result<u64> {
         for id in batch {
             let result = sqlx::query(
                 "UPDATE releases SET passwordstatus = ?
-                 WHERE id = ? AND passwordstatus IN (-1, 0, 1) AND isrenamed = 0 AND predb_id = 0",
+                 WHERE id = ? AND passwordstatus IN (-1, 0, 1) AND isrenamed = 0 AND predb_id = 0
+                   AND additional_pp_claim_token IS NULL",
             )
             .bind(PASSWD_UNIDENTIFIABLE)
             .bind(id)

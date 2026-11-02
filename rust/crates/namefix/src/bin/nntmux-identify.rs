@@ -99,11 +99,12 @@ fn hide_unidentifiable(ids: &Path, apply: bool) -> Result<()> {
             .context("connecting to MariaDB")?;
         let found = unidentifiable::plan(&pool, &ids).await?;
         println!(
-            "{} IDs: would hide {}, already hidden {}, named since {}, missing {}.",
+            "{} IDs: would hide {}, already hidden {}, named since {}, held by a worker {}, missing {}.",
             ids.len(),
             found.eligible.len(),
             found.already_hidden,
             found.named,
+            found.claimed,
             found.missing
         );
         if apply {
@@ -117,6 +118,10 @@ fn hide_unidentifiable(ids: &Path, apply: bool) -> Result<()> {
 }
 
 fn start(cli: &Cli) -> Result<()> {
+    // This one works on MariaDB, and needs nothing the SQLite commands do.
+    if let Command::HideUnidentifiable { ids, apply } = &cli.command {
+        return hide_unidentifiable(ids, *apply);
+    }
     let metrics = nntmux_telemetry::init("info", false)?;
     let mut options = Options {
         data_dir: cli.data_dir.clone().context("--data-dir is required")?,
@@ -189,9 +194,7 @@ fn start(cli: &Cli) -> Result<()> {
             write_out(&cli.out, "streams.tsv", &lines)?;
             print!("{report}");
         }
-        Command::HideUnidentifiable { ref ids, apply } => {
-            return hide_unidentifiable(ids, apply);
-        }
+        Command::HideUnidentifiable { .. } => unreachable!("handled above"),
         Command::Holdout => {
             let text = render_holdout(&holdout(&options)?);
             write_out(&cli.out, "holdout.md", &text)?;

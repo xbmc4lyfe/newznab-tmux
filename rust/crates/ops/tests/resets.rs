@@ -180,6 +180,17 @@ async fn remove_bad_deletes_failures_and_marks_passworded_releases_once() -> Res
         Some("0")
     );
     assert_eq!(resets::remove_bad(db).await?, (0, 0));
+
+    // A release hidden as unidentifiable stays hidden, whatever its files say.
+    sqlx::query("UPDATE releases SET passwordstatus = 3 WHERE id = ?")
+        .bind(locked)
+        .execute(db)
+        .await?;
+    assert_eq!(resets::remove_bad(db).await?, (0, 0));
+    assert_eq!(
+        value(db, "passwordstatus", locked).await?.as_deref(),
+        Some("3")
+    );
     test.drop_database().await
 }
 

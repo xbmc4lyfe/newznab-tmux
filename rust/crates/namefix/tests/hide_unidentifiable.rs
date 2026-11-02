@@ -81,7 +81,12 @@ async fn a_plan_writes_nothing_and_apply_only_touches_what_nothing_has_named() {
     release(&db.pool, 4, 0, 1, 0).await; // Renamed since.
     release(&db.pool, 5, 0, 0, 77).await; // Linked to PreDB since.
     release(&db.pool, 6, 3, 0, 0).await; // Already hidden.
-    let ids = [1, 2, 3, 4, 5, 6, 99];
+    release(&db.pool, 7, 0, 0, 0).await; // A postprocess worker holds it.
+    sqlx::query("UPDATE releases SET additional_pp_claim_token = 'abc' WHERE id = 7")
+        .execute(&db.pool)
+        .await
+        .expect("claim");
+    let ids = [1, 2, 3, 4, 5, 6, 7, 99];
 
     let found = plan(&db.pool, &ids).await.expect("plan");
     let mut eligible = found.eligible.clone();
@@ -95,6 +100,7 @@ async fn a_plan_writes_nothing_and_apply_only_touches_what_nothing_has_named() {
             eligible: vec![1, 2, 3],
             already_hidden: 1,
             named: 2,
+            claimed: 1,
             missing: 1,
         }
     );
@@ -122,6 +128,22 @@ async fn a_plan_writes_nothing_and_apply_only_touches_what_nothing_has_named() {
 
     // Running it again changes nothing.
     assert_eq!(apply(&db.pool, &ids).await.expect("apply"), 0);
+}
+
+#[test]
+fn the_command_needs_no_sqlite_options() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ids = dir.path().join("ids.txt");
+    std::fs::write(&ids, "1\n").expect("ids");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_nntmux-identify"))
+        .args(["hide-unidentifiable", "--ids"])
+        .arg(&ids)
+        .env_remove("DATABASE_URL")
+        .output()
+        .expect("runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("DATABASE_URL"), "{stderr}");
+    assert!(!stderr.contains("--data-dir"), "{stderr}");
 }
 
 #[tokio::test]
