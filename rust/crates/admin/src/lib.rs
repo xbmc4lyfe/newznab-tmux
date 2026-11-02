@@ -7,6 +7,7 @@ pub mod captcha;
 pub mod gdpr;
 pub mod groups;
 pub mod roles;
+pub mod settings;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -41,6 +42,44 @@ pub enum Command {
     /// Newsgroups (the admin group pages).
     #[command(subcommand)]
     Group(GroupCommand),
+    /// Site, registration, ingestion, post-processing, metadata and tmux settings
+    /// (the admin settings pages).
+    #[command(subcommand)]
+    Settings(SettingsCommand),
+}
+
+/// `nntmux-ctl admin settings ...`
+#[derive(Debug, Subcommand)]
+pub enum SettingsCommand {
+    /// Show a domain's settings, or every domain's without one.
+    Show {
+        #[arg(value_enum)]
+        domain: Option<settings::Domain>,
+    },
+    /// Change settings, as `column=value` pairs. Sizes take MB or GB (`500MB`); yes/no
+    /// settings take 1 or 0; choices take their number or label.
+    Set {
+        #[arg(value_enum)]
+        domain: settings::Domain,
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
+    /// Replace the tmux cleanup rules. Without rules or `--clear`, list them.
+    CleanupRules {
+        rules: Vec<String>,
+        /// Remove every rule.
+        #[arg(long, conflicts_with = "rules")]
+        clear: bool,
+    },
+    /// Replace the excluded tmux colors (0-255, inside the color range). Without colors or
+    /// `--clear`, list them.
+    ColorExclusions {
+        #[arg(value_delimiter = ',')]
+        colors: Vec<u8>,
+        /// Remove every exclusion.
+        #[arg(long, conflicts_with = "colors")]
+        clear: bool,
+    },
 }
 
 /// `nntmux-ctl admin group ...`. A group is named by its id or its full name.
@@ -251,6 +290,94 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
         }
         Command::Role(command) => role(&ctx, command, now).await?,
         Command::Group(command) => group(&ctx, command, now).await?,
+        Command::Settings(command) => settings_command(&ctx.db, command, now).await?,
+    }
+    Ok(())
+}
+
+async fn settings_command(
+    db: &sqlx::MySqlPool,
+    command: SettingsCommand,
+    now: chrono::NaiveDateTime,
+) -> Result<()> {
+    match command {
+        SettingsCommand::Show { domain } => {
+            let domains =
+                domain.map_or_else(|| settings::Domain::ALL.to_vec(), |domain| vec![domain]);
+            for (index, domain) in domains.into_iter().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                println!("[{domain}] {}", domain.guidance());
+                for (field, value) in settings::show(db, domain).await? {
+                    println!("  {} = {}", field.column, field.display(value.as_deref()));
+                }
+                if domain == settings::Domain::Tmux {
+                    println!(
+                        "  cleanup_rules = {}",
+                        settings::cleanup_rules(db).await?.join(",")
+                    );
+                    let colors = settings::color_exclusions(db).await?;
+                    println!(
+                        "  color_exclusions = {}",
+                        colors
+                            .iter()
+                            .map(u8::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
+            }
+        }
+        SettingsCommand::Set { domain, values } => {
+            let values = settings::assignments(domain, &values)?;
+            settings::update(db, domain, &values, now).await?;
+            let shown = settings::show(db, domain).await?;
+            for (field, _) in &values {
+                if let Some((_, value)) =
+                    shown.iter().find(|(shown, _)| shown.column == field.column)
+                {
+                    println!(
+                        "{domain}.{} = {}",
+                        field.column,
+                        field.display(value.as_deref())
+                    );
+                }
+            }
+            println!("{}", domain.guidance());
+        }
+        SettingsCommand::CleanupRules { rules, clear } => {
+            if clear || !rules.is_empty() {
+                settings::set_cleanup_rules(db, &rules, now).await?;
+            }
+            let rules = settings::cleanup_rules(db).await?;
+            println!(
+                "cleanup rules: {}",
+                if rules.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    rules.join(", ")
+                }
+            );
+        }
+        SettingsCommand::ColorExclusions { colors, clear } => {
+            if clear || !colors.is_empty() {
+                settings::set_color_exclusions(db, &colors, now).await?;
+            }
+            let colors = settings::color_exclusions(db).await?;
+            println!(
+                "excluded colors: {}",
+                if colors.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    colors
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+        }
     }
     Ok(())
 }
