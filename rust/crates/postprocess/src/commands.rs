@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use nntmux_namefix::update::ReleaseSearch;
-use nntmux_runtime::Ctx;
+use nntmux_runtime::{Ctx, Shutdown};
 use nntmux_search::SearchClient;
 use sqlx::{AssertSqlSafe, MySqlPool};
 
@@ -34,7 +34,7 @@ fn search(ctx: &Ctx) -> Result<Arc<dyn ReleaseSearch>> {
     }))
 }
 
-async fn services(ctx: &Ctx) -> Result<Services> {
+pub(crate) async fn services(ctx: &Ctx) -> Result<Services> {
     let config = Config::load(&ctx.db).await?;
     Services::build(ctx.db.clone(), config, search(ctx)?).await
 }
@@ -161,14 +161,12 @@ pub async fn guid(ctx: &Ctx, options: GuidOptions) -> Result<()> {
     let guid = options.guid.as_str();
     let renamed = || tv_pipeline::renamed_argument(options.renamed.as_deref());
     match options.kind.as_str() {
-        "additional" => additional_bucket(ctx, &options).await,
+        "additional" => additional_bucket(ctx, &options, &Shutdown::default()).await,
         "nfo" => {
-            let config = Config::load(&ctx.db).await?;
-            let nntp = nntmux_nntp::NntpConfig::from_env();
-            let settings = nfo::Settings::from_config(&config, nntp.alternate_article_fallback);
-            let client = nntmux_nntp::NntpClient::new(Arc::new(nntp));
-            let mut service = nfo::NfoService::new(ctx.db.clone(), settings, client);
-            service.process_nfo_files(None, guid).await?;
+            nfo_service(ctx)
+                .await?
+                .process_nfo_files(None, guid)
+                .await?;
             Ok(())
         }
         "movie" => match renamed() {
@@ -202,9 +200,23 @@ pub async fn guid(ctx: &Ctx, options: GuidOptions) -> Result<()> {
     }
 }
 
+/// An NFO service on the configured news server.
+pub(crate) async fn nfo_service(ctx: &Ctx) -> Result<nfo::NfoService> {
+    let config = Config::load(&ctx.db).await?;
+    let nntp = nntmux_nntp::NntpConfig::from_env();
+    let settings = nfo::Settings::from_config(&config, nntp.alternate_article_fallback);
+    let client = nntmux_nntp::NntpClient::new(Arc::new(nntp));
+    Ok(nfo::NfoService::new(ctx.db.clone(), settings, client))
+}
+
 /// `processAdditional`: claim batches of the bucket until none is left, the batch limit or the
 /// child time limit.
-async fn additional_bucket(ctx: &Ctx, options: &GuidOptions) -> Result<()> {
+/// A requested `stop` ends the loop between batches; a batch already claimed finishes.
+pub(crate) async fn additional_bucket(
+    ctx: &Ctx,
+    options: &GuidOptions,
+    stop: &Shutdown,
+) -> Result<()> {
     let mut services = services(ctx).await?;
     let max_batches = if options.worker {
         options.max_batches.max(1)
@@ -217,7 +229,7 @@ async fn additional_bucket(ctx: &Ctx, options: &GuidOptions) -> Result<()> {
         + std::time::Duration::from_secs(u64::try_from((child_time - 30).max(1)).unwrap_or(1));
     let mut excluded: Vec<i64> = Vec::new();
     let mut batch = 0;
-    while batch < max_batches && Instant::now() < deadline {
+    while batch < max_batches && Instant::now() < deadline && !stop.requested() {
         let result =
             orchestrator::start(&mut services, &options.guid, 0, &worker_token, &excluded).await?;
         batch += 1;

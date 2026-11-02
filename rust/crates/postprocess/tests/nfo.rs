@@ -292,3 +292,25 @@ async fn an_alternate_nfo_is_kept_once() -> Result<()> {
     assert_eq!(state(pool, id).await?.2, Some(NFO.to_owned()));
     db.drop_database().await
 }
+
+#[tokio::test]
+async fn buckets_with_nfo_work_are_listed_once() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let tmp = tempfile::tempdir()?;
+    release(pool, "a1", -1, &[]).await?;
+    release(pool, "a2", -1, &[]).await?;
+    release(pool, "b1", -1, &[]).await?;
+    // Done, and out of retries: neither is work.
+    release(pool, "c1", 1, &[]).await?;
+    release(pool, "d1", -9, &[]).await?;
+    let service = NfoService::new(pool.clone(), settings(tmp.path(), None), client(1));
+
+    let mut buckets = service.buckets().await?;
+    buckets.sort();
+
+    assert_eq!(buckets, ["a", "b"]);
+    db.drop_database().await
+}
