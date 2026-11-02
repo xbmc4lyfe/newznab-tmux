@@ -12,7 +12,8 @@
                                     (space-separated) or absent from the base roster read as names on
                                     fd 3, unless labelled nntmux.deploy.stateless: "true"
   deploy-inspect configs            one "service hash" line per service that bind-mounts config
-  deploy-inspect storage            the same, for where existing writable bind mounts really land
+  deploy-inspect storage            the same, for where existing writable bind mounts really land,
+                                    then `link` if one is reached through a symlink, else `-`
   deploy-inspect interpolated FILE  keys of a dotenv FILE whose value Compose would interpolate
 
 A service's config hash covers the content of every bind-mounted file, and of every file under a
@@ -236,7 +237,9 @@ def main() -> None:
             digest = hashlib.sha256()
             for path in storage:
                 storage_identity(path, digest)
-            print(f"{name} {digest.hexdigest()}")
+            # Docker records the unresolved path, so a container can't say which target it mounted.
+            linked = any(os.path.realpath(path) != os.path.abspath(path) for path in storage)
+            print(f"{name} {digest.hexdigest()} {'link' if linked else '-'}")
     else:
         sys.exit(__doc__)
 

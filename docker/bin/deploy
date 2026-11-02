@@ -238,14 +238,22 @@ done < "$work/configs"
 # Where a data service's writable storage really lands (a symlink's target, the directory itself),
 # stamped as `<service>@storage`. Compose sees only the unchanged mount path, so a storage cutover
 # by retargeting a symlink or swapping in restored storage is refused here like changed config,
-# and recreated only with DEPLOY_RECREATE_DATA=1. Storage not yet recorded is only recorded.
+# and recreated only with DEPLOY_RECREATE_DATA=1. Unrecorded storage (first deploy, older stamp)
+# is recorded, except that an existing container on storage reached through a symlink may have
+# mounted an earlier target (Docker keeps only the unresolved path), so it is recreated through
+# the same guarded path rather than adopted as the baseline.
 "$inspect" storage < "$work/model.json" > "$work/storage"
-while read -r svc hash; do
+while read -r svc hash linked; do
     has "$data_services" "$svc" || continue
     has "$targets" "$svc" || continue
-    [ -f "$config_stamp" ] || continue
-    old=$(awk -v s="$svc@storage" '$1 == s { print $2 }' "$config_stamp")
-    [ -z "$old" ] || [ "$old" = "$hash" ] || has "$blocked" "$svc" || blocked="$blocked $svc"
+    old=""
+    [ -f "$config_stamp" ] && old=$(awk -v s="$svc@storage" '$1 == s { print $2 }' "$config_stamp")
+    if [ -z "$old" ]; then
+        [ "$linked" = link ] && [ -n "$("$compose" ps -aq "$svc")" ] || continue
+    elif [ "$old" = "$hash" ]; then
+        continue
+    fi
+    has "$blocked" "$svc" || blocked="$blocked $svc"
 done < "$work/storage"
 
 # A data service whose Compose definition or image changed would be recreated by `run` or `up`
@@ -526,7 +534,7 @@ fi
     # Storage: what the preflight saw, or for storage Compose has just created, what exists now.
     # A retarget after the preflight is therefore still caught by the next deploy.
     "$inspect" storage < "$work/model.json" > "$work/storage-now"
-    while read -r svc hash; do
+    while read -r svc hash _; do
         has "$data_services" "$svc" || continue
         if has "$targets" "$svc"; then
             seen=$(awk -v s="$svc" '$1 == s { print $2 }' "$work/storage")
