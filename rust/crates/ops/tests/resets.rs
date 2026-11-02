@@ -300,3 +300,38 @@ fn remove_files_keeps_directories_dot_files_and_named_files() -> Result<()> {
     assert_eq!(resets::remove_files(&dir.path().join("missing"), &[])?, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn resets_keep_an_unidentifiable_release_out_of_the_queue() -> Result<()> {
+    let Some(test) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let db = &test.pool;
+    let unidentifiable = release(db, "e0", 10).await?;
+    let plain = release(db, "f0", 10).await?;
+    sqlx::query("UPDATE releases SET passwordstatus = 3 WHERE id = ?")
+        .bind(unidentifiable)
+        .execute(db)
+        .await?;
+
+    assert_eq!(resets::reset_category(db, "misc").await?, 2);
+    assert_eq!(
+        value(db, "passwordstatus", unidentifiable)
+            .await?
+            .as_deref(),
+        Some("3")
+    );
+    assert_eq!(
+        value(db, "passwordstatus", plain).await?.as_deref(),
+        Some("-1")
+    );
+
+    resets::reset_all_postprocessing(db).await?;
+    assert_eq!(
+        value(db, "passwordstatus", unidentifiable)
+            .await?
+            .as_deref(),
+        Some("3")
+    );
+    test.drop_database().await
+}

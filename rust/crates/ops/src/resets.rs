@@ -15,7 +15,9 @@ const CHUNK: usize = 1000;
 const TV_RESET: &str =
     "videos_id = 0, tv_episodes_id = 0, tv_lookup_attempts = 0, tv_lookup_retry_at = NULL";
 const BOOK_RESET: &str = "bookinfo_id = NULL, book_lookup_attempts = 0, book_lookup_retry_at = NULL, book_name_normalized_at = NULL";
-const ARCHIVE_RESET: &str = "passwordstatus = -1, haspreview = -1, archive_retry_at = NULL, jpgstatus = 0, videostatus = 0, nfostatus = -1";
+/// A release identification marked unidentifiable (`passwordstatus = 3`) keeps that status, so a
+/// reset never puts it back in the archive queue or in search results.
+const ARCHIVE_RESET: &str = "passwordstatus = IF(passwordstatus = 3, 3, -1), haspreview = -1, archive_retry_at = NULL, jpgstatus = 0, videostatus = 0, nfostatus = -1";
 const GROUP_RESET: &str = "UPDATE usenet_groups SET first_record = 0, first_record_postdate = NULL, \
      last_record = 0, last_record_postdate = NULL, last_updated = NULL";
 
