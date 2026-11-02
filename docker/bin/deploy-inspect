@@ -11,7 +11,8 @@
   deploy-inspect data BASE IMAGE    stateful services: not running IMAGE, and either listed in BASE
                                     (space-separated) or absent from the base roster read as names on
                                     fd 3, unless labelled nntmux.deploy.stateless: "true"
-  deploy-inspect configs            one "service hash" line per service that bind-mounts config
+  deploy-inspect configs            one "service hash link" line per service that bind-mounts config
+                                    (link: `link` if a source is reached through a symlink, else `-`)
   deploy-inspect storage            the same, for where existing writable bind mounts really land,
                                     then `link` if one is reached through a symlink, else `-`
   deploy-inspect interpolated FILE  keys of a dotenv FILE whose value Compose would interpolate
@@ -127,8 +128,13 @@ def refusals(model: dict, image: str) -> list[str]:
             if not check or check.get("disable") or test in (["NONE"], "NONE") or test[:1] == ["NONE"]:
                 out.append(f"{name}: needs a health check; the deploy only trusts a healthy app service")
         replicas = (svc.get("deploy") or {}).get("replicas", svc.get("scale", 1))
-        if app and replicas not in (None, 1):
-            out.append(f"{name}: runs {replicas} replicas; an app service runs exactly one")
+        labels = svc.get("labels") or {}
+        stateless = isinstance(labels, dict) and str(labels.get("nntmux.deploy.stateless", "")).lower() == "true"
+        # An app service or a database with several replicas could be migrated, fenced or written
+        # on different backends; only a service labelled stateless may scale.
+        if replicas not in (None, 1) and (app or not stateless):
+            out.append(f"{name}: runs {replicas} replicas; only a service labelled "
+                       f"nntmux.deploy.stateless: \"true\" may run more than one")
     # The pending check, migrations and the barrier all use migrate's database, so every app role
     # must connect to that same one.
     keys = ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
@@ -147,6 +153,16 @@ def refusals(model: dict, image: str) -> list[str]:
         if differs:
             out.append(f"{name}: {', '.join(differs)} differ from migrate's, so it may use an unmigrated, unfenced database")
     return out
+
+
+def through_link(path: str) -> bool:
+    """Whether a mount source, or anything under it, is reached through a symlink."""
+    if os.path.realpath(path) != os.path.abspath(path):
+        return True
+    for root, dirs, files in os.walk(path):
+        if any(os.path.islink(os.path.join(root, entry)) for entry in dirs + files):
+            return True
+    return False
 
 
 def storage_identity(path: str, digest) -> None:
@@ -227,7 +243,8 @@ def main() -> None:
             # Compose configs and secrets are mounted config too, from a file or the environment.
             if not resource_digest(model, services[name], digest) and not sources:
                 continue
-            print(f"{name} {digest.hexdigest()}")
+            linked = any(through_link(source) for source in sources)
+            print(f"{name} {digest.hexdigest()} {'link' if linked else '-'}")
     elif command == ["storage"]:
         # Only storage that exists: Compose creates a missing bind source when it starts the service.
         for name in sorted(services):

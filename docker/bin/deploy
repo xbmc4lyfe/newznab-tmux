@@ -219,14 +219,16 @@ data_recreate=()
 fence_stop=()
 unfenced=0
 blocked=""
-while read -r svc hash; do
+while read -r svc hash linked; do
     has "$targets" "$svc" || continue
-    if [ -f "$config_stamp" ]; then
-        old=$(awk -v s="$svc" '$1 == s { print $2 }' "$config_stamp")
-        [ "$old" = "$hash" ] && continue
-        [ -z "$old" ] && has "$data_services" "$svc" && continue
-    elif has "$data_services" "$svc"; then
-        continue
+    old=""
+    [ -f "$config_stamp" ] && old=$(awk -v s="$svc" '$1 == s { print $2 }' "$config_stamp")
+    [ "$old" = "$hash" ] && continue
+    # An unrecorded data service's config is only recorded, unless a running container may have
+    # mounted another symlink target than the one hashed now (Docker keeps only the unresolved
+    # path); that one goes through the guarded recreation instead.
+    if [ -z "$old" ] && has "$data_services" "$svc"; then
+        [ "$linked" = link ] && [ -n "$("$compose" ps -aq "$svc")" ] || continue
     fi
     if has "$data_services" "$svc"; then
         blocked="$blocked $svc"
@@ -522,7 +524,7 @@ fi
 
 # Save the stamp: services rolled out now get their new hash; the others keep their old one.
 {
-    while read -r svc hash; do
+    while read -r svc hash _; do
         # A service outside the targets keeps its old entry, or stays unrecorded so the next
         # deploy that includes it still applies its config.
         if has "$targets" "$svc"; then
