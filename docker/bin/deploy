@@ -141,6 +141,7 @@ done
 # another revision's files; a data service's hash is only recorded.
 "$inspect" configs "$stack" < "$work/model.json" > "$work/configs"
 recreate=()
+data_recreate=()
 blocked=""
 while read -r svc hash; do
     has "$targets" "$svc" || continue
@@ -152,17 +153,34 @@ while read -r svc hash; do
         continue
     fi
     if has "$data_services" "$svc"; then
-        if [ "${DEPLOY_RECREATE_DATA:-0}" = 1 ]; then
-            recreate+=("$svc")
-        else
-            blocked="$blocked $svc"
-        fi
+        blocked="$blocked $svc"
     else
         recreate+=("$svc")
     fi
 done < "$work/configs"
+
+# A data service whose Compose definition or image changed would be recreated by `run` or `up`
+# as a side effect, even when it isn't a target (dependencies are recreated too). Every data
+# service with a container is checked against what Compose would run now.
+for svc in $("$inspect" services < "$work/model.json"); do
+    has "$data_services" "$svc" || continue
+    has "$blocked" "$svc" && continue
+    id=$("$compose" ps -aq "$svc" | head -n 1)
+    [ -n "$id" ] || continue
+    want_hash=$("$compose" config --hash "$svc" | awk '{ print $2 }')
+    have_hash=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$id")
+    want_image=$(docker image inspect --format '{{.Id}}' "$("$inspect" image-of "$svc" < "$work/model.json")" 2>/dev/null || true)
+    have_image=$(docker inspect --format '{{.Image}}' "$id")
+    if [ "$want_hash" != "$have_hash" ] || [ "$want_image" != "$have_image" ]; then
+        blocked="$blocked $svc"
+    fi
+done
+if [ -n "$blocked" ] && [ "${DEPLOY_RECREATE_DATA:-0}" = 1 ]; then
+    for svc in $blocked; do data_recreate+=("$svc"); done
+    blocked=""
+fi
 if [ -n "$blocked" ]; then
-    echo "Mounted config changed for data service(s):$blocked." >&2
+    echo "The definition, image or mounted config changed for data service(s):$blocked." >&2
     echo "Recreating one interrupts every writer. Plan a window, then rerun with DEPLOY_RECREATE_DATA=1." >&2
     exit 1
 fi
@@ -170,6 +188,7 @@ fi
 if [ "$dry_run" = 1 ]; then
     echo "Would build $image from $commit and roll out: ${services[*]:-every default service}."
     [ "$need_migrate" = 1 ] && echo "Would run migrate before recreating anything."
+    echo "Would recreate data services first (DEPLOY_RECREATE_DATA=1): ${data_recreate[*]:-none}."
     echo "Would force-recreate for changed mounted config: ${recreate[*]:-none}."
     "$compose" up --dry-run --no-build -d ${services[@]+"${services[@]}"}
     exit 0
@@ -183,6 +202,10 @@ printf '%s deploy result=started by=%s commit=%s services=%s\n' \
 docker build --label "org.opencontainers.image.revision=$commit" -t "$image" "$repo"
 built=$(docker image inspect --format '{{.Id}}' "$image")
 
+if [ ${#data_recreate[@]} -gt 0 ]; then
+    echo "Recreating data services, as DEPLOY_RECREATE_DATA=1 allows: ${data_recreate[*]}."
+    "$compose" up -d --wait --wait-timeout "$timeout" --no-deps --force-recreate "${data_recreate[@]}"
+fi
 if [ "$need_migrate" = 1 ]; then
     echo "Running migrations before recreating any service."
     "$compose" run --rm migrate
@@ -217,9 +240,11 @@ fi
 # Save the stamp: services rolled out now get their new hash; the others keep their old one.
 {
     while read -r svc hash; do
-        if has "$targets" "$svc" || [ ! -f "$config_stamp" ]; then
+        # A service outside the targets keeps its old entry, or stays unrecorded so the next
+        # deploy that includes it still applies its config.
+        if has "$targets" "$svc"; then
             echo "$svc $hash"
-        else
+        elif [ -f "$config_stamp" ]; then
             awk -v s="$svc" '$1 == s' "$config_stamp"
         fi
     done < "$work/configs"

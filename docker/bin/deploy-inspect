@@ -4,6 +4,7 @@
   deploy-inspect name               the Compose project name
   deploy-inspect services           every service, in any profile
   deploy-inspect image-users IMAGE  services that run IMAGE
+  deploy-inspect image-of SERVICE   the image SERVICE runs
   deploy-inspect configs ROOT...    one "service hash" line per service that bind-mounts config
   deploy-inspect interpolated FILE  keys of a dotenv FILE whose value Compose would interpolate
 
@@ -76,6 +77,8 @@ def main() -> None:
         print(model.get("name", ""))
     elif command == ["services"]:
         print("\n".join(sorted(services)))
+    elif command == ["image-of"]:
+        print((services.get(sys.argv[2]) or {}).get("image", ""))
     elif command == ["image-users"]:
         image = sys.argv[2]
         print("\n".join(sorted(name for name, svc in services.items() if svc.get("image") == image)))
