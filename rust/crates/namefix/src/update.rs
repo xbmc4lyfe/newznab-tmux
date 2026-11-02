@@ -1309,7 +1309,9 @@ pub async fn allows_archive_naming_locked(
     Ok(false)
 }
 
-fn decode_witnesses(json: &str) -> Result<Vec<String>> {
+/// `ReleaseArchiveNamingEvidence::decodeNames`: the stored witnesses, which must already be within
+/// bounds and free of duplicates.
+pub fn decode_witnesses(json: &str) -> Result<Vec<String>> {
     let parsed: Value =
         serde_json::from_str(json).map_err(|_| anyhow!("Malformed archive filename witnesses."))?;
     let list = parsed

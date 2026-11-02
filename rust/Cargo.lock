@@ -2654,6 +2654,7 @@ dependencies = [
  "nntmux-metadata",
  "nntmux-namefix",
  "nntmux-nntp",
+ "nntmux-predb",
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",
