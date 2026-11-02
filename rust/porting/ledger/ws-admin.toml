@@ -346,31 +346,36 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/group-bulk"
 source = "App\\Http\\Controllers\\Admin\\AdminGroupController@createBulk"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin group bulk-add <regex>`."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/group-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminGroupController@edit"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin group show` and `group add`."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/group-list"
 source = "App\\Http\\Controllers\\Admin\\AdminGroupController@index"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin group list` (with --name, --active/--inactive, --backfill/--no-backfill) and `group show`."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/group-list-active"
 source = "App\\Http\\Controllers\\Admin\\AdminGroupController@active"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin group list --active`."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/group-list-inactive"
 source = "App\\Http\\Controllers\\Admin\\AdminGroupController@inactive"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin group list --inactive`."
 
 [[entry]]
 kind = "route"
@@ -821,13 +826,15 @@ status = "todo"
 kind = "route"
 id = "POST /admin/group-bulk"
 source = "App\\Http\\Controllers\\Admin\\AdminGroupController@createBulk"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin group bulk-add <regex>`."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/group-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminGroupController@edit"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin group add` and `group edit`."
 
 [[entry]]
 kind = "route"

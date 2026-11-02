@@ -173,7 +173,45 @@ pub(super) fn owed_partial_attempt(verify: &Verify, row: &Candidate) -> bool {
             || (row.status == "ready" && row.reason.as_deref() == Some(PARTIAL_QUEUED)))
 }
 
+/// Expires every unpublished candidate of a group whatever its age, so a group reset or purge
+/// can't be refilled by work already queued for it. The caller holds admission and workers out
+/// with [`crate::reset::fenced`], so no lease is live.
+pub async fn expire_group(verify: &Verify, groups_id: u32) -> Result<u64> {
+    let mut after: u64 = 0;
+    let mut expired = 0;
+    loop {
+        let sql = format!(
+            "SELECT id FROM release_verification_candidates WHERE groups_id = ? AND id > ? \
+             AND release_id IS NULL AND status IN ({EXPIRABLE}) ORDER BY id LIMIT 500"
+        );
+        let ids: Vec<u64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(groups_id)
+            .bind(after)
+            .fetch_all(&verify.db)
+            .await?;
+        let Some(&last) = ids.last() else {
+            return Ok(expired);
+        };
+        after = last;
+        for id in ids {
+            if expire_candidate_as(verify, id as i64, false, true).await? {
+                expired += 1;
+            }
+        }
+    }
+}
+
 async fn expire_candidate(verify: &Verify, id: i64, partials: bool) -> Result<bool> {
+    expire_candidate_as(verify, id, partials, false).await
+}
+
+/// `forced` skips the age, lease and owed-partial checks, for a group reset under the fence.
+async fn expire_candidate_as(
+    verify: &Verify,
+    id: i64,
+    partials: bool,
+    forced: bool,
+) -> Result<bool> {
     let config = &verify.config;
     let done = in_tx!(verify.db, 5, |tx| {
         let row: Option<Candidate> =
@@ -185,11 +223,13 @@ async fn expire_candidate(verify: &Verify, id: i64, partials: bool) -> Result<bo
             return Ok::<Option<String>, anyhow::Error>(None);
         };
         let now = now();
-        if row.release_id.is_some()
-            || !expirable(&row.status)
-            || row.last_unique_at >= now - TimeDelta::hours(config.expiry_hours)
-            || row.lease_until.is_some_and(|until| until >= now)
-            || (partials && owed_partial_attempt(verify, &row))
+        if row.release_id.is_some() || !expirable(&row.status) {
+            return Ok(None);
+        }
+        if !forced
+            && (row.last_unique_at >= now - TimeDelta::hours(config.expiry_hours)
+                || row.lease_until.is_some_and(|until| until >= now)
+                || (partials && owed_partial_attempt(verify, &row)))
         {
             return Ok(None);
         }

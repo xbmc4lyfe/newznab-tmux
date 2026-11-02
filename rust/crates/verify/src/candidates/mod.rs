@@ -19,7 +19,7 @@ use crate::config::VerificationConfig;
 pub use admit::{AdmissionDeferred, CandidateAdmission, enqueue_with_admission};
 pub use archive::{MetadataBudgetExceeded, archive};
 pub use deferrals::{KeptCollection, archive_each, forget_deferrals, unlocked_ids};
-pub use expiry::expire;
+pub use expiry::{expire, expire_group};
 pub use hot::invalidate_hot_collections;
 pub use queue::{
     Claim, FinishedAttempt, abandon_upgrade, claim, defer_partial, finish, heartbeat,

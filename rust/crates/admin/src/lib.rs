@@ -5,9 +5,10 @@
 pub mod accounts;
 pub mod captcha;
 pub mod gdpr;
+pub mod groups;
 pub mod roles;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use chrono::Utc;
 use clap::Subcommand;
@@ -37,6 +38,162 @@ pub enum Command {
     /// Role stacking (`role:manage`).
     #[command(subcommand)]
     Role(RoleCommand),
+    /// Newsgroups (the admin group pages).
+    #[command(subcommand)]
+    Group(GroupCommand),
+}
+
+/// `nntmux-ctl admin group ...`. A group is named by its id or its full name.
+#[derive(Debug, Subcommand)]
+pub enum GroupCommand {
+    /// List groups with their release counts.
+    List {
+        /// Only names containing this text.
+        #[arg(long)]
+        name: Option<String>,
+        /// Only active groups.
+        #[arg(long, conflicts_with = "inactive")]
+        active: bool,
+        /// Only inactive groups.
+        #[arg(long)]
+        inactive: bool,
+        /// Only groups with backfill on.
+        #[arg(long, conflicts_with = "no_backfill")]
+        backfill: bool,
+        /// Only groups with backfill off.
+        #[arg(long)]
+        no_backfill: bool,
+    },
+    /// Show one group.
+    Show { group: String },
+    /// Add a group. A leading `a.b.` becomes `alt.binaries.`.
+    Add {
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Start updating it.
+        #[arg(long)]
+        active: bool,
+        /// Backfill it.
+        #[arg(long)]
+        backfill: bool,
+        /// Days to backfill (default 1).
+        #[arg(long)]
+        backfill_days: Option<i32>,
+        /// Fewest files a release may have; the site setting applies without it.
+        #[arg(long)]
+        min_files: Option<i32>,
+        /// Smallest release, such as 500MB or 2GB; the site setting applies without it.
+        #[arg(long, value_parser = groups::parse_size)]
+        min_size: Option<i64>,
+    },
+    /// Add every group on the news server whose name matches a regular expression
+    /// (case-insensitive), active and backfilling unless told otherwise.
+    BulkAdd {
+        pattern: String,
+        /// Add them turned off.
+        #[arg(long)]
+        inactive: bool,
+        /// Add them without backfill.
+        #[arg(long)]
+        no_backfill: bool,
+    },
+    /// Change a group's settings.
+    Edit {
+        group: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        backfill_days: Option<i32>,
+        #[arg(long)]
+        first_record: Option<u64>,
+        #[arg(long)]
+        last_record: Option<u64>,
+        #[arg(long)]
+        active: Option<bool>,
+        #[arg(long)]
+        backfill: Option<bool>,
+        /// Fewest files, or `default` for the site setting.
+        #[arg(long, value_parser = parse_min_files)]
+        min_files: Option<Minimum>,
+        /// Smallest release such as 500MB, or `default` for the site setting.
+        #[arg(long, value_parser = parse_min_size)]
+        min_size: Option<Minimum>,
+    },
+    /// Turn updating on, or backfill with `--backfill`.
+    Enable {
+        group: String,
+        #[arg(long)]
+        backfill: bool,
+    },
+    /// Turn updating off, or backfill with `--backfill`.
+    Disable {
+        group: String,
+        #[arg(long)]
+        backfill: bool,
+    },
+    /// Drop a group's unfinished collections and part repair rows, start its counters over and
+    /// turn it off. `--all` empties those tables for every group.
+    Reset {
+        group: Option<String>,
+        #[arg(long, conflicts_with = "group")]
+        all: bool,
+        /// Confirm. Without it, only show what would change.
+        #[arg(long)]
+        yes: bool,
+        /// Seconds to wait for active processing to drain first.
+        #[arg(long, default_value_t = DRAIN_TIMEOUT)]
+        drain_timeout: u64,
+    },
+    /// Reset a group (or `--all`) and delete its releases.
+    Purge {
+        group: Option<String>,
+        #[arg(long, conflicts_with = "group")]
+        all: bool,
+        /// Confirm. Without it, only show what would change.
+        #[arg(long)]
+        yes: bool,
+        /// Seconds to wait for active processing to drain first.
+        #[arg(long, default_value_t = DRAIN_TIMEOUT)]
+        drain_timeout: u64,
+    },
+    /// Purge a group, then remove it.
+    Delete {
+        group: String,
+        /// Confirm. Without it, only show what would change.
+        #[arg(long)]
+        yes: bool,
+        /// Seconds to wait for active processing to drain first.
+        #[arg(long, default_value_t = DRAIN_TIMEOUT)]
+        drain_timeout: u64,
+    },
+}
+
+/// How long a destructive group change waits for processing to drain, as deploys do.
+const DRAIN_TIMEOUT: u64 = 900;
+
+/// A per-group minimum, or the site setting.
+#[derive(Clone, Copy, Debug)]
+pub struct Minimum(Option<i64>);
+
+fn parse_min_files(text: &str) -> Result<Minimum> {
+    if text.eq_ignore_ascii_case("default") {
+        return Ok(Minimum(None));
+    }
+    let files: i32 = text
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{text} isn't a whole number or `default`"))?;
+    Ok(Minimum(Some(files.into())))
+}
+
+fn parse_min_size(text: &str) -> Result<Minimum> {
+    if text.eq_ignore_ascii_case("default") {
+        return Ok(Minimum(None));
+    }
+    Ok(Minimum(Some(groups::parse_size(text)?)))
 }
 
 /// `nntmux-ctl admin role ...`
@@ -93,6 +250,7 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
             }
         }
         Command::Role(command) => role(&ctx, command, now).await?,
+        Command::Group(command) => group(&ctx, command, now).await?,
     }
     Ok(())
 }
@@ -231,4 +389,339 @@ async fn role(ctx: &Ctx, command: RoleCommand, now: chrono::NaiveDateTime) -> Re
         }
     }
     Ok(())
+}
+
+fn flag(on: bool, off: bool) -> Option<bool> {
+    match (on, off) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+fn print_group(group: &groups::Group) {
+    let date = |at: Option<chrono::NaiveDateTime>| {
+        at.map_or_else(
+            || "-".to_owned(),
+            |at| at.format("%Y-%m-%d %H:%M").to_string(),
+        )
+    };
+    println!("ID:            {}", group.id);
+    println!("Name:          {}", group.name);
+    println!(
+        "Description:   {}",
+        group.description.as_deref().unwrap_or_default()
+    );
+    println!("Active:        {}", if group.active { "yes" } else { "no" });
+    println!(
+        "Backfill:      {}",
+        if group.backfill { "yes" } else { "no" }
+    );
+    println!("Backfill days: {}", group.backfill_target);
+    println!(
+        "First record:  {} ({})",
+        group.first_record,
+        date(group.first_record_postdate)
+    );
+    println!(
+        "Last record:   {} ({})",
+        group.last_record,
+        date(group.last_record_postdate)
+    );
+    println!("Last updated:  {}", date(group.last_updated));
+    println!(
+        "Min files:     {}",
+        group
+            .minfilestoformrelease
+            .map_or_else(|| "default".to_owned(), |files| files.to_string())
+    );
+    println!(
+        "Min size:      {}",
+        groups::format_size(group.minsizetoformrelease)
+    );
+    println!("Releases:      {}", group.releases);
+}
+
+async fn server_groups() -> Result<Vec<nntmux_ingest::groups::ServerGroup>> {
+    use nntmux_ingest::run::Connector as _;
+    let connector =
+        nntmux_ingest::client::ClientConnector::new(nntmux_nntp::NntpConfig::from_env());
+    let mut connection = connector
+        .connect()
+        .await
+        .context("Problem connecting to usenet.")?;
+    let listed = connection
+        .list_groups()
+        .await
+        .map_err(|failure| anyhow::anyhow!("{}", failure.message))
+        .context("Problem fetching usenet_groups from usenet.")?;
+    Ok(listed)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> Result<()> {
+    let db = &ctx.db;
+    match command {
+        GroupCommand::List {
+            name,
+            active,
+            inactive,
+            backfill,
+            no_backfill,
+        } => {
+            let found = groups::list(
+                db,
+                &groups::Filter {
+                    name,
+                    active: flag(active, inactive),
+                    backfill: flag(backfill, no_backfill),
+                },
+            )
+            .await?;
+            println!("ID\tName\tActive\tBackfill\tReleases\tLast updated");
+            for group in &found {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    group.id,
+                    group.name,
+                    u8::from(group.active),
+                    u8::from(group.backfill),
+                    group.releases,
+                    group.last_updated.map_or_else(
+                        || "-".to_owned(),
+                        |at| at.format("%Y-%m-%d %H:%M").to_string()
+                    )
+                );
+            }
+            println!("Total: {} groups", found.len());
+        }
+        GroupCommand::Show { group } => print_group(&groups::require(db, &group).await?),
+        GroupCommand::Add {
+            name,
+            description,
+            active,
+            backfill,
+            backfill_days,
+            min_files,
+            min_size,
+        } => {
+            let Some(name) = groups::valid_name(name.trim()) else {
+                anyhow::bail!("{name} isn't a valid group name");
+            };
+            let (id, created) = groups::add(
+                db,
+                &groups::NewGroup {
+                    name: name.clone(),
+                    description,
+                    active,
+                    backfill,
+                    backfill_target: backfill_days,
+                    min_files,
+                    min_size,
+                },
+            )
+            .await?;
+            if created {
+                println!("Added {name} (ID {id}).");
+            } else {
+                println!("{name} already exists (ID {id}); nothing changed.");
+            }
+        }
+        GroupCommand::BulkAdd {
+            pattern,
+            inactive,
+            no_backfill,
+        } => {
+            let listed = server_groups().await?;
+            let created = groups::add_bulk(db, &listed, &pattern, !inactive, !no_backfill).await?;
+            if created.is_empty() {
+                println!(
+                    "No groups found with your regex or groups already exist in database, try again!"
+                );
+            }
+            for group in &created {
+                println!("Created {} (ID {})", group.name, group.id);
+            }
+        }
+        GroupCommand::Edit {
+            group,
+            name,
+            description,
+            backfill_days,
+            first_record,
+            last_record,
+            active,
+            backfill,
+            min_files,
+            min_size,
+        } => {
+            let found = groups::require(db, &group).await?;
+            let changes = groups::Changes {
+                name,
+                description,
+                backfill_target: backfill_days,
+                first_record,
+                last_record,
+                active,
+                backfill,
+                min_files: min_files
+                    .map(|Minimum(files)| files.map(i32::try_from).transpose())
+                    .transpose()?,
+                min_size: min_size.map(|Minimum(size)| size),
+            };
+            if changes.is_empty() {
+                anyhow::bail!("Nothing to change. See --help for the settings.");
+            }
+            groups::update(db, found.id, &changes, now).await?;
+            print_group(&groups::require(db, &found.id.to_string()).await?);
+        }
+        GroupCommand::Enable { group, backfill } => {
+            set_group_flag(db, &group, backfill, true).await?;
+        }
+        GroupCommand::Disable { group, backfill } => {
+            set_group_flag(db, &group, backfill, false).await?;
+        }
+        GroupCommand::Reset {
+            group,
+            all,
+            yes,
+            drain_timeout,
+        } => {
+            if all {
+                if !yes {
+                    println!(
+                        "Would empty collections, binaries, parts and missed_parts for every \
+                         group and reset all groups. Add --yes to do it."
+                    );
+                    return Ok(());
+                }
+                let reset =
+                    groups::reset_all(&exclusive(ctx, &verify_context(ctx)?, drain_timeout))
+                        .await?;
+                println!("All groups reset successfully ({reset}).");
+                return Ok(());
+            }
+            let found = target(db, group).await?;
+            if !yes {
+                println!(
+                    "Would reset {} (ID {}): its unfinished collections and part repair rows are \
+                     dropped and it's turned off. Add --yes to do it.",
+                    found.name, found.id
+                );
+                return Ok(());
+            }
+            groups::reset(
+                &exclusive(ctx, &verify_context(ctx)?, drain_timeout),
+                found.id,
+            )
+            .await?;
+            println!("Group {} reset successfully", found.id);
+        }
+        GroupCommand::Purge {
+            group,
+            all,
+            yes,
+            drain_timeout,
+        } => {
+            let found = if all {
+                None
+            } else {
+                Some(target(db, group).await?)
+            };
+            if !yes {
+                match &found {
+                    Some(found) => println!(
+                        "Would reset {} (ID {}) and delete its {} release(s). Add --yes to do it.",
+                        found.name, found.id, found.releases
+                    ),
+                    None => println!(
+                        "Would reset every group and delete every release. Add --yes to do it."
+                    ),
+                }
+                return Ok(());
+            }
+            let (deleted, failed) = groups::purge(
+                &exclusive(ctx, &verify_context(ctx)?, drain_timeout),
+                found.as_ref().map(|found| found.id),
+            )
+            .await?;
+            println!("Deleted {deleted} release(s).");
+            if failed > 0 {
+                anyhow::bail!("{failed} release(s) couldn't be deleted; see the log.");
+            }
+            match found {
+                Some(found) => println!("Group {} purged successfully", found.id),
+                None => println!("All groups purged successfully"),
+            }
+        }
+        GroupCommand::Delete {
+            group,
+            yes,
+            drain_timeout,
+        } => {
+            let found = groups::require(db, &group).await?;
+            if !yes {
+                println!(
+                    "Would delete {} (ID {}) and its {} release(s). Add --yes to do it.",
+                    found.name, found.id, found.releases
+                );
+                return Ok(());
+            }
+            let (deleted, _) = groups::delete(
+                &exclusive(ctx, &verify_context(ctx)?, drain_timeout),
+                found.id,
+            )
+            .await?;
+            println!(
+                "Deleted {deleted} release(s). Group {} deleted successfully",
+                found.id
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn target(db: &sqlx::MySqlPool, group: Option<String>) -> Result<groups::Group> {
+    let Some(group) = group else {
+        anyhow::bail!("Name a group, or use --all.");
+    };
+    groups::require(db, &group).await
+}
+
+async fn set_group_flag(db: &sqlx::MySqlPool, group: &str, backfill: bool, on: bool) -> Result<()> {
+    let found = groups::require(db, group).await?;
+    let flag = if backfill {
+        groups::Flag::Backfill
+    } else {
+        groups::Flag::Active
+    };
+    groups::set_flag(db, found.id, flag, on).await?;
+    println!(
+        "{} {} for {} (ID {}).",
+        if backfill { "Backfill" } else { "Updating" },
+        if on { "enabled" } else { "disabled" },
+        found.name,
+        found.id
+    );
+    Ok(())
+}
+
+fn verify_context(ctx: &Ctx) -> Result<nntmux_verify::context::Verify> {
+    Ok(nntmux_verify::context::Verify::new(
+        ctx.db.clone(),
+        nntmux_verify::cache::Cache::new(ctx.redis.clone(), "nntmux:"),
+        nntmux_verify::config::VerificationConfig::from_env()?,
+    ))
+}
+
+fn exclusive<'a>(
+    ctx: &'a Ctx,
+    verify: &'a nntmux_verify::context::Verify,
+    drain_timeout: u64,
+) -> groups::Exclusive<'a> {
+    groups::Exclusive {
+        ctx,
+        verify,
+        drain_timeout,
+    }
 }
