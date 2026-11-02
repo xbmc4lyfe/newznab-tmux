@@ -41,6 +41,8 @@ scrape_configs:
           - fingerprint:9187
           - verify:9187
           - search-sync:9187
+          - ingest:9187
+          - backfill:9187
     relabel_configs:
       - source_labels: [__address__]
         regex: '([^:]+):\d+'

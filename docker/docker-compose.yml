@@ -120,17 +120,18 @@ services:
     <<: [*app, *worker-memory]
     command: ["nntmux-worker", "search-sync"]
 
-  # ── Not ported yet (ws-ingest, ws-postprocess, ws-admin). `--profile pending` starts them. ──
+  # Header ingest and backfill fetch from NNTP. On SIGTERM they finish the header ranges in
+  # flight and defer the rest to the next pass.
   ingest:
     <<: [*app, *worker-memory]
-    profiles: [pending]
     command: ["nntmux-worker", "ingest"]
 
   backfill:
     <<: [*app, *worker-memory]
-    profiles: [pending]
     command: ["nntmux-worker", "backfill"]
 
+  # ── Pending: postprocess isn't ported yet (ws-postprocess); mail waits until account mail is
+  #    configured. `--profile pending` starts them. ──
   postprocess:
     <<: *app
     profiles: [pending]
