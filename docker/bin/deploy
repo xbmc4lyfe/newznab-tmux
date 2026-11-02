@@ -43,7 +43,7 @@ inspect="$stack/bin/deploy-inspect"
 
 : "${DEPLOY_BY:?set DEPLOY_BY in docker/.env or on the command line}"
 remote=${DEPLOY_GIT_REMOTE:-origin}
-branch=${DEPLOY_GIT_BRANCH:-rust-native}
+branch=${DEPLOY_GIT_BRANCH:-main}
 sync=${DEPLOY_SYNC_REMOTE:-1}
 timeout=${DEPLOY_HEALTH_TIMEOUT:-600}
 lock=${DEPLOY_LOCK_DIR:-$stack/.deploy.lock}
