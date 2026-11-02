@@ -216,9 +216,20 @@ built=$(docker image inspect --format '{{.Id}}' "$image")
 barrier="$project-deploy-barrier"
 quiesce=0
 [ ${#data_recreate[@]} -gt 0 ] && quiesce=1
+# Every `run` below passes --no-deps: Compose would otherwise recreate a drifted data service as
+# a dependency, before the writers stop. A data service with no container yet (a new install)
+# (or a stopped one) is started here without recreating anything that exists.
+missing=()
+for svc in $("$inspect" services < "$work/model.json"); do
+    has "$data_services" "$svc" || continue
+    [ -n "$("$compose" ps -q --status running "$svc")" ] || missing+=("$svc")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+    "$compose" up -d --wait --wait-timeout "$timeout" --no-recreate "${missing[@]}"
+fi
 empty=0
 if [ "$need_migrate" = 1 ]; then
-    report=$("$compose" run --rm migrate nntmux-ctl migrate --pending | grep '^pending=' | tail -n 1)
+    report=$("$compose" run --rm --no-deps migrate nntmux-ctl migrate --pending | grep '^pending=' | tail -n 1)
     pending=$(printf '%s\n' "$report" | sed -n 's/^pending=\([0-9]*\).*/\1/p')
     case "$report" in *" empty=1"*) empty=1 ;; esac
     [ "${pending:-unknown}" = 0 ] || quiesce=1
@@ -240,7 +251,7 @@ if [ "$quiesce" = 1 ]; then
     else
         docker rm -f "$barrier" > /dev/null 2>&1 || true
         echo "Holding the verification barrier (remote workers drain within ${remote_drain}s)."
-        "$compose" run -d --name "$barrier" migrate \
+        "$compose" run -d --no-deps --name "$barrier" migrate \
             nntmux-ctl verify barrier --timeout "$remote_drain" > /dev/null
         until docker logs "$barrier" 2>&1 | grep -q '^barrier held'; do
             if [ "$(docker inspect --format '{{.State.Running}}' "$barrier")" != true ]; then
@@ -260,7 +271,7 @@ if [ ${#data_recreate[@]} -gt 0 ]; then
 fi
 if [ "$need_migrate" = 1 ]; then
     echo "Running migrations before recreating any service."
-    "$compose" run --rm migrate
+    "$compose" run --rm --no-deps migrate
 fi
 "$compose" up -d --wait --wait-timeout "$timeout" ${services[@]+"${services[@]}"}
 # Writers stopped for the quiesce that aren't targets come back as they were, not recreated.
@@ -296,7 +307,7 @@ if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ]; then
     docker stop --time 60 "$barrier" > /dev/null || true
     if [ "$(docker inspect --format '{{.State.ExitCode}}' "$barrier")" != 0 ] \
         || ! docker logs "$barrier" 2>&1 | grep -q '^barrier released'; then
-        "$compose" run --rm migrate nntmux-ctl verify barrier --release
+        "$compose" run --rm --no-deps migrate nntmux-ctl verify barrier --release
     fi
     docker rm "$barrier" > /dev/null
     echo "Released the verification barrier."
