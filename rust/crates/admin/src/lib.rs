@@ -578,7 +578,7 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                     );
                     return Ok(());
                 }
-                let reset = groups::reset_all(db).await?;
+                let reset = groups::reset_all(&verify_context(ctx)?).await?;
                 println!("All groups reset successfully ({reset}).");
                 return Ok(());
             }
@@ -591,7 +591,7 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                 );
                 return Ok(());
             }
-            groups::reset(db, found.id).await?;
+            groups::reset(&verify_context(ctx)?, found.id).await?;
             println!("Group {} reset successfully", found.id);
         }
         GroupCommand::Purge { group, all, yes } => {
@@ -612,7 +612,8 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                 }
                 return Ok(());
             }
-            let (deleted, failed) = groups::purge(db, found.as_ref().map(|found| found.id)).await?;
+            let (deleted, failed) =
+                groups::purge(&verify_context(ctx)?, found.as_ref().map(|found| found.id)).await?;
             println!("Deleted {deleted} release(s).");
             if failed > 0 {
                 anyhow::bail!("{failed} release(s) couldn't be deleted; see the log.");
@@ -631,7 +632,7 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                 );
                 return Ok(());
             }
-            let (deleted, _) = groups::delete(db, found.id).await?;
+            let (deleted, _) = groups::delete(&verify_context(ctx)?, found.id).await?;
             println!(
                 "Deleted {deleted} release(s). Group {} deleted successfully",
                 found.id
@@ -664,4 +665,12 @@ async fn set_group_flag(db: &sqlx::MySqlPool, group: &str, backfill: bool, on: b
         found.id
     );
     Ok(())
+}
+
+fn verify_context(ctx: &Ctx) -> Result<nntmux_verify::context::Verify> {
+    Ok(nntmux_verify::context::Verify::new(
+        ctx.db.clone(),
+        nntmux_verify::cache::Cache::new(ctx.redis.clone(), "nntmux:"),
+        nntmux_verify::config::VerificationConfig::from_env()?,
+    ))
 }

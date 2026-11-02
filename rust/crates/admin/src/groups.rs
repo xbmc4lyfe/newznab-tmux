@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDateTime;
 use nntmux_ingest::groups::ServerGroup;
+use nntmux_verify::context::Verify;
 use sqlx::{FromRow, MySqlPool, QueryBuilder};
 use tracing::warn;
 
@@ -286,8 +287,17 @@ const RESET_STATS: &str = "backfill_target = 1, first_record = 0, first_record_p
 
 /// `UsenetGroup::reset`: drops the group's part repair rows and unfinished collections (their
 /// binaries, parts and group links go with them by foreign key), then starts its counters over
-/// and turns it off.
-pub async fn reset(db: &MySqlPool, id: u32) -> Result<()> {
+/// and turns it off. Verification is held out meanwhile, and the group's unpublished candidates
+/// are expired, so work already queued can't publish into the group afterwards.
+pub async fn reset(verify: &Verify, id: u32) -> Result<()> {
+    nntmux_verify::reset::fenced(verify, || async {
+        nntmux_verify::candidates::expire_group(verify, id).await?;
+        reset_rows(&verify.db, id).await
+    })
+    .await
+}
+
+async fn reset_rows(db: &MySqlPool, id: u32) -> Result<()> {
     let mut tx = db.begin().await?;
     sqlx::query("DELETE FROM missed_parts WHERE groups_id = ?")
         .bind(id)
@@ -308,8 +318,14 @@ pub async fn reset(db: &MySqlPool, id: u32) -> Result<()> {
 }
 
 /// `UsenetGroup::resetall`: empties every unfinished collection and part repair table, then
-/// resets every group. `collection_groups` is emptied with them, which Laravel left orphaned.
-pub async fn reset_all(db: &MySqlPool) -> Result<u64> {
+/// resets every group. `collection_groups` is emptied with them, which Laravel left orphaned. It
+/// runs as a verification reset, like `nntmux:reset-truncate`, which clears all queued
+/// verification work.
+pub async fn reset_all(verify: &Verify) -> Result<u64> {
+    nntmux_verify::reset::run(verify, || reset_all_rows(&verify.db)).await
+}
+
+async fn reset_all_rows(db: &MySqlPool) -> Result<u64> {
     let mut conn = db.acquire().await?;
     sqlx::query("SET FOREIGN_KEY_CHECKS = 0")
         .execute(&mut *conn)
@@ -344,14 +360,29 @@ pub async fn reset_all(db: &MySqlPool) -> Result<u64> {
 }
 
 /// `UsenetGroup::purge`: resets one group, or all of them, then deletes its releases with their
-/// NZBs, files and search documents. A release that fails is reported and skipped.
-pub async fn purge(db: &MySqlPool, id: Option<u32>) -> Result<(u64, u64)> {
+/// NZBs, files and search documents. A release that fails is reported and skipped. Verification
+/// stays held out until the releases are gone.
+pub async fn purge(verify: &Verify, id: Option<u32>) -> Result<(u64, u64)> {
     match id {
-        Some(id) => reset(db, id).await?,
+        Some(id) => {
+            nntmux_verify::reset::fenced(verify, || async {
+                nntmux_verify::candidates::expire_group(verify, id).await?;
+                reset_rows(&verify.db, id).await?;
+                delete_releases(&verify.db, Some(id)).await
+            })
+            .await
+        }
         None => {
-            reset_all(db).await?;
+            nntmux_verify::reset::run(verify, || async {
+                reset_all_rows(&verify.db).await?;
+                delete_releases(&verify.db, None).await
+            })
+            .await
         }
     }
+}
+
+async fn delete_releases(db: &MySqlPool, id: Option<u32>) -> Result<(u64, u64)> {
     let (mut deleted, mut failed) = (0, 0);
     let mut after = 0_u32;
     loop {
@@ -385,20 +416,27 @@ pub async fn purge(db: &MySqlPool, id: Option<u32>) -> Result<(u64, u64)> {
     Ok((deleted, failed))
 }
 
-/// `UsenetGroup::deleteGroup`: purges the group, then removes it. A group whose releases
-/// couldn't all be deleted is kept, so none is left pointing at a missing group.
-pub async fn delete(db: &MySqlPool, id: u32) -> Result<(u64, bool)> {
-    let (deleted, failed) = purge(db, Some(id)).await?;
-    if failed > 0 {
-        bail!("{failed} release(s) couldn't be deleted, so the group is kept; see the log");
-    }
-    let removed = sqlx::query("DELETE FROM usenet_groups WHERE id = ?")
-        .bind(id)
-        .execute(db)
-        .await?
-        .rows_affected()
-        > 0;
-    Ok((deleted, removed))
+/// `UsenetGroup::deleteGroup`: purges the group, then removes it, all behind the verification
+/// fence. A group whose releases couldn't all be deleted is kept, so none is left pointing at a
+/// missing group.
+pub async fn delete(verify: &Verify, id: u32) -> Result<(u64, bool)> {
+    let db = &verify.db;
+    nntmux_verify::reset::fenced(verify, || async {
+        nntmux_verify::candidates::expire_group(verify, id).await?;
+        reset_rows(db, id).await?;
+        let (deleted, failed) = delete_releases(db, Some(id)).await?;
+        if failed > 0 {
+            bail!("{failed} release(s) couldn't be deleted, so the group is kept; see the log");
+        }
+        let removed = sqlx::query("DELETE FROM usenet_groups WHERE id = ?")
+            .bind(id)
+            .execute(db)
+            .await?
+            .rows_affected()
+            > 0;
+        Ok((deleted, removed))
+    })
+    .await
 }
 
 /// What `addBulk` reported for each group.

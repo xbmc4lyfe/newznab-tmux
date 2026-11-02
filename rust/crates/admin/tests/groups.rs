@@ -5,6 +5,9 @@ use nntmux_admin::groups::{
 };
 use nntmux_ingest::groups::ServerGroup;
 use nntmux_testkit::TestDb;
+use nntmux_verify::cache::Cache;
+use nntmux_verify::config::VerificationConfig;
+use nntmux_verify::context::Verify;
 
 fn at(raw: &str) -> NaiveDateTime {
     NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").expect("a timestamp")
@@ -101,6 +104,63 @@ async fn collection(db: &TestDb, group: u32, hash: &str) -> Result<()> {
         .execute(&db.pool)
         .await?;
     Ok(())
+}
+
+/// A verification context on the test database, with its own scratch directory and cache prefix.
+async fn verification(db: &TestDb) -> Result<Option<Verify>> {
+    let Ok(url) = std::env::var("TEST_REDIS_URL") else {
+        eprintln!("TEST_REDIS_URL is unset, skipping");
+        return Ok(None);
+    };
+    let redis = redis::Client::open(url)?.get_connection_manager().await?;
+    let prefix = format!(
+        "t_admin_{}_{}:",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    );
+    sqlx::query(
+        "INSERT INTO release_verification_state (id, pending_bytes, audit_cursor) VALUES (1, 0, 0) \
+         ON DUPLICATE KEY UPDATE pending_bytes = 0",
+    )
+    .execute(&db.pool)
+    .await?;
+    Ok(Some(Verify::new(
+        db.pool.clone(),
+        Cache::new(redis, prefix.clone()),
+        VerificationConfig::for_tests(std::env::temp_dir().join(prefix)),
+    )))
+}
+
+/// A queued candidate of `group` with its manifest row, counted in the pending bytes.
+async fn candidate(db: &TestDb, group: u32, tag: &str, release: Option<u32>) -> Result<String> {
+    let manifest = format!("{:0>64}.json.gz", hex_tag(tag));
+    sqlx::query(
+        "INSERT INTO release_verification_candidates (identity, groups_id, manifest_path, \
+         manifest_bytes, manifest_hash, status, last_unique_at, next_attempt_at, release_id) \
+         VALUES (SHA1(?), ?, ?, 10, '', 'pending', UTC_TIMESTAMP(), UTC_TIMESTAMP(), ?)",
+    )
+    .bind(tag)
+    .bind(group)
+    .bind(&manifest)
+    .bind(release)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO release_verification_manifests (name, body, bytes) VALUES (?, 'x', 1)",
+    )
+    .bind(&manifest)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query("UPDATE release_verification_state SET pending_bytes = pending_bytes + 10")
+        .execute(&db.pool)
+        .await?;
+    Ok(manifest)
+}
+
+fn hex_tag(tag: &str) -> String {
+    tag.bytes().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn count(db: &TestDb, sql: &str) -> Result<i64> {
@@ -340,8 +400,11 @@ async fn reset_purge_and_delete_clear_a_group() -> Result<()> {
         ids.push(id);
     }
     let (one, two, three) = (ids[0], ids[1], ids[2]);
+    let Some(verify) = verification(&db).await? else {
+        return Ok(());
+    };
 
-    groups::reset(&db.pool, one).await?;
+    groups::reset(&verify, one).await?;
     let reset = groups::require(&db.pool, &one.to_string()).await?;
     assert_eq!(
         (
@@ -365,7 +428,7 @@ async fn reset_purge_and_delete_clear_a_group() -> Result<()> {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM releases").await?, 3);
     assert!(groups::require(&db.pool, &two.to_string()).await?.active);
 
-    assert_eq!(groups::purge(&db.pool, Some(two)).await?, (1, 0));
+    assert_eq!(groups::purge(&verify, Some(two)).await?, (1, 0));
     assert_eq!(
         count(
             &db,
@@ -377,11 +440,11 @@ async fn reset_purge_and_delete_clear_a_group() -> Result<()> {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM releases").await?, 2);
     assert_eq!(count(&db, "SELECT COUNT(*) FROM collections").await?, 1);
 
-    assert_eq!(groups::delete(&db.pool, three).await?, (1, true));
+    assert_eq!(groups::delete(&verify, three).await?, (1, true));
     assert!(groups::find(&db.pool, &three.to_string()).await?.is_none());
 
     // Purging everything resets every group and deletes the remaining release.
-    assert_eq!(groups::purge(&db.pool, None).await?, (1, 0));
+    assert_eq!(groups::purge(&verify, None).await?, (1, 0));
     for table in [
         "collections",
         "binaries",
@@ -400,5 +463,64 @@ async fn reset_purge_and_delete_clear_a_group() -> Result<()> {
         .fetch_one(&db.pool)
         .await?;
     assert_eq!(checks, 1);
+    db.drop_database().await
+}
+
+#[tokio::test]
+async fn a_group_reset_retires_its_queued_verification_work() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let Some(verify) = verification(&db).await? else {
+        return Ok(());
+    };
+    sqlx::query("DELETE FROM usenet_groups")
+        .execute(&db.pool)
+        .await?;
+    let mut ids = Vec::new();
+    for name in ["alt.binaries.one", "alt.binaries.two"] {
+        let (id, _) = groups::add(
+            &db.pool,
+            &NewGroup {
+                name: name.to_owned(),
+                active: true,
+                ..NewGroup::default()
+            },
+        )
+        .await?;
+        ids.push(id);
+    }
+    let (one, two) = (ids[0], ids[1]);
+    let queued = candidate(&db, one, "a", None).await?;
+    candidate(&db, one, "b", None).await?;
+    // A published candidate belongs to its release, and another group's work is untouched.
+    candidate(&db, one, "c", Some(77)).await?;
+    let other = candidate(&db, two, "d", None).await?;
+
+    groups::reset(&verify, one).await?;
+
+    let rows: Vec<(String, String, u32)> = sqlx::query_as(
+        "SELECT identity, status, groups_id FROM release_verification_candidates \
+         WHERE manifest_path = '' ORDER BY id",
+    )
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.1 == "expired" && row.2 == one));
+    let manifests: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM release_verification_manifests ORDER BY name")
+            .fetch_all(&db.pool)
+            .await?;
+    assert!(!manifests.contains(&queued));
+    assert!(manifests.contains(&other));
+    assert_eq!(manifests.len(), 2);
+    let pending: u64 =
+        sqlx::query_scalar("SELECT pending_bytes FROM release_verification_state WHERE id = 1")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pending, 20);
+    // The fence is gone afterwards.
+    assert!(!nntmux_verify::locks::paused(&db.pool, None).await?);
+    let _ = two;
     db.drop_database().await
 }

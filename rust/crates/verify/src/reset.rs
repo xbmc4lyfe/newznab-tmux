@@ -25,6 +25,26 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
+    fence(verify, || clear(verify), reset).await
+}
+
+/// Runs `work` behind the same fence as [`run`] without clearing verification state, for a change
+/// that retires only part of it, such as one group's candidates.
+pub async fn fenced<F, Fut, T>(verify: &Verify, work: F) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    fence(verify, || async { Ok(()) }, work).await
+}
+
+async fn fence<P, PFut, F, Fut, T>(verify: &Verify, prepare: P, reset: F) -> Result<T>
+where
+    P: FnOnce() -> PFut,
+    PFut: Future<Output = Result<()>>,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
     let mut session = LockSession::open(&verify.db).await?;
     let admission = session
         .exclusive_group("reset")
@@ -49,7 +69,7 @@ where
             "Verification locks were lost; clear the reset's pause once nothing else is running."
         );
     }
-    let outcome = match clear(verify).await {
+    let outcome = match prepare().await {
         Ok(()) if session.holds_all(&[&admission, &workers]).await => reset().await,
         Ok(()) => bail!(
             "Verification locks were lost; clear the reset's pause once nothing else is running."
