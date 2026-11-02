@@ -87,6 +87,10 @@ impl<'a> Cursor<'a> {
 
     /// A bit vector with its "all set" shortcut. Bits are read most significant first.
     fn all_or_bits(&mut self, count: usize) -> Option<Vec<bool>> {
+        // A claim the rest of the index couldn't hold, even at one bit each, is a lie.
+        if count / 8 > self.bytes.len() - self.at {
+            return None;
+        }
         if self.byte()? != 0 {
             return Some(vec![true; count]);
         }
@@ -172,7 +176,7 @@ fn read_substreams(cursor: &mut Cursor<'_>, folders: &[Folder], digests: &[bool]
     let mut kind = cursor.byte()?;
     if kind == 0x0d {
         for count in &mut files {
-            *count = usize::try_from(cursor.number()?).ok()?;
+            *count = cursor.count()?;
         }
         kind = cursor.byte()?;
     }
@@ -188,14 +192,13 @@ fn read_substreams(cursor: &mut Cursor<'_>, folders: &[Folder], digests: &[bool]
         if kind != 0x0a {
             return None;
         }
-        let unknown = files
-            .iter()
-            .enumerate()
-            .map(|(index, count)| {
-                let shared = *count == 1 && digests.get(index) == Some(&true);
-                if shared { 0 } else { *count }
-            })
-            .sum();
+        let mut unknown = 0usize;
+        for (index, count) in files.iter().enumerate() {
+            let shared = *count == 1 && digests.get(index) == Some(&true);
+            if !shared {
+                unknown = unknown.checked_add(*count)?;
+            }
+        }
         cursor.digests(unknown)?;
         kind = cursor.byte()?;
     }
@@ -659,6 +662,24 @@ pub(crate) mod tests {
             broken[28..32].copy_from_slice(&crc.to_le_bytes());
             let _ = open(&broken, &broken, LIMIT);
         }
+    }
+
+    #[test]
+    fn an_absurd_file_count_is_refused_rather_than_allocated() {
+        // NumUnpackStream of u64::MAX, then a digest section claiming all of them are defined.
+        let mut index = vec![0x0d, 0xff];
+        index.extend_from_slice(&[0xff; 8]);
+        index.extend_from_slice(&[0x0a, 0x01]);
+        let mut cursor = Cursor::new(&index);
+        assert_eq!(
+            read_substreams(&mut cursor, &[Folder::default()], &[]),
+            None
+        );
+
+        // A digest section alone, claiming more than its bytes could hold.
+        let mut cursor = Cursor::new(&[0x01, 0x00, 0x00]);
+        assert_eq!(cursor.all_or_bits(usize::MAX), None);
+        assert_eq!(cursor.digests(1 << 40), None);
     }
 
     #[test]
