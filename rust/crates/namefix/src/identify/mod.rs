@@ -23,6 +23,7 @@ pub mod nzb;
 pub mod sevenzip;
 pub mod srrdb;
 pub mod stream_probe;
+pub mod unidentifiable;
 
 pub use donor::DonorIndex;
 pub use ladder::{
