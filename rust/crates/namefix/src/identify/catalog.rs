@@ -26,7 +26,8 @@ use super::nzb;
 
 /// The releases this stage exists for: uncategorized, with no PreDB link and never renamed. The
 /// import already left out everything below 500 MB.
-const TARGET: &str = "legacy_category IN (10, 20) AND predb_id IS NULL AND is_renamed = 0";
+pub(super) const TARGET: &str =
+    "legacy_category IN (10, 20) AND predb_id IS NULL AND is_renamed = 0";
 const SAMPLES_PER_METHOD: usize = 4;
 const WORKER_CHUNK: usize = 64;
 const MAX_NZB_BYTES: u64 = 268_435_456;
@@ -60,7 +61,7 @@ CREATE INDEX IF NOT EXISTS release_identifications_method
 /// Opens without touching the disk where it can. The import is in WAL mode, where a plain
 /// read-only open still creates side files. With nothing pending in the WAL, `immutable` needs
 /// none. With something pending, it has to be read the ordinary way or those rows go unseen.
-fn open_read_only(path: &Path) -> Result<Connection> {
+pub(super) fn open_read_only(path: &Path) -> Result<Connection> {
     let wal = format!("{}-wal", path.display());
     let wal_pending = std::fs::metadata(wal).is_ok_and(|wal| wal.len() > 0);
     let uri = format!(
@@ -111,7 +112,7 @@ pub struct Report {
     pub applied: bool,
 }
 
-fn text(value: ValueRef<'_>) -> String {
+pub(super) fn text(value: ValueRef<'_>) -> String {
     match value {
         ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
             String::from_utf8_lossy(bytes).into_owned()
@@ -367,13 +368,13 @@ fn load_names(catalog: &Connection, targets: &mut HashMap<i64, Evidence>) -> Res
     Ok(())
 }
 
-struct Loaded {
-    predb: LocalPredb,
-    donors: DonorIndex,
-    targets: Vec<Evidence>,
+pub(super) struct Loaded {
+    pub(super) predb: LocalPredb,
+    pub(super) donors: DonorIndex,
+    pub(super) targets: Vec<Evidence>,
 }
 
-fn load(catalog: &Connection, filter: &str, limit: Option<usize>) -> Result<Loaded> {
+pub(super) fn load(catalog: &Connection, filter: &str, limit: Option<usize>) -> Result<Loaded> {
     tracing::info!("loading PreDB");
     let predb = load_predb(catalog).context("loading PreDB")?;
     tracing::info!(rows = predb.len(), "loading the evidence");
@@ -423,7 +424,7 @@ struct Answer {
 }
 
 /// Runs `visit` over the targets on every thread, with the NZB of each read.
-fn for_each_target<T: Send>(
+pub(super) fn for_each_target<T: Send>(
     nzbs_path: &Path,
     threads: usize,
     targets: Vec<Evidence>,
@@ -754,7 +755,7 @@ pub fn render_holdout(holdout: &Holdout) -> String {
 }
 
 /// A fixed shuffle, so the samples are spread out but the same on every run.
-fn sample_order(id: i64) -> u64 {
+pub(super) fn sample_order(id: i64) -> u64 {
     (id as u64)
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .rotate_left(29)

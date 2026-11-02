@@ -11,7 +11,7 @@ use nntmux_namefix::identify::archive_probe::{ArchiveProbe, NntpFetch};
 use nntmux_namefix::identify::catalog::{
     Options, holdout, render_holdout, render_report, render_tsv, run_with_probe,
 };
-use nntmux_namefix::identify::{Hooks, SrrdbClient, SrrdbConfig};
+use nntmux_namefix::identify::{Hooks, SrrdbClient, SrrdbConfig, stream_probe};
 
 #[derive(Parser)]
 #[command(about = "Identify releases from the evidence in a SQLite import")]
@@ -55,6 +55,16 @@ enum Command {
     },
     /// Measures the weak rungs on releases whose PreDB row is already known.
     Holdout,
+    /// Reads the streams of a sample of releases with no other evidence, over NNTP. It takes the
+    /// provider from the NNTP_* variables, and writes to no database.
+    StreamSample {
+        /// Releases to classify.
+        #[arg(long, default_value_t = 2000)]
+        sample: usize,
+        /// Of those, how many Matroska and MP4 streams to read in full.
+        #[arg(long, default_value_t = 100)]
+        media: usize,
+    },
 }
 
 fn write_out(dir: &Path, file: &str, content: &str) -> Result<()> {
@@ -116,6 +126,17 @@ fn start(cli: &Cli) -> Result<()> {
                 write_out(&cli.out, "srrdb.md", &stats)?;
                 print!("\n{stats}");
             }
+        }
+        Command::StreamSample { sample, media } => {
+            let fetcher = NntpFetch::from_env()?;
+            let (report, lines) = stream_probe::sample(
+                &options,
+                &stream_probe::SampleOptions { sample, media },
+                &fetcher,
+            )?;
+            write_out(&cli.out, "stream_sample.md", &report)?;
+            write_out(&cli.out, "streams.tsv", &lines)?;
+            print!("{report}");
         }
         Command::Holdout => {
             let text = render_holdout(&holdout(&options)?);

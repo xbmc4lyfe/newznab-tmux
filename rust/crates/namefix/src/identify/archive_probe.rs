@@ -150,7 +150,7 @@ pub fn read_headers(bytes: &[u8]) -> HeaderReading {
 
 /// Files to try, first volumes first. The order needs no real names: when none look like a first
 /// volume, the biggest file is the best bet.
-fn volumes_to_try(nzb: &NzbSummary) -> Vec<&NzbFile> {
+pub(super) fn volumes_to_try(nzb: &NzbSummary) -> Vec<&NzbFile> {
     let first_volume = |file: &NzbFile| {
         let name = name::name_from_subject(&file.subject)
             .unwrap_or_default()
@@ -356,6 +356,10 @@ pub(crate) mod tests {
 
     /// A RAR4 volume's first bytes, with valid header checksums.
     pub(crate) fn rar4(name: &str, size: u32, crc: u32, flags: u16) -> Vec<u8> {
+        rar4_method(name, size, crc, flags, 0x30)
+    }
+
+    pub(crate) fn rar4_method(name: &str, size: u32, crc: u32, flags: u16, method: u8) -> Vec<u8> {
         let mut out = b"Rar!\x1a\x07\x00".to_vec();
         let mut main = vec![0x73, 0x00, 0x00, 13, 0x00];
         main.extend_from_slice(&[0; 6]);
@@ -371,7 +375,7 @@ pub(crate) mod tests {
         file.extend_from_slice(&crc.to_le_bytes());
         file.extend_from_slice(&0u32.to_le_bytes());
         file.push(29);
-        file.push(0x30);
+        file.push(method);
         file.extend_from_slice(&(name.len() as u16).to_le_bytes());
         file.extend_from_slice(&0x20u32.to_le_bytes());
         file.extend_from_slice(name.as_bytes());
@@ -436,6 +440,8 @@ pub(crate) mod tests {
             bytes,
             group: Some("alt.binaries.misc".to_owned()),
             first_message_id: Some(id.to_owned()),
+            head_message_ids: vec![id.to_owned()],
+            tail_message_ids: vec![id.to_owned()],
         }
     }
 

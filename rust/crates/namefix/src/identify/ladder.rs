@@ -805,6 +805,8 @@ mod tests {
                     bytes: *bytes,
                     group: None,
                     first_message_id: None,
+                    head_message_ids: Vec::new(),
+                    tail_message_ids: Vec::new(),
                 })
                 .collect(),
             payload_bytes: subjects.iter().map(|(_, bytes)| bytes).sum(),
