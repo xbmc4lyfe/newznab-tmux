@@ -143,4 +143,6 @@ docker/Justfile		-binary text eol=lf
 
 /rust/** -binary text eol=lf
 /rust/frontend/public/** binary
+# Media fixtures are bytes; line-ending conversion corrupts them.
+/rust/crates/*/tests/fixtures/media/** binary
 /.github/workflows/rust.yml -binary text eol=lf
