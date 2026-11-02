@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Reads `docker compose config --format json` on stdin for docker/bin/deploy.
+
+  deploy-inspect name               the Compose project name
+  deploy-inspect services           every service, in any profile
+  deploy-inspect image-users IMAGE  services that run IMAGE
+  deploy-inspect image-of SERVICE   the image SERVICE runs
+  deploy-inspect configs            one "service hash" line per service that bind-mounts config
+  deploy-inspect interpolated FILE  keys of a dotenv FILE whose value Compose would interpolate
+
+A service's config hash covers the content of every bind-mounted file, and of every file under a
+read-only bind-mounted directory, wherever it lives (a persistent runtime directory outside the
+checkout too) and following symlinks. Writable directories are data (database files, storage)
+and are skipped, and so are host system paths (/, /proc, /sys, /dev, /run, Docker's own state),
+such as node-exporter's mounts. Compose recreates a service only when its definition changes, so deploy uses these hashes
+to recreate a service whose mounted config changed.
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from compose_dotenv import parse  # noqa: E402
+
+
+def tree_digest(path: str, digest) -> None:
+    if os.path.isfile(path):
+        digest.update(path.encode() + b"\0")
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 16), b""):
+                digest.update(chunk)
+        return
+    for root, dirs, files in os.walk(path, followlinks=True):
+        dirs.sort()
+        for name in sorted(files):
+            tree_digest(os.path.join(root, name), digest)
+
+
+SYSTEM = ("/proc", "/sys", "/dev", "/run", "/var/run", "/var/lib/docker", "/private/var/run")
+
+
+def inside(path: str, roots: list[str]) -> bool:
+    real = os.path.realpath(path)
+    return any(real == root or real.startswith(root + os.sep) for root in roots)
+
+
+def system_path(path: str) -> bool:
+    real = os.path.realpath(path)
+    return real == "/" or inside(real, list(SYSTEM))
+
+
+def config_sources(service: dict) -> list[str]:
+    sources = []
+    for volume in service.get("volumes") or []:
+        if volume.get("type") != "bind":
+            continue
+        source = volume.get("source", "")
+        if os.path.isfile(source):
+            sources.append(source)
+        elif os.path.isdir(source) and volume.get("read_only") and not system_path(source):
+            sources.append(source)
+    return sorted(sources)
+
+
+def main() -> None:
+    if sys.argv[1:2] == ["interpolated"]:
+        # Compose interpolates `$` in env_file values too, so an unquoted or double-quoted secret
+        # with a `$` in it reaches the container cut short. Single-quoted values are literal.
+        # A reference to another key of the same file (`${PUSHER_APP_KEY}`) is deliberate and
+        # resolves; anything else is flagged.
+        parsed = parse(Path(sys.argv[2]))
+        flagged = []
+        for key, (value, flag) in parsed.items():
+            names = re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", value)
+            if flag == "multiline" or (flag and not (names and set(names) <= parsed.keys())):
+                flagged.append(key)
+        print("\n".join(sorted(flagged)))
+        return
+    model = json.load(sys.stdin)
+    services = model.get("services") or {}
+    command = sys.argv[1:2]
+    if command == ["name"]:
+        print(model.get("name", ""))
+    elif command == ["services"]:
+        print("\n".join(sorted(services)))
+    elif command == ["image-of"]:
+        print((services.get(sys.argv[2]) or {}).get("image", ""))
+    elif command == ["image-users"]:
+        image = sys.argv[2]
+        print("\n".join(sorted(name for name, svc in services.items() if svc.get("image") == image)))
+    elif command == ["configs"]:
+        for name in sorted(services):
+            sources = config_sources(services[name])
+            if not sources:
+                continue
+            digest = hashlib.sha256()
+            for source in sources:
+                tree_digest(source, digest)
+            print(f"{name} {digest.hexdigest()}")
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

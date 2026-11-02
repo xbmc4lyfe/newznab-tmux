@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# Guarded rollout of the Rust stack: `just --justfile docker/Justfile deploy [service...]`.
+#
+#   1. One deploy at a time (a lock directory; a crashed run leaves it for the owner to inspect).
+#   2. The checkout must be on DEPLOY_GIT_BRANCH and match DEPLOY_GIT_REMOTE (fast-forwarded when
+#      only behind). Local or diverged commits stop the deploy.
+#   3. Preflight, before anything changes: the Compose project is the one the last healthy deploy
+#      used (.deploy.project), no running container of a service the Compose file no
+#      longer defines (the PHP horizon/scheduler/indexer after cutover), no `$` interpolation in
+#      config/app.env, and no changed mounted config on a data service (mariadb, redis,
+#      manticore) unless DEPLOY_RECREATE_DATA=1.
+#   4. Build the image while the old stack keeps running. It is labelled with the newest commit
+#      that changed its sources (bin/source-revision), so a docs- or test-only commit builds the
+#      same cached image and recreates nothing.
+#   5. When migrations are pending or a data service is recreated, writers are quiesced first:
+#      every running app service is stopped (each drains within its stop_grace_period), and a
+#      one-off `nntmux-ctl verify barrier` pauses the verification workers on other hosts and
+#      waits for them to finish. If anything then fails, the writers stay stopped and the
+#      barrier stays held until a later deploy succeeds; .deploy.barrier-owed records a release
+#      that is still owed even if the barrier container is gone. The barrier is labelled with the
+#      database it fences; a leftover barrier for another database stops the deploy. Recreating
+#      a data service drops the barrier's session, so a fresh barrier is taken on the new one.
+#   6. `migrate` runs on its own, before any app service is recreated, so a failed migration
+#      leaves the stack as it was (stopped, if it was quiesced).
+#   7. `docker compose up -d --wait`: each changed service is recreated. Workers get SIGTERM and
+#      finish their in-flight units within their stop_grace_period before the new container
+#      starts. Compose doesn't notice a changed mounted file (Caddyfile, prometheus.yml, Grafana
+#      provisioning), so services whose mounted config hash differs from the last healthy deploy
+#      (DEPLOY_CONFIG_STAMP) are force-recreated as well.
+#   8. Every running app container must run the image just built, and the config stamp is
+#      saved. The barrier is released only once every app service runs healthy; a targeted
+#      deploy that leaves one stopped keeps it held and fails.
+#   9. Every started line in DEPLOY_LOG gets a matching finished line with the exit code.
+#
+# Settings come from the environment (the Justfile loads docker/.env): DEPLOY_BY (required),
+# DEPLOY_SYNC_REMOTE, DEPLOY_GIT_REMOTE, DEPLOY_GIT_BRANCH, DEPLOY_HEALTH_TIMEOUT, DEPLOY_LOCK_DIR,
+# DEPLOY_LOG, DEPLOY_CONFIG_STAMP, DEPLOY_DATA_SERVICES, DEPLOY_RECREATE_DATA,
+# DEPLOY_REMOTE_DRAIN_TIMEOUT, APP_ENV_FILE, APP_IMAGE, DRY_RUN=1 (print the plan and stop).
+#
+# Written for bash 3.2 (macOS): no associative arrays, and every array expansion is guarded so an
+# empty one doesn't trip `set -u`.
+set -euo pipefail
+
+stack=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+repo=$(dirname "$stack")
+compose="$stack/bin/compose"
+inspect="$stack/bin/deploy-inspect"
+
+: "${DEPLOY_BY:?set DEPLOY_BY in docker/.env or on the command line}"
+remote=${DEPLOY_GIT_REMOTE:-origin}
+branch=${DEPLOY_GIT_BRANCH:-main}
+sync=${DEPLOY_SYNC_REMOTE:-1}
+timeout=${DEPLOY_HEALTH_TIMEOUT:-600}
+lock=${DEPLOY_LOCK_DIR:-$stack/.deploy.lock}
+log=${DEPLOY_LOG:-$stack/.deploy.log}
+config_stamp=${DEPLOY_CONFIG_STAMP:-$stack/.deploy.config}
+# Kept beside the config stamp: the Compose project of the last healthy deploy, and the database
+# whose deployment pause a failed attempt still owes a release.
+project_stamp=$(dirname "$config_stamp")/.deploy.project
+owed=$(dirname "$config_stamp")/.deploy.barrier-owed
+data_services=" ${DEPLOY_DATA_SERVICES:-mariadb redis manticore} "
+app_env=${APP_ENV_FILE:-$stack/config/app.env}
+image=${APP_IMAGE:-nntmux/rust:local}
+dry_run=${DRY_RUN:-0}
+remote_drain=${DEPLOY_REMOTE_DRAIN_TIMEOUT:-900}
+services=("$@")
+
+stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+has() { case " $1 " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+
+if ! mkdir "$lock" 2>/dev/null; then
+    echo "Another deploy holds $lock ($(cat "$lock/owner" 2>/dev/null || echo unknown))." >&2
+    echo "If no deploy is running, inspect $log, then remove $lock by hand." >&2
+    exit 75
+fi
+printf '%s pid=%s at=%s\n' "$DEPLOY_BY" "$$" "$(stamp)" > "$lock/owner"
+started=0
+work=$(mktemp -d)
+finish() {
+    rc=$?
+    if [ "$started" = 1 ]; then
+        printf '%s deploy result=finished rc=%s by=%s\n' "$(stamp)" "$rc" "$DEPLOY_BY" >> "$log"
+    fi
+    rm -rf "$lock" "$work"
+    exit "$rc"
+}
+trap finish EXIT
+
+cd "$repo"
+if [ "$sync" != 0 ]; then
+    current=$(git symbolic-ref --quiet --short HEAD || true)
+    if [ "$current" != "$branch" ]; then
+        echo "The checkout is on '${current:-a detached HEAD}', not $branch." >&2
+        exit 1
+    fi
+    git fetch --quiet "$remote" "$branch"
+    if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+        echo "The checkout has commits that aren't on $remote/$branch; push or drop them first." >&2
+        exit 1
+    fi
+    if [ "$dry_run" = 1 ]; then
+        echo "Would fast-forward $(git rev-parse --short=12 HEAD) to $(git rev-parse --short=12 FETCH_HEAD)."
+    else
+        git merge --quiet --ff-only FETCH_HEAD
+    fi
+fi
+commit=$(git rev-parse --short=12 HEAD)
+revision=$("$stack/bin/source-revision")
+
+# ── Preflight. Nothing has changed yet, so every refusal here leaves the stack as it was.
+"$compose" config --format json > "$work/model.json"
+"$compose" --profile '*' config --format json > "$work/all.json"
+project=$("$inspect" name < "$work/model.json")
+# Containers, orphans and the barrier are all found by project name. A renamed project would see
+# none of the running stack and could start a second set of data services on the same storage.
+if [ -f "$project_stamp" ] && [ "$(cat "$project_stamp")" != "$project" ]; then
+    echo "The last healthy deploy used Compose project $(cat "$project_stamp"), this one $project." >&2
+    echo "Check COMPOSE_PROJECT_NAME and COMPOSE_FILE. To move the stack on purpose, stop the old" >&2
+    echo "project first, then remove $project_stamp." >&2
+    exit 1
+fi
+known=" $("$inspect" services < "$work/all.json" | tr '\n' ' ') "
+app_users=" $("$inspect" image-users "$image" < "$work/model.json" | tr '\n' ' ') "
+if [ "$app_users" = "  " ]; then
+    echo "No service in the Compose model runs $image; check APP_IMAGE and COMPOSE_FILE." >&2
+    exit 1
+fi
+
+orphans=""
+while read -r name svc; do
+    [ -n "$name" ] || continue
+    has "$known" "$svc" || orphans="$orphans $name"
+done <<EOF_PS
+$(docker ps --filter "label=com.docker.compose.project=$project" \
+    --format '{{.Names}} {{.Label "com.docker.compose.service"}}')
+EOF_PS
+if [ -n "$orphans" ]; then
+    echo "Containers of services the Compose file no longer defines are running:$orphans." >&2
+    echo "They would keep writing beside the new stack. Drain them with their own tooling, then" >&2
+    echo "stop and remove them (Compose can't, since it no longer knows them):" >&2
+    echo "  docker stop --time 1920$orphans && docker rm$orphans" >&2
+    exit 1
+fi
+
+if [ -f "$app_env" ]; then
+    bad=$("$inspect" interpolated "$app_env" | tr '\n' ' ')
+    if [ -n "${bad// /}" ]; then
+        echo "$app_env: Compose would interpolate \$ in: $bad" >&2
+        echo "Single-quote those values (KEY='value'), or write \$\$ for a literal \$." >&2
+        exit 1
+    fi
+fi
+
+# Targets: the services named on the command line, else every service in the active profiles.
+if [ ${#services[@]} -gt 0 ]; then
+    targets=" ${services[*]} "
+else
+    targets=" $("$inspect" services < "$work/model.json" | tr '\n' ' ') "
+fi
+need_migrate=0
+for svc in $targets; do
+    has "$known" "$svc" || { echo "Unknown service: $svc" >&2; exit 1; }
+    has "$app_users" "$svc" && need_migrate=1
+done
+
+# Mounted config: compare with the last healthy deploy's stamp. Without a stamp (first deploy)
+# every stateless service with mounted config is recreated, since its running container may hold
+# another revision's files; a data service's hash is only recorded.
+"$inspect" configs < "$work/model.json" > "$work/configs"
+recreate=()
+data_recreate=()
+blocked=""
+while read -r svc hash; do
+    has "$targets" "$svc" || continue
+    if [ -f "$config_stamp" ]; then
+        old=$(awk -v s="$svc" '$1 == s { print $2 }' "$config_stamp")
+        [ "$old" = "$hash" ] && continue
+        [ -z "$old" ] && has "$data_services" "$svc" && continue
+    elif has "$data_services" "$svc"; then
+        continue
+    fi
+    if has "$data_services" "$svc"; then
+        blocked="$blocked $svc"
+    else
+        recreate+=("$svc")
+    fi
+done < "$work/configs"
+
+# A data service whose Compose definition or image changed would be recreated by `run` or `up`
+# as a side effect, even when it isn't a target (dependencies are recreated too). Every data
+# service with a container is checked against what Compose would run now.
+for svc in $("$inspect" services < "$work/model.json"); do
+    has "$data_services" "$svc" || continue
+    has "$blocked" "$svc" && continue
+    id=$("$compose" ps -aq "$svc" | head -n 1)
+    [ -n "$id" ] || continue
+    want_hash=$("$compose" config --hash "$svc" | awk '{ print $2 }')
+    have_hash=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$id")
+    want_image=$(docker image inspect --format '{{.Id}}' "$("$inspect" image-of "$svc" < "$work/model.json")" 2>/dev/null || true)
+    have_image=$(docker inspect --format '{{.Image}}' "$id")
+    if [ "$want_hash" != "$have_hash" ] || [ "$want_image" != "$have_image" ]; then
+        blocked="$blocked $svc"
+    fi
+done
+if [ -n "$blocked" ] && [ "${DEPLOY_RECREATE_DATA:-0}" = 1 ]; then
+    for svc in $blocked; do data_recreate+=("$svc"); done
+    blocked=""
+fi
+if [ -n "$blocked" ]; then
+    echo "The definition, image or mounted config changed for data service(s):$blocked." >&2
+    echo "Recreating one interrupts every writer. Plan a window, then rerun with DEPLOY_RECREATE_DATA=1." >&2
+    exit 1
+fi
+
+if [ "$dry_run" = 1 ]; then
+    echo "Would build $image from $commit and roll out: ${services[*]:-every default service}."
+    [ "$need_migrate" = 1 ] && echo "Would run migrate before recreating anything, first stopping every writer and holding the verification barrier if a migration is pending."
+    echo "Would recreate data services first (DEPLOY_RECREATE_DATA=1): ${data_recreate[*]:-none}."
+    echo "Would force-recreate for changed mounted config: ${recreate[*]:-none}."
+    "$compose" up --dry-run --no-build -d ${services[@]+"${services[@]}"}
+    exit 0
+fi
+
+started=1
+printf '%s deploy result=started by=%s commit=%s services=%s\n' \
+    "$(stamp)" "$DEPLOY_BY" "$commit" "${services[*]:-all}" >> "$log"
+
+# ── Rollout.
+docker build --label "org.opencontainers.image.revision=$revision" -t "$image" "$repo"
+built=$(docker image inspect --format '{{.Id}}' "$image")
+
+# A schema change or a data-service restart must not race a writer, here or on another host.
+barrier="$project-deploy-barrier"
+barrier_label=nntmux.deploy.database
+quiesce=0
+[ ${#data_recreate[@]} -gt 0 ] && quiesce=1
+# A barrier, or a release owed, left by a failed attempt means the last schema change may be
+# unfinished, so migrations are checked (and applied) whatever the targets are.
+if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ] || [ -f "$owed" ]; then
+    quiesce=1
+    need_migrate=1
+fi
+
+# The database the barrier fences, as the migrate service resolves it (host:port/database).
+database_identity() {
+    # shellcheck disable=SC2016 # expanded inside the container
+    "$compose" run --rm --no-deps -T --entrypoint sh migrate -c \
+        'printf "%s:%s/%s\n" "${DB_HOST:-127.0.0.1}" "${DB_PORT:-3306}" "${DB_DATABASE:-nntmux}"' \
+        | tail -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r'
+}
+
+# Waits until the barrier container reports that remote workers have drained. Returns non-zero,
+# with the reason, when it stops first.
+wait_barrier() {
+    until docker logs "$barrier" 2>&1 | grep -q '^barrier held'; do
+        if [ "$(docker inspect --format '{{.State.Running}}' "$barrier")" != true ]; then
+            docker logs --tail 20 "$barrier" >&2
+            echo "The verification barrier wasn't taken." >&2
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+# Takes the barrier on the current database. Returns non-zero, with the reason, when it isn't held.
+take_barrier() {
+    # Recorded first: removing a barrier kills it before it can release its durable pause, and a
+    # failure below must leave the next deploy knowing that a release is owed.
+    printf '%s\n' "$database" > "$owed"
+    docker rm -f "$barrier" > /dev/null 2>&1 || true
+    echo "Holding the verification barrier on $database (remote workers drain within ${remote_drain}s)."
+    "$compose" run -d --no-deps --name "$barrier" --label "$barrier_label=$database" migrate \
+        nntmux-ctl verify barrier --timeout "$remote_drain" > /dev/null
+    wait_barrier
+}
+
+# Reads `migrate --pending` for the current database into $pending and $empty.
+read_pending() {
+    report=$("$compose" run --rm --no-deps migrate nntmux-ctl migrate --pending | grep '^pending=' | tail -n 1)
+    pending=$(printf '%s\n' "$report" | sed -n 's/^pending=\([0-9]*\).*/\1/p')
+    empty=0
+    case "$report" in *" empty=1"*) empty=1 ;; esac
+}
+# Every `run` below passes --no-deps: Compose would otherwise recreate a drifted data service as
+# a dependency, before the writers stop. A data service with no container yet (a new install)
+# (or a stopped one) is started here without recreating anything that exists.
+missing=()
+for svc in $("$inspect" services < "$work/model.json"); do
+    has "$data_services" "$svc" || continue
+    [ -n "$("$compose" ps -q --status running "$svc")" ] || missing+=("$svc")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+    "$compose" up -d --wait --wait-timeout "$timeout" --no-recreate "${missing[@]}"
+fi
+empty=0
+if [ "$need_migrate" = 1 ]; then
+    read_pending
+    [ "${pending:-unknown}" = 0 ] || quiesce=1
+fi
+stopped=()
+if [ "$quiesce" = 1 ]; then
+    database=$(database_identity)
+    if [ -z "$database" ]; then
+        echo "Couldn't resolve the database the migrate service uses." >&2
+        exit 1
+    fi
+    # A leftover barrier fences the database it was taken on. Adopting it for another one would
+    # leave this database's remote workers unfenced, and replacing it would orphan its pause.
+    if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ]; then
+        held=$(docker inspect --format "{{index .Config.Labels \"$barrier_label\"}}" "$barrier")
+        if [ "$held" != "$database" ]; then
+            echo "The leftover verification barrier $barrier fences ${held:-an unrecorded database}," >&2
+            echo "but this deploy uses $database. Release that pause on its own database" >&2
+            echo "(nntmux-ctl verify barrier --release), remove the container, then rerun." >&2
+            exit 1
+        fi
+    fi
+    if [ -f "$owed" ] && [ "$(cat "$owed")" != "$database" ]; then
+        echo "An earlier deploy owes a verification release on $(cat "$owed"), but this one uses" >&2
+        echo "$database. Release that pause on its own database (nntmux-ctl verify barrier" >&2
+        echo "--release), remove $owed, then rerun." >&2
+        exit 1
+    fi
+    for svc in $app_users; do
+        # The barrier itself is a one-off container of the migrate service.
+        [ "$svc" = migrate ] && continue
+        [ -n "$("$compose" ps -q --status running "$svc")" ] && stopped+=("$svc")
+    done
+    if [ ${#stopped[@]} -gt 0 ]; then
+        echo "Stopping writers so they drain before the schema or data services change: ${stopped[*]}."
+        "$compose" stop "${stopped[@]}"
+    fi
+    if [ -n "$(docker ps -q --filter "name=^${barrier}\$")" ]; then
+        # An interrupted deploy can leave one still waiting for remote workers to drain.
+        echo "Adopting the verification barrier an earlier deploy left running."
+        printf '%s\n' "$database" > "$owed"
+        if ! wait_barrier; then
+            echo "The stopped writers stay stopped; rerun the deploy once remote workers can drain." >&2
+            exit 1
+        fi
+    elif [ "$empty" = 1 ]; then
+        echo "The database has no tables yet, so no verification worker can be using it."
+    elif ! take_barrier; then
+        echo "The stopped writers stay stopped; rerun the deploy once remote workers can drain." >&2
+        exit 1
+    fi
+fi
+
+if [ ${#data_recreate[@]} -gt 0 ]; then
+    echo "Recreating data services, as DEPLOY_RECREATE_DATA=1 allows: ${data_recreate[*]}."
+    "$compose" up -d --wait --wait-timeout "$timeout" --no-deps --force-recreate "${data_recreate[@]}"
+    # The barrier's session died with the old database (and its pause may live only in the old
+    # storage), so the replacement is fenced by a fresh barrier before anything migrates it, and
+    # it is migrated whatever the targets are, before any writer starts again.
+    need_migrate=1
+    read_pending
+    if [ "$empty" = 1 ]; then
+        docker rm -f "$barrier" > /dev/null 2>&1 || true
+        echo "The recreated database has no tables yet, so no verification worker can be using it."
+    elif ! take_barrier; then
+        echo "Stopping the recreated data service(s) so nothing uses them unfenced: ${data_recreate[*]}." >&2
+        "$compose" stop "${data_recreate[@]}" || true
+        echo "The writers stay stopped; rerun the deploy once remote workers can drain." >&2
+        exit 1
+    fi
+fi
+if [ "$need_migrate" = 1 ]; then
+    echo "Running migrations before recreating any service."
+    "$compose" run --rm --no-deps migrate
+fi
+"$compose" up -d --wait --wait-timeout "$timeout" ${services[@]+"${services[@]}"}
+# Writers stopped for the quiesce that aren't targets come back as they were, not recreated.
+restart=()
+for svc in ${stopped[@]+"${stopped[@]}"}; do
+    has "$targets" "$svc" || restart+=("$svc")
+done
+if [ ${#restart[@]} -gt 0 ]; then
+    # --no-recreate starts the existing containers; --wait holds the barrier check until healthy.
+    "$compose" up -d --wait --wait-timeout "$timeout" --no-deps --no-recreate "${restart[@]}"
+fi
+if [ ${#recreate[@]} -gt 0 ]; then
+    echo "Recreating for changed mounted config: ${recreate[*]}."
+    "$compose" up -d --wait --wait-timeout "$timeout" --no-deps --force-recreate "${recreate[@]}"
+fi
+
+# Every running app container must run the image just built, whatever Compose decided.
+stale=""
+for svc in $app_users; do
+    has "$targets" "$svc" || continue
+    for id in $("$compose" ps -q "$svc"); do
+        [ "$(docker inspect --format '{{.Image}}' "$id")" = "$built" ] || stale="$stale $svc"
+    done
+done
+if [ -n "$stale" ]; then
+    echo "Still running another image than $built:$stale." >&2
+    exit 1
+fi
+
+# Grafana applies GF_SECURITY_ADMIN_PASSWORD only to a new database, so set it on every rollout.
+if has "$targets" grafana && [ -n "$("$compose" ps -q grafana)" ]; then
+    # shellcheck disable=SC2016 # expanded inside the container
+    "$compose" exec -T grafana sh -c \
+        'printf %s "$GF_SECURITY_ADMIN_PASSWORD" | grafana cli admin reset-admin-password --password-from-stdin' \
+        > /dev/null || echo "Warning: couldn't set Grafana's admin password; set it in Grafana." >&2
+fi
+
+# Save the stamp: services rolled out now get their new hash; the others keep their old one.
+{
+    while read -r svc hash; do
+        # A service outside the targets keeps its old entry, or stays unrecorded so the next
+        # deploy that includes it still applies its config.
+        if has "$targets" "$svc"; then
+            echo "$svc $hash"
+        elif [ -f "$config_stamp" ]; then
+            awk -v s="$svc" '$1 == s' "$config_stamp"
+        fi
+    done < "$work/configs"
+} > "$work/stamp"
+mv "$work/stamp" "$config_stamp"
+printf '%s\n' "$project" > "$project_stamp"
+
+# Remote verification workers may claim again only once the whole stack is healthy: a targeted
+# deploy can leave writers that an earlier failed attempt stopped, or a migration unfinished.
+# Stopping the barrier releases it; one whose database session was lost, or that was removed,
+# left its durable pause, which --release clears.
+if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ] || [ -f "$owed" ]; then
+    down=""
+    for svc in $app_users; do
+        [ "$svc" = migrate ] && continue
+        id=$("$compose" ps -q --status running "$svc" | head -n 1)
+        if [ -z "$id" ]; then
+            down="$down $svc"
+            continue
+        fi
+        health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id")
+        [ -z "$health" ] || [ "$health" = healthy ] || down="$down $svc"
+    done
+    read_pending
+    if [ -n "$down" ] || [ "${pending:-unknown}" != 0 ]; then
+        echo "Keeping the verification barrier held: not running healthy:${down:- none};" >&2
+        echo "pending migrations: ${pending:-unknown}. Deploy the whole stack to release it." >&2
+        exit 1
+    fi
+    released=0
+    if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ]; then
+        docker stop --time 60 "$barrier" > /dev/null || true
+        if [ "$(docker inspect --format '{{.State.ExitCode}}' "$barrier")" = 0 ] \
+            && docker logs "$barrier" 2>&1 | grep -q '^barrier released'; then
+            released=1
+        fi
+    fi
+    if [ "$released" = 0 ]; then
+        "$compose" run --rm --no-deps migrate nntmux-ctl verify barrier --release
+    fi
+    docker rm -f "$barrier" > /dev/null 2>&1 || true
+    rm -f "$owed"
+    echo "Released the verification barrier."
+fi
+
+"$compose" ps
+echo "Deployed $commit (image sources at ${revision:0:12})."
