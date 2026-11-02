@@ -42,4 +42,30 @@ except ValueError:
     sys.exit("Invalid quoting in DC Compose command.")
 if not command:
     command = ["docker", "compose", "--project-directory", str(stack)]
+
+# The deploy also runs plain `docker` (build, ps, inspect, the barrier), which talks to the daemon
+# DOCKER_HOST/DOCKER_CONTEXT select. A DC that picks another daemon itself would split the two, so
+# daemon selection must come from that shared environment.
+DAEMON_FLAGS = ("-H", "--host", "-c", "--context", "--config", "--tls", "--tlsverify", "--tlscacert",
+                "--tlscert", "--tlskey")
+
+
+def selects_daemon(arg: str) -> bool:
+    return any(arg == flag or arg.startswith(flag + "=") or (len(flag) == 2 and arg.startswith(flag) and
+                                                            len(arg) > 2 and not arg.startswith("--"))
+               for flag in DAEMON_FLAGS)
+
+
+program = os.path.basename(command[0])
+if program == "docker":
+    # Global options precede the subcommand. Only debug and log options are harmless there.
+    for arg in command[1:]:
+        if not arg.startswith("-"):
+            break
+        if arg not in ("-D", "--debug") and not arg.startswith(("-l", "--log-level")):
+            sys.exit(f"DC passes the Docker option {arg!r} before compose. Select the daemon with "
+                     f"DOCKER_HOST or DOCKER_CONTEXT instead, so every docker call reaches the same one.")
+if any(selects_daemon(arg) for arg in command[1:]):
+    sys.exit("DC passes a daemon-selecting option (-H/--host, -c/--context, --config or TLS). Select the "
+             "daemon with DOCKER_HOST or DOCKER_CONTEXT instead, so every docker call reaches the same one.")
 os.execvp(command[0], [*command, *sys.argv[1:]])

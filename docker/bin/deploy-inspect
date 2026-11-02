@@ -6,6 +6,7 @@
   deploy-inspect image-users IMAGE  services that run IMAGE
   deploy-inspect image-of SERVICE   the image SERVICE runs
   deploy-inspect configs            one "service hash" line per service that bind-mounts config
+  deploy-inspect storage            the same, for where existing writable bind mounts really land
   deploy-inspect interpolated FILE  keys of a dotenv FILE whose value Compose would interpolate
 
 A service's config hash covers the content of every bind-mounted file, and of every file under a
@@ -52,17 +53,26 @@ def system_path(path: str) -> bool:
     return real == "/" or inside(real, list(SYSTEM))
 
 
-def config_sources(service: dict) -> list[str]:
-    sources = []
+def config_sources(service: dict) -> tuple[list[str], list[str]]:
+    """Mounted config (hashed by content) and writable storage (recorded by resolved identity)."""
+    sources, storage = [], []
     for volume in service.get("volumes") or []:
         if volume.get("type") != "bind":
             continue
         source = volume.get("source", "")
         if os.path.isfile(source):
             sources.append(source)
-        elif os.path.isdir(source) and volume.get("read_only") and not system_path(source):
-            sources.append(source)
-    return sorted(sources)
+        elif os.path.isdir(source) and not system_path(source):
+            (sources if volume.get("read_only") else storage).append(source)
+    return sorted(sources), sorted(storage)
+
+
+def storage_identity(path: str, digest) -> None:
+    # Not the contents (a live database), but where the mount really lands: retargeting a symlink
+    # or swapping the directory for restored storage changes this, so it enters the data preflight.
+    real = os.path.realpath(path)
+    info = os.stat(real)
+    digest.update(f"storage {path} -> {real} {info.st_dev}:{info.st_ino}".encode() + b"\0")
 
 
 def main() -> None:
@@ -93,12 +103,22 @@ def main() -> None:
         print("\n".join(sorted(name for name, svc in services.items() if svc.get("image") == image)))
     elif command == ["configs"]:
         for name in sorted(services):
-            sources = config_sources(services[name])
+            sources, _ = config_sources(services[name])
             if not sources:
                 continue
             digest = hashlib.sha256()
             for source in sources:
                 tree_digest(source, digest)
+            print(f"{name} {digest.hexdigest()}")
+    elif command == ["storage"]:
+        # Only storage that exists: Compose creates a missing bind source when it starts the service.
+        for name in sorted(services):
+            _, storage = config_sources(services[name])
+            if not storage:
+                continue
+            digest = hashlib.sha256()
+            for path in storage:
+                storage_identity(path, digest)
             print(f"{name} {digest.hexdigest()}")
     else:
         sys.exit(__doc__)
