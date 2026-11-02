@@ -435,8 +435,29 @@ impl<'a> ReleaseProcessor<'a> {
                 "Release {} only contains PAR2 data, deleting.",
                 context.release.id
             );
-            let release = &context.release;
-            self.files.delete_release(release.id, &release.guid).await;
+            match self.files.delete_release_if_current(context).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(result(
+                        context,
+                        Outcome::Failed,
+                        false,
+                        "The release changed while it was probed; it was not deleted.",
+                    ));
+                }
+                Err(failure) => {
+                    eprintln!(
+                        "release {}: deletion failed: {failure:#}",
+                        context.release.id
+                    );
+                    return Ok(result(
+                        context,
+                        Outcome::Failed,
+                        false,
+                        "The PAR2-only release could not be deleted.",
+                    ));
+                }
+            }
             return Ok(result(
                 context,
                 Outcome::DeletedPar2Only,

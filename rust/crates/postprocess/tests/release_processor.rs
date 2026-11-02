@@ -372,6 +372,45 @@ async fn a_lone_par2_file_deletes_the_release() -> Result<()> {
 }
 
 #[tokio::test]
+async fn a_release_replaced_meanwhile_is_not_deleted() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let covers = tempfile::tempdir()?;
+    let mut files = manager(pool, covers.path()).await?;
+    let (file, _) = post("q", "a8f3c29d10e4", b"PAR2\0PKT");
+    let claimed = release(pool, "d1", &[file]).await?;
+    let id = claimed.id;
+    let stored = nzb::read(pool, "d1").await?.expect("stored NZB");
+    let mut context = ReleaseContext::new(claimed);
+
+    // A newer NZB was installed after this attempt read its own.
+    context.nzb_source_digest = Some(nzb::digest(b"<nzb>older</nzb>"));
+    assert!(!files.delete_release_if_current(&context).await?);
+    assert!(exists(pool, id).await?);
+
+    // Another worker took the claim over.
+    context.nzb_source_digest = Some(nzb::digest(&stored));
+    sqlx::query("UPDATE releases SET additional_pp_claim_token = 'other' WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    assert!(!files.delete_release_if_current(&context).await?);
+    assert!(exists(pool, id).await?);
+
+    sqlx::query("UPDATE releases SET additional_pp_claim_token = ? WHERE id = ?")
+        .bind(TOKEN)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    assert!(files.delete_release_if_current(&context).await?);
+    assert!(!exists(pool, id).await?);
+    assert!(nzb::read(pool, "d1").await?.is_none());
+    db.drop_database().await
+}
+
+#[tokio::test]
 async fn a_passworded_archive_is_reported_as_such() -> Result<()> {
     let Some(db) = TestDb::create().await? else {
         return Ok(());
