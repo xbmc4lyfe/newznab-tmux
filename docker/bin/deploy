@@ -293,6 +293,8 @@ if [ "$quiesce" = 1 ]; then
         fi
     fi
     for svc in $app_users; do
+        # The barrier itself is a one-off container of the migrate service.
+        [ "$svc" = migrate ] && continue
         [ -n "$("$compose" ps -q --status running "$svc")" ] && stopped+=("$svc")
     done
     if [ ${#stopped[@]} -gt 0 ]; then
