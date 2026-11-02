@@ -21,7 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 
-use super::ladder::{SrrdbLookup, SrrdbQuery};
+use super::ladder::{Agreement, SrrdbLookup, SrrdbQuery, agree};
 use super::name::folded;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.srrdb.com/v1/";
@@ -30,7 +30,6 @@ const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 /// Bounds what one release can cost, because a pack can list hundreds of files.
 const MAX_CRCS: usize = 3;
-const MAX_NAMES: usize = 2;
 const MAX_CANDIDATES: usize = 5;
 
 #[derive(Clone, Debug)]
@@ -68,6 +67,8 @@ pub struct SrrdbStats {
     pub crc_disagree: AtomicUsize,
     pub name_asked: AtomicUsize,
     pub name_hits: AtomicUsize,
+    /// Posts whose readable names pointed at different releases.
+    pub name_disagree: AtomicUsize,
     pub candidates_asked: AtomicUsize,
     pub candidates_hits: AtomicUsize,
     /// Releases with no CRC32 at all, so PreDB candidates couldn't be checked.
@@ -253,13 +254,21 @@ impl SrrdbClient {
         if !query.file_names.is_empty() {
             stats.name_asked.fetch_add(1, Ordering::Relaxed);
         }
-        for name in query.file_names.iter().take(MAX_NAMES) {
-            let wanted = folded(name);
-            let found = self.search(name)?;
-            if let Some(release) = found.iter().find(|release| folded(release) == wanted) {
-                stats.name_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(release.clone()));
+        // A release name has to speak for the whole post, as on the ladder's own name rungs.
+        match agree(query.file_names.iter().map(String::as_str)) {
+            Some(Agreement::One(name) | Agreement::Pack(name)) => {
+                let wanted = folded(&name);
+                let found = self.search(&name)?;
+                if let Some(release) = found.iter().find(|release| folded(release) == wanted) {
+                    stats.name_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(release.clone()));
+                }
             }
+            Some(Agreement::Split) => {
+                stats.name_disagree.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            }
+            None => {}
         }
 
         if !query.size_candidates.is_empty() {
@@ -288,7 +297,7 @@ impl SrrdbClient {
             "# srrDB run\n\nReleases asked about: {}. Requests: {}. From cache: {}. Errors: {}.\n\n\
              | Evidence | Releases asked | Hits |\n|---|---|---|\n\
              | CRC32 | {} | {} ({} matched several releases, {} files disagreed) |\n\
-             | Readable name | {} | {} |\n\
+             | Readable name | {} | {} ({} had names that disagreed) |\n\
              | PreDB size candidates checked by CRC32 | {} | {} |\n\n\
              Releases with size candidates but no CRC32 to check them against: {}.\n",
             read(&stats.releases),
@@ -301,6 +310,7 @@ impl SrrdbClient {
             read(&stats.crc_disagree),
             read(&stats.name_asked),
             read(&stats.name_hits),
+            read(&stats.name_disagree),
             read(&stats.candidates_asked),
             read(&stats.candidates_hits),
             read(&stats.candidates_uncheckable),
@@ -580,6 +590,34 @@ mod tests {
         };
         let (answer, client) = ask(setup.config.clone(), query).await;
         assert_eq!(answer.expect("answer").as_deref(), Some(RELEASE));
+        finish(client).await;
+    }
+
+    #[tokio::test]
+    async fn names_that_disagree_decide_nothing() {
+        let setup = setup().await;
+        let first = "Film.One.2021.1080p.WEB-DL.H264-AAA";
+        let second = "Film.Two.2022.1080p.WEB-DL.H264-BBB";
+        serve(
+            &setup.server,
+            &format!("/v1/search/{first}"),
+            results(&[first]),
+        )
+        .await;
+        serve(
+            &setup.server,
+            &format!("/v1/search/{second}"),
+            results(&[second]),
+        )
+        .await;
+        let query = SrrdbQuery {
+            file_names: vec![first.to_owned(), second.to_owned()],
+            ..SrrdbQuery::default()
+        };
+        let (answer, client) = ask(setup.config.clone(), query).await;
+        assert_eq!(answer.expect("answer"), None);
+        assert_eq!(client.stats.name_disagree.load(Ordering::Relaxed), 1);
+        assert_eq!(client.stats.requests.load(Ordering::Relaxed), 0);
         finish(client).await;
     }
 

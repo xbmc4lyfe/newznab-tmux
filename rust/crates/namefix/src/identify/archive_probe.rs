@@ -102,7 +102,12 @@ pub fn read_headers(bytes: &[u8]) -> HeaderReading {
                     if file.encrypted {
                         reading.encrypted = true;
                     }
-                    if let Some(name) = &file.filename {
+                    // A damaged header can still look readable, and proves nothing.
+                    if let Some(name) = file
+                        .filename
+                        .as_ref()
+                        .filter(|_| file.checksum_valid == Some(true))
+                    {
                         reading.files.push(InnerFile {
                             name: name.clone(),
                             size: file.uncompressed_size.unwrap_or(0),
@@ -121,7 +126,11 @@ pub fn read_headers(bytes: &[u8]) -> HeaderReading {
                 reading.encrypted |= encryption_algorithm_version.is_some();
                 let blocks = visible_block_walk.iter().flat_map(|walk| &walk.blocks);
                 for file in blocks.filter_map(|block| block.file_header.as_ref()) {
-                    if let Some(name) = &file.filename {
+                    if let Some(name) = file
+                        .filename
+                        .as_ref()
+                        .filter(|_| file.header_crc32_valid == Some(true))
+                    {
                         reading.files.push(InnerFile {
                             name: name.clone(),
                             size: file.unpacked_size_effective.unwrap_or(0),
@@ -508,6 +517,20 @@ pub(crate) mod tests {
                 .render_stats()
                 .contains("| Gained a CRC32 for a file of 50 MB or more | 0 |")
         );
+    }
+
+    #[test]
+    fn a_damaged_header_gives_no_evidence() {
+        for mut bytes in [
+            rar4(REMUX, 2_000_000_000, 7, 0),
+            rar5(REMUX, 2_000_000_000, 7),
+        ] {
+            // The last byte is the end of the name, inside what the header checksum covers.
+            *bytes.last_mut().expect("bytes") ^= 0x01;
+            let reading = read_headers(&bytes);
+            assert!(reading.rar);
+            assert_eq!(reading.files, []);
+        }
     }
 
     #[test]
