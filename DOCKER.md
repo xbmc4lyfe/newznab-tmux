@@ -55,7 +55,7 @@ just docker status                    # groups, binaries, releases, predb counts
 just docker mysql                     # MariaDB client (bundled MariaDB only)
 just docker backup                    # dump to docker/backups/, keeps 7
 just docker down                      # stop the stack; data is kept
-just docker up                        # start as built, no build or git checks
+just docker up                        # first start of a new stack; refuses an existing one
 ```
 
 Pass `KEY=VALUE` after a recipe to set an option for one run, for example `just deploy DEPLOY_BY=me`. The recipes read `docker/.env` for the keys they need.
@@ -67,13 +67,14 @@ Pass `KEY=VALUE` after a recipe to set an option for one run, for example `just 
 1. Takes a lock directory (`DEPLOY_LOCK_DIR`, default `docker/.deploy.lock`). If another deploy holds it, it exits with status 75.
 2. Requires the checkout to be on `DEPLOY_GIT_BRANCH` (default `rust-native`) with no commits missing from `DEPLOY_GIT_REMOTE` (default `origin`), and fast-forwards it. `DEPLOY_SYNC_REMOTE=0` skips this, for offline testing only.
 3. Preflight, before anything changes. It refuses to run while containers of services the Compose file no longer defines are running (the PHP `horizon`, `scheduler` and `indexer` after the cutover), while `docker/config/app.env` has a `$` Compose would interpolate (single-quote such values), or when a data service's (`DEPLOY_DATA_SERVICES`, default `mariadb redis manticore`) Compose definition, image or mounted config changed. `DEPLOY_RECREATE_DATA=1` allows that, and recreates those data services as a separate step before `migrate`, in a window you planned.
-4. Builds the image while the old stack keeps running.
-5. Runs `migrate` on its own. If it fails, nothing has been recreated and the old stack keeps serving.
-6. Runs `docker compose up -d --wait` (timeout `DEPLOY_HEALTH_TIMEOUT`, default 600 s). Changed services are recreated; unchanged ones are left alone. Compose doesn't notice an edited mounted file, so services whose mounted config (Caddyfile, Prometheus, Grafana provisioning) changed since the last healthy deploy are force-recreated. The hashes live in `DEPLOY_CONFIG_STAMP` (default `docker/.deploy.config`).
-7. Checks that every running app container runs the image just built, and sets Grafana's admin password from `GRAFANA_ADMIN_PASSWORD`.
-8. Appends `deploy result=started` and `deploy result=finished rc=<n>` lines to `DEPLOY_LOG` (default `docker/.deploy.log`).
+4. Builds the image while the old stack keeps running. It is labelled with the newest commit that changed its sources (`docker/bin/source-revision`), so a docs- or test-only commit builds the same cached image and recreates nothing.
+5. When a migration is pending (`nntmux-ctl migrate --pending`) or a data service is recreated, it stops every running app service (each drains) and holds `nntmux-ctl verify barrier`, which pauses verification workers on every host until the rollout is healthy; after a failure both stay in place for the next deploy to adopt.
+6. Runs `migrate` on its own, before any app service is recreated. A failed migration leaves the stack as it was (stopped, if step 5 quiesced it).
+7. Runs `docker compose up -d --wait` (timeout `DEPLOY_HEALTH_TIMEOUT`, default 600 s). Changed services are recreated; unchanged ones are left alone. Compose doesn't notice an edited mounted file, so services whose mounted config (Caddyfile, Prometheus, Grafana provisioning) changed since the last healthy deploy are force-recreated. The hashes live in `DEPLOY_CONFIG_STAMP` (default `docker/.deploy.config`).
+8. Checks that every running app container runs the image just built, releases the barrier, and sets Grafana's admin password from `GRAFANA_ADMIN_PASSWORD`.
+9. Appends `deploy result=started` and `deploy result=finished rc=<n>` lines to `DEPLOY_LOG` (default `docker/.deploy.log`).
 
-Remote verification workers (`docker/worker`) aren't part of the stack. Stop them before a deploy that adds a migration, and start them again after it.
+Remote verification workers (`docker/worker`) aren't part of the stack; the barrier in step 5 keeps them out during a migration or data-service change. `DEPLOY_REMOTE_DRAIN_TIMEOUT` (default 900 s) is how long it waits for them to finish.
 
 Workers get SIGTERM, stop claiming work, and finish in-flight units within their `stop_grace_period` (30 s `web`, 120 s default, 1920 s `fingerprint`, `verify` and `postprocess`). A long job can delay a rollout.
 
