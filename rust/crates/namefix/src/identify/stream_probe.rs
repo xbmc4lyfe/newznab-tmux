@@ -1145,7 +1145,7 @@ fn render(rows: &[Row]) -> (String, String) {
          | Title or track name gives a scene name | {} (in PreDB: {}) |\n\
          | Inner archive name gives a scene name | {} (in PreDB: {}) |\n\
          | SegmentUID matches a named release | {} |\n\
-         | Fingerprint fits one named release (unproven: 0 of 22 right in the hold-out) | {} |\n\
+         | Fingerprint fits one named release (unproven: 9 of 32 right in the hold-out) | {} |\n\
          | Fingerprint fits several | {} |\n\
          | Exactly one PreDB size candidate after stream filter | {} |\n\
          | Several PreDB size candidates | {} |\n",
