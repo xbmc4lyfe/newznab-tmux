@@ -44,7 +44,7 @@ pub fn chapter_signature(header: &Header) -> Option<String> {
         .chapters
         .iter()
         .filter(|c| !c.hidden)
-        .map(|c| (c.start_ns + 50_000_000) / 100_000_000)
+        .map(|c| c.start_ns.saturating_add(50_000_000) / 100_000_000)
         .collect();
     if starts.len() < 3 {
         return None;

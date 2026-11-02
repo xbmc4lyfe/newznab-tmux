@@ -52,10 +52,16 @@ pub fn yenc_fields(article: &[u8]) -> YencFields {
         match keyword {
             "=ybegin" => {
                 fields.name = name.filter(|n| !n.is_empty()).or(fields.name);
-                fields.line = num("line").map(|v| v as u32).or(fields.line);
+                fields.line = num("line")
+                    .and_then(|v| u32::try_from(v).ok())
+                    .or(fields.line);
                 fields.size = num("size").or(fields.size);
-                fields.part = num("part").map(|v| v as u32).or(fields.part);
-                fields.total = num("total").map(|v| v as u32).or(fields.total);
+                fields.part = num("part")
+                    .and_then(|v| u32::try_from(v).ok())
+                    .or(fields.part);
+                fields.total = num("total")
+                    .and_then(|v| u32::try_from(v).ok())
+                    .or(fields.total);
             }
             "=ypart" => {
                 fields.begin = num("begin").or(fields.begin);

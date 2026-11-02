@@ -76,7 +76,11 @@ pub struct RpuSummary {
 
 /// Parses one HEVC UNSPEC62 NAL unit (with or without its `7C 01` header).
 pub fn summarize_rpu(nal: &[u8]) -> Option<RpuSummary> {
-    let rpu = DoviRpu::parse_unspec62_nalu(nal).ok()?;
+    // The parser is a third-party crate fed untrusted bytes; a panic in it costs one probe, not
+    // the worker.
+    let rpu = std::panic::catch_unwind(|| DoviRpu::parse_unspec62_nalu(nal))
+        .ok()?
+        .ok()?;
     let el_type = match rpu
         .el_type
         .clone()

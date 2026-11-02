@@ -195,7 +195,7 @@ impl MediaSummary {
             attrs.push(("subs", subs.join(", ")));
         }
         if let Some(ms) = self.duration_ms {
-            attrs.push(("runtime", ((ms + 30_000) / 60_000).to_string()));
+            attrs.push(("runtime", (ms.saturating_add(30_000) / 60_000).to_string()));
         }
         if let Some(video) = &self.video {
             attrs.push(("hdr", video.hdr.join(" ")));

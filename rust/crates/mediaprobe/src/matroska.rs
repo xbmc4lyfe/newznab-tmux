@@ -192,14 +192,21 @@ pub fn parse_header(buf: &[u8]) -> Result<Header, HeaderError> {
     if !have_tracks {
         return Err(HeaderError::NeedMore(None));
     }
+    // Anything past 100 days is a broken header, not a film.
+    const MAX_DURATION_MS: f64 = 100.0 * 24.0 * 3600.0 * 1000.0;
     header.duration_ms = duration
-        .filter(|d| d.is_finite() && *d > 0.0)
-        .map(|d| (d * header.timestamp_scale as f64 / 1_000_000.0).round() as u64);
+        .map(|d| d * header.timestamp_scale as f64 / 1_000_000.0)
+        .filter(|ms| ms.is_finite() && *ms > 0.0 && *ms < MAX_DURATION_MS)
+        .map(|ms| ms.round() as u64);
     Ok(header)
 }
 
 fn need(element: &Element<'_>) -> HeaderError {
-    HeaderError::NeedMore(element.size.map(|size| element.body_offset + size as usize))
+    HeaderError::NeedMore(element.size.and_then(|size| {
+        usize::try_from(size)
+            .ok()
+            .and_then(|size| element.body_offset.checked_add(size))
+    }))
 }
 
 fn non_empty(s: String) -> Option<String> {
@@ -433,10 +440,28 @@ fn walk_clusters<'a>(data: &'a [u8], base: usize, out: &mut Vec<Block<'a>>) {
 }
 
 fn read_cluster<'a>(data: &'a [u8], base: usize, out: &mut Vec<Block<'a>>) {
+    // An unknown-sized cluster swallows the next one as a "child". That one is read in this same
+    // loop rather than by recursion, so a run of nested clusters can't exhaust the stack.
+    let mut next = Some((data, base));
+    while let Some((data, base)) = next.take() {
+        read_cluster_body(data, base, out, &mut next);
+    }
+}
+
+fn read_cluster_body<'a>(
+    data: &'a [u8],
+    base: usize,
+    out: &mut Vec<Block<'a>>,
+    next: &mut Option<(&'a [u8], usize)>,
+) {
     let mut cluster_time: i64 = 0;
     for element in children(data, base) {
         match element.id {
-            0xE7 => cluster_time = ebml::uint(element.body).unwrap_or(0) as i64,
+            0xE7 => {
+                cluster_time = ebml::uint(element.body)
+                    .and_then(|t| i64::try_from(t).ok())
+                    .unwrap_or(i64::MAX)
+            }
             0xA3 if !element.truncated => {
                 if let Some(block) = parse_block(element.body, cluster_time, None) {
                     out.push(block);
@@ -477,7 +502,10 @@ fn read_cluster<'a>(data: &'a [u8], base: usize, out: &mut Vec<Block<'a>>) {
                 }
             }
             // An unknown-sized cluster swallows the next one as a "child".
-            CLUSTER => read_cluster(element.body, element.body_offset, out),
+            CLUSTER => {
+                *next = Some((element.body, element.body_offset));
+                return;
+            }
             _ => {}
         }
     }
@@ -496,7 +524,7 @@ fn parse_block(body: &[u8], cluster_time: i64, keyframe: Option<bool>) -> Option
     let frames = delace(payload, (flags >> 1) & 3)?;
     Some(Block {
         track,
-        timestamp: cluster_time + i64::from(offset),
+        timestamp: cluster_time.saturating_add(i64::from(offset)),
         keyframe: keyframe.unwrap_or(flags & 0x80 != 0),
         frames,
         additions: Vec::new(),
@@ -508,8 +536,10 @@ fn delace(payload: &[u8], lacing: u8) -> Option<Vec<&[u8]>> {
         return Some(vec![payload]);
     }
     let count = usize::from(*payload.first()?) + 1;
-    let mut pos = 1;
+    let mut pos = 1usize;
     let mut sizes = Vec::with_capacity(count);
+    // Every size is checked against the payload as soon as it's read, so no sum can overflow.
+    let limit = payload.len();
     match lacing {
         // Xiph
         1 => {
@@ -518,7 +548,10 @@ fn delace(payload: &[u8], lacing: u8) -> Option<Vec<&[u8]>> {
                 loop {
                     let byte = *payload.get(pos)?;
                     pos += 1;
-                    size += usize::from(byte);
+                    size = size.checked_add(usize::from(byte))?;
+                    if size > limit {
+                        return None;
+                    }
                     if byte != 255 {
                         break;
                     }
@@ -536,28 +569,35 @@ fn delace(payload: &[u8], lacing: u8) -> Option<Vec<&[u8]>> {
         }
         // EBML
         _ => {
-            let (first, len) = ebml::read_size(&payload[pos..])?;
+            let (first, len) = ebml::read_size(payload.get(pos..)?)?;
             pos += len;
-            let mut size = first? as i64;
+            let mut size = i64::try_from(first?).ok()?;
+            if size > limit as i64 {
+                return None;
+            }
             sizes.push(size as usize);
             for _ in 1..count - 1 {
-                let (delta, len) = ebml::read_signed(&payload[pos..])?;
+                let (delta, len) = ebml::read_signed(payload.get(pos..)?)?;
                 pos += len;
-                size += delta;
-                if size < 0 {
+                size = size.checked_add(delta)?;
+                if size < 0 || size > limit as i64 {
                     return None;
                 }
                 sizes.push(size as usize);
             }
         }
     }
-    let used: usize = sizes.iter().sum();
-    let last = payload.len().checked_sub(pos + used)?;
+    let mut used = 0usize;
+    for &size in &sizes {
+        used = used.checked_add(size)?;
+    }
+    let last = payload.len().checked_sub(pos.checked_add(used)?)?;
     sizes.push(last);
     let mut frames = Vec::with_capacity(count);
     for size in sizes {
-        frames.push(payload.get(pos..pos + size)?);
-        pos += size;
+        let end = pos.checked_add(size)?;
+        frames.push(payload.get(pos..end)?);
+        pos = end;
     }
     Some(frames)
 }
