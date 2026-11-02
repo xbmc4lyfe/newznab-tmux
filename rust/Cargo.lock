@@ -2289,6 +2289,7 @@ dependencies = [
  "hex",
  "md-5 0.10.6",
  "nntmux-core",
+ "nntmux-mail",
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-webkit",

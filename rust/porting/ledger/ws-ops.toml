@@ -245,7 +245,8 @@ status = "ported"
 kind = "schedule"
 id = "command: 'cloudflare:reload')->daily()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "Refreshed Cloudflare's ranges for Laravel's trusted proxy middleware. nntmux_webkit::client_ip carries the published ranges, and TRUSTED_PROXIES adds any others."
 
 [[entry]]
 kind = "schedule"
