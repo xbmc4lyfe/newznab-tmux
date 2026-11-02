@@ -218,6 +218,28 @@ pub(super) fn volumes_to_try(nzb: &NzbSummary) -> Vec<&NzbFile> {
         .collect()
 }
 
+/// The volume holding the end of a set `first` opens, which is where a 7z keeps its index.
+pub(super) fn last_volume<'a>(nzb: &'a NzbSummary, first: &'a NzbFile) -> &'a NzbFile {
+    static NUMBERED: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(.*)\.(\d{3})$").expect("static pattern"));
+    let split = |file: &NzbFile| -> Option<(String, u32)> {
+        let name = name::name_from_subject(&file.subject)?.to_ascii_lowercase();
+        let found = NUMBERED.captures(&name)?;
+        Some((found[1].to_owned(), found[2].parse().ok()?))
+    };
+    let Some((base, _)) = split(first) else {
+        return first;
+    };
+    nzb.files
+        .iter()
+        .filter_map(|file| {
+            let (other, number) = split(file)?;
+            (other == base).then_some((number, file))
+        })
+        .max_by_key(|(number, _)| *number)
+        .map_or(first, |(_, file)| file)
+}
+
 #[derive(Debug, Default)]
 struct Stats {
     releases: AtomicUsize,

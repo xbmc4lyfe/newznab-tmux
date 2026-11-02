@@ -20,6 +20,7 @@ pub mod local_predb;
 pub mod mysql;
 pub mod name;
 pub mod nzb;
+pub mod sevenzip;
 pub mod srrdb;
 pub mod stream_probe;
 

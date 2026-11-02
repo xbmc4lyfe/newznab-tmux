@@ -64,6 +64,9 @@ enum Command {
         /// Of those, how many Matroska and MP4 streams to read in full.
         #[arg(long, default_value_t = 100)]
         media: usize,
+        /// The most to download for one release, in MiB.
+        #[arg(long, default_value_t = 64)]
+        budget_mib: u64,
     },
 }
 
@@ -127,11 +130,19 @@ fn start(cli: &Cli) -> Result<()> {
                 print!("\n{stats}");
             }
         }
-        Command::StreamSample { sample, media } => {
+        Command::StreamSample {
+            sample,
+            media,
+            budget_mib,
+        } => {
             let fetcher = NntpFetch::from_env()?;
             let (report, lines) = stream_probe::sample(
                 &options,
-                &stream_probe::SampleOptions { sample, media },
+                &stream_probe::SampleOptions {
+                    sample,
+                    media,
+                    byte_budget: budget_mib * 1024 * 1024,
+                },
                 &fetcher,
             )?;
             write_out(&cli.out, "stream_sample.md", &report)?;

@@ -17,17 +17,20 @@ use nntmux_mediaprobe::summary::MediaSummary;
 use nntmux_mediaprobe::{Limits, Probe, probe_prefix};
 use rusqlite::Connection;
 
-use super::archive_probe::{ArticleFetch, volumes_to_try};
+use super::archive_probe::{ArticleFetch, last_volume, volumes_to_try};
 use super::catalog::{Options, for_each_target, load, open_read_only, text};
 use super::ladder::{Context, Evidence, Hooks, Outcome, identify};
 use super::local_predb::LocalPredb;
 use super::name::{self, folded};
-use super::nzb::NzbFile;
+use super::nzb::{NzbFile, NzbSummary};
+use super::sevenzip::{self, Opened};
 
 /// Layers to walk through before giving up on a post built to waste our time.
 const MAX_LAYERS: usize = 6;
 /// Articles to read per file, about 6 MB at the usual size.
 const MAX_ARTICLES: usize = 8;
+/// How much of a compressed layer to decode, which is plenty to reach a stream's header.
+const DECODED_LIMIT: usize = 32 * 1024 * 1024;
 const RAR4_STORED: u8 = 0x30;
 const RANDOMNESS_SAMPLE: usize = 64 * 1024;
 /// Bits per byte, where 8 is perfectly random.
@@ -490,6 +493,8 @@ struct Row {
     end: Option<End>,
     layers: usize,
     missing: bool,
+    fetched_bytes: u64,
+    over_budget: bool,
     /// How the walk went, as `rar5(stored)>mkv`.
     chain: String,
     /// Sampled for a read of its stream.
@@ -511,6 +516,7 @@ struct Sampler<'a> {
     known: &'a KnownReleases,
     media_budget: usize,
     media_taken: AtomicUsize,
+    byte_budget: u64,
 }
 
 impl Sampler<'_> {
@@ -530,36 +536,73 @@ impl Sampler<'_> {
             let mut in_budget = false;
             let mut file_chain = String::new();
             let mut file_unknown = None;
+            let mut tail: Option<Vec<u8>> = None;
             while index < file.head_message_ids.len().min(limit) {
-                let Some(body) = self.fetch.fetch(group, &file.head_message_ids[index]) else {
-                    row.missing = true;
+                let Some(body) = self.get(group, &file.head_message_ids[index], &mut row) else {
+                    row.missing |= !row.over_budget;
                     break;
                 };
                 buffer.extend_from_slice(&body);
                 index += 1;
+                let holder;
                 let peeled = peel(&buffer);
-                end = Some(peeled.end);
-                file_chain = peeled
+                let mut chain: Vec<String> = peeled
                     .chain
                     .iter()
-                    .copied()
-                    .chain([peeled.end.as_str()])
-                    .collect::<Vec<_>>()
-                    .join(">");
-                file_unknown = matches!(peeled.end, End::Other | End::LooksRandom)
-                    .then(|| unknown_line(evidence.id, file, peeled.stream));
-                if let Some(found) = peeled
-                    .names
-                    .iter()
-                    .find_map(|inner| scene_name(inner, self.predb))
-                {
+                    .map(|layer| (*layer).to_owned())
+                    .collect();
+                let mut names = peeled.names.clone();
+                let mut current = peeled.end;
+                let mut stream = peeled.stream;
+                let mut layers = peeled.layers;
+                // A 7z inside another layer has no tail of its own to read, for now.
+                if current == End::SevenZip && layers == 0 {
+                    match self.open_sevenzip(&buffer, nzb, file, group, &mut tail, &mut row) {
+                        Opened::Encrypted { names: inner } => {
+                            names.extend(inner);
+                            chain.push("7z(aes)".to_owned());
+                            current = End::Encrypted;
+                        }
+                        Opened::Inner {
+                            method,
+                            names: inner,
+                            bytes,
+                        } => {
+                            names.extend(inner);
+                            chain.push(format!("7z({method})"));
+                            holder = bytes;
+                            let within = peel(&holder);
+                            chain.extend(within.chain.iter().map(|layer| (*layer).to_owned()));
+                            names.extend(within.names);
+                            current = within.end;
+                            stream = within.stream;
+                            layers += 1 + within.layers;
+                        }
+                        Opened::Unsupported {
+                            method,
+                            names: inner,
+                        } => {
+                            names.extend(inner);
+                            chain.push(format!("7z({method})"));
+                            current = End::Compressed;
+                        }
+                        Opened::NeedTail => chain.push("7z(index out of reach)".to_owned()),
+                        Opened::Damaged => chain.push("7z(damaged)".to_owned()),
+                    }
+                }
+                end = Some(current);
+                chain.push(current.as_str().to_owned());
+                file_chain = chain.join(">");
+                file_unknown = matches!(current, End::Other | End::LooksRandom)
+                    .then(|| unknown_line(evidence.id, file, stream));
+                if let Some(found) = names.iter().find_map(|inner| scene_name(inner, self.predb)) {
                     row.inner_name = Some(found);
                 }
-                row.layers = peeled.layers;
-                if peeled.end == End::NeedMore {
+                row.layers = layers;
+                if current == End::NeedMore {
                     continue;
                 }
-                if peeled.end == End::Mp4 {
+                if current == End::Mp4 {
                     if !in_budget {
                         in_budget =
                             self.media_taken.fetch_add(1, Ordering::Relaxed) < self.media_budget;
@@ -569,7 +612,7 @@ impl Sampler<'_> {
                         row.read = true;
                         limit = MAX_ARTICLES;
                     }
-                    match mp4::probe_prefix(peeled.stream) {
+                    match mp4::probe_prefix(stream) {
                         Mp4Probe::Read(summary) => {
                             row.header_read = true;
                             self.record(&mut row, &summary, nzb.payload_bytes, evidence.posted_at);
@@ -578,7 +621,7 @@ impl Sampler<'_> {
                         Mp4Probe::NeedPrefix { .. } => continue,
                         Mp4Probe::NotMp4 => break,
                         Mp4Probe::MoovInTail => {
-                            if let Some(summary) = self.read_tail(group, file) {
+                            if let Some(summary) = self.read_tail(group, file, &mut row) {
                                 row.header_read = true;
                                 self.record(
                                     &mut row,
@@ -591,7 +634,7 @@ impl Sampler<'_> {
                         }
                     }
                 }
-                if peeled.end != End::Matroska {
+                if current != End::Matroska {
                     break;
                 }
                 if !in_budget {
@@ -603,7 +646,7 @@ impl Sampler<'_> {
                     row.read = true;
                     limit = MAX_ARTICLES;
                 }
-                match probe_prefix(peeled.stream, Limits::default()) {
+                match probe_prefix(stream, Limits::default()) {
                     Probe::Read {
                         summary,
                         wants_more,
@@ -635,16 +678,57 @@ impl Sampler<'_> {
         Some(row)
     }
 
+    /// One article, counted against the release's download budget.
+    fn get(&self, group: &str, id: &str, row: &mut Row) -> Option<Vec<u8>> {
+        if row.fetched_bytes >= self.byte_budget {
+            row.over_budget = true;
+            return None;
+        }
+        let body = self.fetch.fetch(group, id)?;
+        row.fetched_bytes += body.len() as u64;
+        Some(body)
+    }
+
     /// An MP4 whose index comes after its media: read the file's last articles.
-    fn read_tail(&self, group: &str, file: &NzbFile) -> Option<MediaSummary> {
+    fn read_tail(&self, group: &str, file: &NzbFile, row: &mut Row) -> Option<MediaSummary> {
         let mut bodies = Vec::new();
         for id in file.tail_message_ids.iter().rev() {
-            bodies.insert(0, self.fetch.fetch(group, id)?);
+            bodies.insert(0, self.get(group, id, row)?);
             if let Some(summary) = mp4::probe_tail(&bodies.concat()) {
                 return Some(summary);
             }
         }
         None
+    }
+
+    /// Opens a 7z, reading its last volume's tail back only as far as its index needs.
+    fn open_sevenzip(
+        &self,
+        prefix: &[u8],
+        nzb: &NzbSummary,
+        file: &NzbFile,
+        group: &str,
+        tail: &mut Option<Vec<u8>>,
+        row: &mut Row,
+    ) -> Opened {
+        if let Some(known) = tail {
+            return sevenzip::open(prefix, known, DECODED_LIMIT);
+        }
+        let last = last_volume(nzb, file);
+        let mut bodies: Vec<Vec<u8>> = Vec::new();
+        for id in last.tail_message_ids.iter().rev() {
+            let Some(body) = self.get(group, id, row) else {
+                break;
+            };
+            bodies.insert(0, body);
+            let joined = bodies.concat();
+            let opened = sevenzip::open(prefix, &joined, DECODED_LIMIT);
+            if opened != Opened::NeedTail {
+                *tail = Some(joined);
+                return opened;
+            }
+        }
+        Opened::NeedTail
     }
 
     fn record(&self, row: &mut Row, summary: &MediaSummary, payload_bytes: u64, posted_at: i64) {
@@ -735,6 +819,8 @@ pub struct SampleOptions {
     pub sample: usize,
     /// Of those, how many Matroska and MP4 streams to read in full.
     pub media: usize,
+    /// The most to download for one release.
+    pub byte_budget: u64,
 }
 
 /// Classifies a sample of the releases nothing else can name, and fingerprints the streams it can
@@ -760,6 +846,7 @@ pub fn sample(
         known: &known,
         media_budget: settings.media,
         media_taken: AtomicUsize::new(0),
+        byte_budget: settings.byte_budget,
     };
     let taken = AtomicUsize::new(0);
     let rows = Mutex::new(Vec::new());
@@ -809,9 +896,15 @@ fn render(rows: &[Row]) -> (String, String) {
     }
     let read: Vec<&Row> = rows.iter().filter(|row| row.read).collect();
     let count = |test: &dyn Fn(&Row) -> bool| read.iter().filter(|row| test(row)).count();
+    let fetched: u64 = rows.iter().map(|row| row.fetched_bytes).sum();
+    let largest = rows.iter().map(|row| row.fetched_bytes).max().unwrap_or(0);
     let mut out = format!(
-        "# Stream sample\n\nReleases: {}\n\n## What's inside\n\n| Reached | Releases |\n|---|---|\n",
-        rows.len()
+        "# Stream sample\n\nReleases: {}\n\nDownloaded: {} MiB, averaging {} KiB a release, {} MiB at most. Over budget: {}.\n\n## What's inside\n\n| Reached | Releases |\n|---|---|\n",
+        rows.len(),
+        fetched / (1024 * 1024),
+        fetched / 1024 / (rows.len().max(1) as u64),
+        largest / (1024 * 1024),
+        rows.iter().filter(|row| row.over_budget).count(),
     );
     for (label, total) in &ends {
         let _ = writeln!(out, "| {label} | {total} |");
@@ -907,7 +1000,11 @@ fn render(rows: &[Row]) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identify::archive_probe::tests::{rar4, rar4_method};
+    use sevenz_rust2::EncoderMethod;
+
+    use crate::identify::archive_probe::tests::{Fake, rar4, rar4_method};
+    use crate::identify::nzb::NzbFile;
+    use crate::identify::sevenzip;
 
     fn mkv() -> Vec<u8> {
         std::fs::read(concat!(
@@ -1035,9 +1132,6 @@ mod tests {
 
     #[test]
     fn the_report_follows_the_file_that_decided_the_release() {
-        use crate::identify::archive_probe::tests::Fake;
-        use crate::identify::nzb::{NzbFile, NzbSummary};
-
         let file = |subject: &str, id: &str| NzbFile {
             subject: subject.to_owned(),
             bytes: 100,
@@ -1060,6 +1154,7 @@ mod tests {
             known: &known,
             media_budget: 0,
             media_taken: AtomicUsize::new(0),
+            byte_budget: 64 * 1024 * 1024,
         };
         let evidence = Evidence {
             nzb: Some(NzbSummary {
@@ -1073,8 +1168,108 @@ mod tests {
         };
         let row = sampler.read_release(&evidence).expect("row");
         assert_eq!(row.end, Some(End::SevenZip));
-        assert_eq!(row.chain, "7z");
+        // The fake 7z has no index, and the random second volume doesn't replace it in the report.
+        assert_eq!(row.chain, "7z(damaged)>7z");
         assert_eq!(row.unknown, None);
+    }
+
+    fn sevenzip_row(files: Vec<NzbFile>, fake: &Fake) -> Row {
+        let predb = LocalPredb::default();
+        let known = KnownReleases::default();
+        let sampler = Sampler {
+            fetch: fake,
+            predb: &predb,
+            known: &known,
+            media_budget: 10,
+            media_taken: AtomicUsize::new(0),
+            byte_budget: 64 * 1024 * 1024,
+        };
+        let evidence = Evidence {
+            nzb: Some(NzbSummary {
+                files,
+                ..NzbSummary::default()
+            }),
+            ..Evidence::default()
+        };
+        sampler.read_release(&evidence).expect("row")
+    }
+
+    fn volume(subject: &str, head: &str, tail: &str) -> NzbFile {
+        NzbFile {
+            subject: subject.to_owned(),
+            bytes: 100,
+            group: Some("g".to_owned()),
+            first_message_id: Some(head.to_owned()),
+            head_message_ids: vec![head.to_owned()],
+            tail_message_ids: vec![tail.to_owned()],
+        }
+    }
+
+    #[test]
+    fn walks_through_a_compressed_7z_split_across_volumes_to_the_stream() {
+        let archive = sevenzip::tests::archive(
+            EncoderMethod::LZMA2,
+            "Some.Film.2021.1080p.WEB-DL.H264-GRP.mkv",
+            &mkv(),
+        );
+        // The last volume holds the index and whatever else fits, as with any fixed-size split.
+        let (first, second) = archive.split_at(archive.len() - 512);
+        let mut fake = Fake::default();
+        fake.0.insert("one".to_owned(), first.to_vec());
+        fake.0.insert("two".to_owned(), second.to_vec());
+        let row = sevenzip_row(
+            vec![
+                volume(r#""x.7z.002" yEnc"#, "two", "two"),
+                volume(r#""x.7z.001" yEnc"#, "one", "one"),
+            ],
+            &fake,
+        );
+        assert_eq!(row.chain, "7z(lzma2)>Matroska");
+        assert_eq!(row.end, Some(End::Matroska));
+        assert!(row.header_read);
+        assert_eq!(row.layers, 1);
+        assert_eq!(
+            row.inner_name.map(|found| found.0).as_deref(),
+            Some("Some.Film.2021.1080p.WEB-DL.H264-GRP")
+        );
+        assert!(row.fetched_bytes > 0);
+    }
+
+    #[test]
+    fn a_stored_7z_is_walked_through_too() {
+        let archive = sevenzip::tests::archive(EncoderMethod::COPY, "a.mkv", &mkv());
+        let mut fake = Fake::default();
+        fake.0.insert("a".to_owned(), archive);
+        let row = sevenzip_row(vec![volume(r#""x.7z" yEnc"#, "a", "a")], &fake);
+        assert_eq!(row.chain, "7z(copy)>Matroska");
+    }
+
+    #[test]
+    fn the_download_budget_stops_a_release_and_is_counted() {
+        let archive = sevenzip::tests::archive(EncoderMethod::COPY, "a.mkv", &mkv());
+        let mut fake = Fake::default();
+        fake.0.insert("a".to_owned(), archive);
+        let predb = LocalPredb::default();
+        let known = KnownReleases::default();
+        let sampler = Sampler {
+            fetch: &fake,
+            predb: &predb,
+            known: &known,
+            media_budget: 10,
+            media_taken: AtomicUsize::new(0),
+            byte_budget: 0,
+        };
+        let evidence = Evidence {
+            nzb: Some(NzbSummary {
+                files: vec![volume(r#""x.7z" yEnc"#, "a", "a")],
+                ..NzbSummary::default()
+            }),
+            ..Evidence::default()
+        };
+        let row = sampler.read_release(&evidence).expect("row");
+        assert!(row.over_budget);
+        assert!(!row.missing);
+        assert_eq!(row.fetched_bytes, 0);
     }
 
     #[test]
