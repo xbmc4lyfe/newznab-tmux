@@ -5,6 +5,7 @@
   deploy-inspect services           every service, in any profile
   deploy-inspect image-users IMAGE  services that run IMAGE
   deploy-inspect image-of SERVICE   the image SERVICE runs
+  deploy-inspect refuse IMAGE       one line per setting the deploy cannot run safely (empty: none)
   deploy-inspect app-deps IMAGE SVC...  "service dependency" for each listed service that needs
                                     (directly or through others) a service running IMAGE
   deploy-inspect data BASE IMAGE    stateful services: not running IMAGE, and either listed in BASE
@@ -18,8 +19,10 @@ A service's config hash covers the content of every bind-mounted file, and of ev
 read-only bind-mounted directory, wherever it lives (a persistent runtime directory outside the
 checkout too) and following symlinks. Writable directories are data (database files, storage)
 and are skipped, and so are host system paths (/, /proc, /sys, /dev, /run, Docker's own state),
-such as node-exporter's mounts. Compose recreates a service only when its definition changes, so deploy uses these hashes
-to recreate a service whose mounted config changed.
+such as node-exporter's mounts. It also covers the Compose configs and secrets the service uses:
+a file source's content, an environment source's value (which must be set), inline content, or
+an external resource's definition. Compose recreates a service only when its definition changes,
+so deploy uses these hashes to recreate a service whose mounted config changed.
 """
 import hashlib
 import json
@@ -70,6 +73,62 @@ def config_sources(service: dict) -> tuple[list[str], list[str]]:
         elif os.path.isdir(source) and not system_path(source):
             (sources if volume.get("read_only") else storage).append(source)
     return sorted(sources), sorted(storage)
+
+
+def resource_digest(model: dict, service: dict, digest) -> bool:
+    """Hash the Compose configs and secrets a service uses; False if it uses none."""
+    used = False
+    for kind in ("configs", "secrets"):
+        defined = model.get(kind) or {}
+        for ref in service.get(kind) or []:
+            name = ref.get("source") if isinstance(ref, dict) else ref
+            spec = defined.get(name) or {}
+            used = True
+            digest.update(f"{kind} {name}".encode() + b"\0")
+            if spec.get("file"):
+                tree_digest(spec["file"], digest)
+            elif spec.get("environment"):
+                var = spec["environment"]
+                if var not in os.environ:
+                    sys.exit(f"The {kind[:-1]} {name} reads ${var}, which isn't set here, so a change "
+                             f"to it can't be detected. Set it in docker/.env or the environment.")
+                digest.update(os.environ[var].encode() + b"\0")
+            elif "content" in spec:
+                digest.update(str(spec["content"]).encode() + b"\0")
+            else:
+                # External: managed outside this project; its name is all there is to record.
+                digest.update(json.dumps(spec, sort_keys=True).encode() + b"\0")
+    return used
+
+
+def refusals(model: dict, image: str) -> list[str]:
+    """Settings that would let Compose act outside the deploy's checks, as the old planner refused."""
+    out = []
+    services = model.get("services") or {}
+    for name, svc in sorted(services.items()):
+        app = svc.get("image") == image
+        if svc.get("build"):
+            out.append(f"{name}: has a build section; the deploy builds {image} itself")
+        for key in ("network_mode", "ipc", "pid"):
+            value = str(svc.get(key) or "")
+            if value.startswith(("service:", "container:")):
+                out.append(f"{name}: {key} {value} shares another container's namespace")
+        if svc.get("volumes_from"):
+            out.append(f"{name}: volumes_from ties it to another container's lifecycle")
+        deps = svc.get("depends_on") or {}
+        if isinstance(deps, dict):
+            for dep, cond in deps.items():
+                if isinstance(cond, dict) and cond.get("restart"):
+                    out.append(f"{name}: depends_on.{dep}.restart restarts it outside the deploy")
+        if app and name != "migrate":
+            check = svc.get("healthcheck") or {}
+            test = check.get("test") or []
+            if not check or check.get("disable") or test in (["NONE"], "NONE") or test[:1] == ["NONE"]:
+                out.append(f"{name}: needs a health check; the deploy only trusts a healthy app service")
+        replicas = (svc.get("deploy") or {}).get("replicas", svc.get("scale", 1))
+        if app and replicas not in (None, 1):
+            out.append(f"{name}: runs {replicas} replicas; an app service runs exactly one")
+    return out
 
 
 def storage_identity(path: str, digest) -> None:
@@ -139,14 +198,17 @@ def main() -> None:
     elif command == ["image-users"]:
         image = sys.argv[2]
         print("\n".join(sorted(name for name, svc in services.items() if svc.get("image") == image)))
+    elif command == ["refuse"]:
+        print("\n".join(refusals(model, sys.argv[2])))
     elif command == ["configs"]:
         for name in sorted(services):
             sources, _ = config_sources(services[name])
-            if not sources:
-                continue
             digest = hashlib.sha256()
             for source in sources:
                 tree_digest(source, digest)
+            # Compose configs and secrets are mounted config too, from a file or the environment.
+            if not resource_digest(model, services[name], digest) and not sources:
+                continue
             print(f"{name} {digest.hexdigest()}")
     elif command == ["storage"]:
         # Only storage that exists: Compose creates a missing bind source when it starts the service.

@@ -146,6 +146,14 @@ known=" $("$inspect" services < "$work/all.json" | tr '\n' ' ') "
 # the app image, unless it is labelled nntmux.deploy.stateless: "true".
 COMPOSE_FILE="$stack/docker-compose.yml" "$compose" --profile '*' config --services > "$work/roster"
 data_services=" $("$inspect" data "$base_data" "$image" < "$work/all.json" 3< "$work/roster" | tr '\n' ' ') "
+# Settings that would let Compose act outside these checks (a build section, shared namespaces,
+# dependency restarts, an app service without a health check or with several replicas).
+refused=$("$inspect" refuse "$image" < "$work/all.json")
+if [ -n "$refused" ]; then
+    echo "The Compose model has settings the deploy can't run safely:" >&2
+    echo "$refused" | sed 's/^/  /' >&2
+    exit 1
+fi
 # Starting a data service starts what it depends on. One that needs an app service would start
 # web and migrate before the writers stop and the barrier is held, so it is refused outright.
 bad_deps=$("$inspect" app-deps "$image" $data_services < "$work/all.json")
@@ -545,7 +553,8 @@ if [ -n "$(docker ps -aq --filter "name=^${barrier}\$")" ] || [ -f "$owed" ]; th
             continue
         fi
         health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id")
-        [ -z "$health" ] || [ "$health" = healthy ] || down="$down $svc"
+        # Every app service but migrate has a health check (the preflight refuses one without).
+        [ "$health" = healthy ] || down="$down $svc"
     done
     read_pending
     if [ -n "$down" ] || [ "${pending:-unknown}" != 0 ]; then
