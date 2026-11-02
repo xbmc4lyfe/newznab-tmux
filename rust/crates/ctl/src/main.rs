@@ -5,6 +5,8 @@ use clap::{Parser, Subcommand};
 use nntmux_core::Config;
 use nntmux_runtime::Ctx;
 
+use nntmux_ctl::init;
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -16,6 +18,9 @@ struct Cli {
 enum Command {
     /// Apply pending schema migrations.
     Migrate,
+    /// Set up a new deployment on an empty database: schema, seed, administrator and search
+    /// tables (`nntmux:deploy-init`). Refuses any database that already has tables.
+    Init,
     #[command(subcommand)]
     Ingest(nntmux_ingest::Command),
     #[command(subcommand)]
@@ -60,6 +65,7 @@ async fn main() -> Result<()> {
     let ctx = Ctx::connect(config).await?;
     match cli.command {
         Command::Migrate => unreachable!("handled above"),
+        Command::Init => init::run(&ctx).await,
         Command::Ingest(command) => nntmux_ingest::ctl(ctx, command).await,
         Command::Categorize(command) => nntmux_categorize::ctl(ctx, command).await,
         Command::Namefix(command) => nntmux_namefix::ctl(ctx, command).await,

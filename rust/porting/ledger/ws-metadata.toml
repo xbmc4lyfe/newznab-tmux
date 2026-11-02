@@ -4,19 +4,20 @@
 kind = "command"
 id = "anime:migrate-covers"
 source = "app/Console/Commands/MigrateAnimeCovers.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "anime:refresh"
 source = "app/Console/Commands/RefreshAnimeData.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "books:requeue-failed"
 source = "app/Console/Commands/RequeueFailedBooks.php"
-status = "todo"
+status = "dropped"
+note = "Books are out of scope: the indexer keeps only TV and movies."
 
 [[entry]]
 kind = "command"
@@ -28,25 +29,27 @@ status = "todo"
 kind = "command"
 id = "movie:reverify-matches"
 source = "app/Console/Commands/MovieReverifyMatches.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "nntmux:populate-anidb"
 source = "app/Console/Commands/NntmuxPopulateAniDB.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "steam:lookup"
 source = "app/Console/Commands/SteamLookupGame.php"
-status = "todo"
+status = "dropped"
+note = "Games are out of scope: the indexer keeps only TV and movies."
 
 [[entry]]
 kind = "command"
 id = "steam:search"
 source = "app/Console/Commands/SteamSearchGames.php"
-status = "todo"
+status = "dropped"
+note = "Games are out of scope: the indexer keeps only TV and movies."
 
 [[entry]]
 kind = "command"
@@ -71,3 +74,23 @@ kind = "command"
 id = "tv:reprocess-unmatched"
 source = "app/Console/Commands/ReprocessUnmatchedTvReleases.php"
 status = "ported"
+
+[[entry]]
+kind = "library"
+id = "TvShowAdder"
+source = "app/Services/TvProcessing/TvShowAdder.php"
+status = "ported"
+
+[[entry]]
+kind = "command"
+id = "nntmux:fetch-movie"
+source = "app/Console/Commands/FetchMovieByImdb.php"
+status = "ported"
+note = "Moved from ws-ops."
+
+[[entry]]
+kind = "command"
+id = "nntmux:populate-steam-apps"
+source = "app/Console/Commands/NntmuxPopulateSteamApps.php"
+status = "dropped"
+note = "Games are out of scope: the indexer keeps only TV and movies. Moved from ws-ops."

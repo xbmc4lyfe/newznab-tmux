@@ -58,6 +58,10 @@ pub struct Show {
     pub publisher: String,
     pub country: String,
     pub poster: String,
+    /// Tried when the poster can't be saved. Only the add-show page uses it.
+    pub fallback_poster: String,
+    /// `videos.type`, 0 for TV.
+    pub kind: i64,
     pub source: i64,
     pub imdb: String,
     pub tvdb: i64,
@@ -553,7 +557,7 @@ async fn add_or_update(services: &Services, show: &Show) -> Result<i64> {
         "INSERT INTO videos (type, title, countries_id, started, source, tvdb, trakt, tvrage, \
          tvmaze, imdb, tmdb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(TYPE_TV)
+    .bind(show.kind)
     .bind(&title)
     .bind(&country)
     .bind(started_value(&show.started))
@@ -580,7 +584,7 @@ async fn add_or_update(services: &Services, show: &Show) -> Result<i64> {
                  AND started = ? AND countries_id = ? FOR UPDATE",
             )
             .bind(&title)
-            .bind(TYPE_TV)
+            .bind(show.kind)
             .bind(started_value(&show.started))
             .bind(&country)
             .fetch_optional(db)
@@ -642,7 +646,7 @@ async fn find_existing(db: &MySqlPool, show: &Show) -> Result<i64> {
         "SELECT CAST(id AS SIGNED) FROM videos WHERE title = ? AND type = ? ORDER BY id LIMIT 1",
     )
     .bind(&show.title)
-    .bind(TYPE_TV)
+    .bind(show.kind)
     .fetch_optional(db)
     .await?;
     Ok(found.unwrap_or(0))

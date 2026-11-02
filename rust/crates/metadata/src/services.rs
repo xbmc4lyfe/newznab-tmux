@@ -11,7 +11,10 @@ use sqlx::MySqlPool;
 use tracing::{error, warn};
 
 use crate::cache::Cache;
+use crate::clients::anilist::AniList;
 use crate::clients::fanart::Fanart;
+use crate::clients::imdb::Imdb;
+use crate::clients::omdb::Omdb;
 use crate::clients::tmdb::Tmdb;
 use crate::clients::trakt::Trakt;
 use crate::clients::tvdb::Tvdb;
@@ -30,6 +33,9 @@ pub struct Services {
     pub tvmaze: TvMaze,
     pub trakt: Trakt,
     pub fanart: Fanart,
+    pub omdb: Omdb,
+    pub imdb: Imdb,
+    pub anilist: AniList,
 }
 
 static SHARED: OnceLock<Arc<Services>> = OnceLock::new();
@@ -92,6 +98,9 @@ impl Services {
                 parsed_or("FANARTTV_RETRY_TIMES", 3)?,
                 parsed_or("FANARTTV_RETRY_DELAY", 100)?,
             ),
+            omdb: Omdb::new(http.clone(), key("OMDB_APIKEY")),
+            imdb: Imdb::from_env(Cache::new(ctx.redis.clone()))?,
+            anilist: AniList::new(http.clone()),
             http,
         })
     }

@@ -34,7 +34,9 @@ enum Role {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::from_env()?;
-    let metrics = nntmux_telemetry::init(&config.log_filter, config.log_json)?;
+    let role = format!("{:?}", cli.role).to_lowercase();
+    let metrics =
+        nntmux_telemetry::init_for_role(&config.log_filter, config.log_json, Some(&role))?;
     let stop = Shutdown::on_signals()?;
     let health = tokio::spawn(nntmux_telemetry::serve(
         config.health_addr,

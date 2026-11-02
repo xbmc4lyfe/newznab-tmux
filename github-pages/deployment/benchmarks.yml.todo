@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: master
+          ref: rust-native
           persist-credentials: false
       - name: Prepare frozen benchmark reports
         run: bash github-pages/deployment/prepare-benchmarks.sh "$RUNNER_TEMP/site"
@@ -22,5 +22,5 @@ jobs:
       # TODO: Keep frozen /benchmarks/runs/... reports and their provenance intact.
       # TODO: Configure Pages once, upload this combined directory with
       # actions/upload-pages-artifact@v4, then deploy using actions/deploy-pages@v4
-      # in the Pages owner's master-only job with pages:write/id-token:write.
+      # in the Pages owner's rust-native-only job with pages:write/id-token:write.
       # There is intentionally no upload or deployment step in this template.

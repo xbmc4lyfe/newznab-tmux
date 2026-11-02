@@ -4,13 +4,10 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Response};
 use chrono::NaiveDateTime;
-use md5::{Digest, Md5};
 use nntmux_runtime::Ctx;
-use nntmux_webkit::session::random_string;
-use nntmux_webkit::user::{CATEGORY_PERMISSIONS, USER_MODEL};
+use nntmux_webkit::user::create_user;
 use nntmux_webkit::{ClientIp, Input, Session, WebResult, auth};
 use serde_json::Value;
-use sqlx::{MySql, Transaction};
 use tracing::warn;
 
 use super::{back, captcha_error, flash_form, verify};
@@ -265,64 +262,6 @@ async fn validate_form(ctx: &Ctx, input: &Input) -> Result<Vec<(&'static str, St
         }
     }
     Ok(errors)
-}
-
-/// Inserts the account with its role and the view permissions that role allows, which is what
-/// the observer and `grantInheritedPermissions` did. Category access checks direct permissions.
-async fn create_user(
-    tx: &mut Transaction<'_, MySql>,
-    username: &str,
-    email: &str,
-    password_hash: &str,
-    host: &str,
-    role: i32,
-    invites: i32,
-) -> Result<i64> {
-    let rate_limit: Option<i32> = sqlx::query_scalar("SELECT rate_limit FROM roles WHERE id = ?")
-        .bind(role)
-        .fetch_optional(&mut **tx)
-        .await?;
-    let api_token = hex::encode(Md5::digest(random_string(40).as_bytes()));
-    let id = sqlx::query(
-        "INSERT INTO users (username, email, password, host, roles_id, notes, invites, api_token, rate_limit,
-                            verified, email_verified_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, 0, NULL, NOW(), NOW())",
-    )
-    .bind(username)
-    .bind(email)
-    .bind(password_hash)
-    .bind(host)
-    .bind(role)
-    .bind(invites)
-    .bind(api_token)
-    .bind(rate_limit.unwrap_or(60))
-    .execute(&mut **tx)
-    .await?
-    .last_insert_id();
-    sqlx::query("INSERT INTO model_has_roles (role_id, model_type, model_id) VALUES (?, ?, ?)")
-        .bind(role)
-        .bind(USER_MODEL)
-        .bind(id)
-        .execute(&mut **tx)
-        .await?;
-    let names = CATEGORY_PERMISSIONS
-        .iter()
-        .map(|(name, _)| format!("'{name}'"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let grant = format!(
-        "INSERT INTO model_has_permissions (permission_id, model_type, model_id)
-         SELECT p.id, ?, ? FROM permissions p
-         JOIN role_has_permissions rp ON rp.permission_id = p.id
-         WHERE rp.role_id = ? AND p.name IN ({names})"
-    );
-    sqlx::query(sqlx::AssertSqlSafe(grant))
-        .bind(USER_MODEL)
-        .bind(id)
-        .bind(role)
-        .execute(&mut **tx)
-        .await?;
-    Ok(id as i64)
 }
 
 fn metadata_role(metadata: Option<&str>) -> Option<i32> {

@@ -2,12 +2,12 @@ name: Rust indexer
 
 on:
   pull_request:
-    branches: [master]
+    branches: [rust-native]
     paths:
       - 'rust/indexer/**'
       - '.github/workflows/rust-indexer.yml'
   push:
-    branches: [master]
+    branches: [rust-native]
     paths:
       - 'rust/indexer/**'
       - '.github/workflows/rust-indexer.yml'

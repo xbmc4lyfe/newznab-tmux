@@ -329,7 +329,7 @@ sync_remote() {
         remote_head=$(git -C "$REPO" symbolic-ref -q --short "refs/remotes/$remote/HEAD" 2>/dev/null || true)
         branch="${remote_head#"$remote"/}"
         if [ -z "$branch" ] || [ "$branch" = "$remote_head" ]; then
-            branch="master"
+            branch="rust-native"
         fi
     fi
     current_branch=$(git -C "$REPO" symbolic-ref -q --short HEAD 2>/dev/null || true)

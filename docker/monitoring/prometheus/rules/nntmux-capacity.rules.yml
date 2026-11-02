@@ -149,3 +149,22 @@ groups:
         expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
         for: 15m
         annotations: {summary: "Under 10% of host memory available."}
+
+  - name: nntmux-rust
+    rules:
+      # NZBHydra2 waits on these; a slow API is the first thing users feel.
+      - alert: NntmuxApiSlow
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(nntmux_http_request_duration_seconds_bucket{route=~"/api.*"}[5m]))) > 1
+        for: 15m
+        annotations: {summary: "API p95 latency above 1s for 15m."}
+      - alert: NntmuxApiErrors
+        expr: |
+          sum(rate(nntmux_http_requests_total{route=~"/api.*",status=~"5.."}[5m]))
+            / clamp_min(sum(rate(nntmux_http_requests_total{route=~"/api.*"}[5m])), 1e-9) > 0.05
+        for: 10m
+        annotations: {summary: "Over 5% of API requests failing with 5xx for 10m."}
+      - alert: NntmuxRoleErrors
+        expr: sum by (role) (rate(nntmux_work_errors_total[15m])) > 0 unless sum by (role) (rate(nntmux_work_units_total[15m])) > 0
+        for: 30m
+        annotations: {summary: "A worker role has only failed for 30m: it is erroring without finishing any unit."}
