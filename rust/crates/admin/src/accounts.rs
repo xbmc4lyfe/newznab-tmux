@@ -21,7 +21,7 @@ const UNVERIFIED_GRACE_DAYS: i64 = 3;
 /// `chunkById(100)`.
 const CHUNK: i64 = 100;
 /// Spatie stores the model class with each role and permission link.
-const USER_MODEL: &str = r"App\Models\User";
+pub const USER_MODEL: &str = r"App\Models\User";
 
 /// `config('nntmux.purge_inactive_users') === true`: Laravel's `env()` turned only the words
 /// true and (true) into a boolean, so `1` or `yes` left both jobs off.
