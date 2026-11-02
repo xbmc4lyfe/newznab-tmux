@@ -60,7 +60,13 @@ fn reports_parse_and_store_as_php_did() {
             ),
         }
 
-        let inserts = rows::extra(&container);
+        let extra_result = rows::extra(&container);
+        assert_eq!(
+            extra_result.failed,
+            !case["extra_error"].is_null(),
+            "{name}: extra error"
+        );
+        let inserts = &extra_result.inserts;
         let videos: Vec<_> = inserts
             .iter()
             .filter_map(|insert| match insert {

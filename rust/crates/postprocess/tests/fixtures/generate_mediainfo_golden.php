@@ -13,6 +13,15 @@ declare(strict_types=1);
 $ref = $argv[1];
 require $ref.'/vendor/autoload.php';
 
+// Laravel's handler turns warnings (an undefined array key or string offset) into exceptions,
+// and only logs deprecations (utf8_encode is one).
+set_error_handler(static function (int $level, string $message, string $file, int $line): bool {
+    if ($level === E_DEPRECATED || $level === E_USER_DEPRECATED) {
+        return true;
+    }
+    throw new ErrorException($message, 0, $level, $file, $line);
+});
+
 use Mhor\MediaInfo\Container\MediaInfoContainer;
 use Mhor\MediaInfo\Parser\MediaInfoOutputParser;
 
@@ -47,7 +56,8 @@ function addData(MediaInfoContainer $xmlArray): ?array
     ];
 }
 
-function addFromXml(MediaInfoContainer $arrXml): array
+/** Records into $rows as it goes, so the rows before a failure are kept. */
+function addFromXml(MediaInfoContainer $arrXml, ?array &$rows): void
 {
     $rows = ['video' => [], 'audio' => [], 'subs' => []];
     $containerFormat = '';
@@ -192,8 +202,6 @@ function addFromXml(MediaInfoContainer $arrXml): array
             }
         }
     }
-
-    return $rows;
 }
 
 $cases = [];
@@ -215,9 +223,12 @@ foreach (glob(__DIR__.'/mediainfo/*.xml') as $path) {
         $case['media_info'] = ['error' => get_class($e)];
     }
     try {
-        $case['extra'] = addFromXml($container);
+        $partial = null;
+        addFromXml($container, $partial);
+        $case['extra'] = $partial;
     } catch (Throwable $e) {
         $case['extra_error'] = get_class($e);
+        $case['extra'] = $partial ?? null;
     }
     $cases[] = $case;
 }

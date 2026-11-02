@@ -37,16 +37,27 @@ impl Value {
         }
     }
 
-    /// PHP's `.` with this as the left side.
-    fn concat(&self, right: &str) -> Self {
+    /// PHP's `.` with this as the left side; an array warned.
+    fn concat(&self, right: &str) -> Result<Self, Warning> {
         let left = match self {
             Self::Str(text) => text.clone(),
             Self::Int(value) => value.to_string(),
             Self::Null => String::new(),
-            Self::Array => "Array".to_owned(),
+            Self::Array => return Err(Warning),
         };
-        Self::Str(left + right)
+        Ok(Self::Str(left + right))
     }
+}
+
+/// A PHP warning, which Laravel's error handler threw, ending the pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Warning;
+
+/// The inserts `addFromXml` reached, and whether a warning ended it before the rest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Extra {
+    pub inserts: Vec<Insert>,
+    pub failed: bool,
 }
 
 /// `media_infos`.
@@ -185,12 +196,12 @@ fn raw(track: &Track, name: &str) -> Option<Node> {
 }
 
 /// `is_array($x) ? implode($x) : $x`.
-fn imploded(value: &RawOrText) -> Value {
-    match value {
+fn imploded(value: &RawOrText) -> Result<Value, Warning> {
+    Ok(match value {
         RawOrText::Text(text) | RawOrText::Node(Node::Str(text)) => Value::Str(text.clone()),
         RawOrText::Int(value) => Value::Int(*value),
-        RawOrText::Node(array @ Node::Arr(_)) => Value::Str(array.implode("")),
-    }
+        RawOrText::Node(array @ Node::Arr(_)) => Value::Str(array.implode("").ok_or(Warning)?),
+    })
 }
 
 /// A loop variable of `addFromXml`: a string it set, a number, or an attribute's raw value.
@@ -203,11 +214,15 @@ enum RawOrText {
 
 /// `ReleaseExtraService::addFromXml`. Its loop variables carry over from one track to the next,
 /// as PHP's did.
-pub fn extra(container: &Container) -> Vec<Insert> {
-    let mut inserts = Vec::new();
-    let Some(general) = &container.general else {
-        return inserts;
-    };
+pub fn extra(container: &Container) -> Extra {
+    let mut extra = Extra::default();
+    if let Some(general) = &container.general {
+        extra.failed = fill(container, general, &mut extra.inserts).is_err();
+    }
+    extra
+}
+
+fn fill(container: &Container, general: &Track, inserts: &mut Vec<Insert>) -> Result<(), Warning> {
     let container_format = full_name(general, "format").unwrap_or_default();
     let mut overall_bit_rate = Value::empty();
     let mut duration: Option<i64> = None;
@@ -248,7 +263,7 @@ pub fn extra(container: &Container) -> Vec<Insert> {
             library = Value::of_node(Some(node));
         }
         if let Some(node) = raw(video, "encoded_library_version") {
-            library = library.concat(&node.concat_text());
+            library = library.concat(&node.concat_text().ok_or(Warning)?)?;
         }
         if let Some(name) = full_name(video, "writing_library") {
             library = Value::Str(name);
@@ -315,20 +330,20 @@ pub fn extra(container: &Container) -> Vec<Insert> {
             title = RawOrText::Node(node);
         }
         let language_value = match &language {
-            Some(node) if !node.is_empty() => Value::of_node(node.index(1)),
+            Some(node) if !node.is_empty() => Value::of_node(Some(node.index(1).ok_or(Warning)?)),
             _ => Value::empty(),
         };
         inserts.push(Insert::Audio(AudioRow {
-            audioid: imploded(&audio_id),
-            audioformat: imploded(&audio_format),
-            audiomode: imploded(&audio_mode),
-            audiobitratemode: imploded(&bit_rate_mode),
-            audiobitrate: imploded(&audio_bit_rate),
-            audiochannels: imploded(&channels),
-            audiosamplerate: imploded(&sample_rate),
-            audiolibrary: imploded(&audio_library),
+            audioid: imploded(&audio_id)?,
+            audioformat: imploded(&audio_format)?,
+            audiomode: imploded(&audio_mode)?,
+            audiobitratemode: imploded(&bit_rate_mode)?,
+            audiobitrate: imploded(&audio_bit_rate)?,
+            audiochannels: imploded(&channels)?,
+            audiosamplerate: imploded(&sample_rate)?,
+            audiolibrary: imploded(&audio_library)?,
             audiolanguage: language_value,
-            audiotitle: imploded(&title),
+            audiotitle: imploded(&title)?,
         }));
     }
 
@@ -355,7 +370,7 @@ pub fn extra(container: &Container) -> Vec<Insert> {
             subslanguage: chosen,
         }));
     }
-    inserts
+    Ok(())
 }
 
 #[cfg(test)]

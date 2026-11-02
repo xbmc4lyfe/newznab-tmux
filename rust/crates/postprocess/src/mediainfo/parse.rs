@@ -5,7 +5,8 @@
 //! The library's quirks are kept, because they decide what reaches the database: an attribute
 //! that appears once is a string, and a checker indexes it, so a lone `<Width>1920</Width>` is
 //! `Rate("1", "9")`. A blank element is an empty array. A checker given the wrong shape threw a
-//! `TypeError`, which failed the whole parse; that is [`ParseError`] here.
+//! `TypeError`, or warned, which Laravel's error handler turned into an exception; either failed
+//! the whole parse, and that is [`ParseError`] here.
 
 use std::collections::HashMap;
 
@@ -68,23 +69,25 @@ impl Node {
         }
     }
 
-    /// The string a concatenation makes of it: an array is `"Array"`.
-    pub fn concat_text(&self) -> String {
+    /// The string a concatenation makes of it. An array converts with an "Array to string"
+    /// warning, which Laravel's handler threw, so that is `None`.
+    pub fn concat_text(&self) -> Option<String> {
         match self {
-            Self::Str(text) => text.clone(),
-            Self::Arr(_) => "Array".to_owned(),
+            Self::Str(text) => Some(text.clone()),
+            Self::Arr(_) => None,
         }
     }
 
-    /// `implode($glue, $array)` for an array, the string itself otherwise.
-    pub fn implode(&self, glue: &str) -> String {
+    /// `implode($glue, $array)` for an array, the string itself otherwise. `None` where an entry
+    /// is itself an array, which warned.
+    pub fn implode(&self, glue: &str) -> Option<String> {
         match self {
-            Self::Str(text) => text.clone(),
+            Self::Str(text) => Some(text.clone()),
             Self::Arr(entries) => entries
                 .iter()
                 .map(|(_, value)| value.concat_text())
-                .collect::<Vec<_>>()
-                .join(glue),
+                .collect::<Option<Vec<_>>>()
+                .map(|parts| parts.join(glue)),
         }
     }
 }
@@ -507,6 +510,14 @@ fn string_parameter(value: Option<Node>) -> Result<String, ParseError> {
     }
 }
 
+/// `$value[$key]` as a checker reads it: a missing key or offset warned, and Laravel's handler
+/// threw.
+fn indexed(value: &Node, key: usize) -> Result<Node, ParseError> {
+    value
+        .index(key)
+        .ok_or(ParseError("an undefined array key or string offset warned"))
+}
+
 /// `ModeChecker::create`.
 fn mode(value: &Node) -> Result<Attribute, ParseError> {
     let list = match value {
@@ -516,7 +527,9 @@ fn mode(value: &Node) -> Result<Attribute, ParseError> {
     let first = list.index(0);
     let second = list.index(1).or_else(|| first.clone());
     let name = |part: Option<Node>| match part {
-        Some(array @ Node::Arr(_)) => Ok(array.implode(" ")),
+        Some(array @ Node::Arr(_)) => array
+            .implode(" ")
+            .ok_or(ParseError("an array to string conversion warned")),
         other => string_parameter(other),
     };
     Ok(Attribute::Mode {
@@ -531,25 +544,25 @@ fn attribute(name: &str, value: &Node) -> Result<Attribute, ParseError> {
         return string_parameter(Some(value.clone())).map(Attribute::Cover);
     }
     if DURATION.contains(&name) {
-        return Ok(Attribute::Duration(php_int(value.index(0).as_ref())));
+        return Ok(Attribute::Duration(php_int(Some(&indexed(value, 0)?))));
     }
     if MODE.contains(&name) {
         return mode(value);
     }
     if RATE.contains(&name) || name == "frame_rate" {
         return Ok(Attribute::Rate {
-            absolute: php_float(value.index(0).as_ref()),
-            text: string_parameter(value.index(1))?,
+            absolute: php_float(Some(&indexed(value, 0)?)),
+            text: string_parameter(Some(indexed(value, 1)?))?,
         });
     }
     if RATIO.contains(&name) {
         return Ok(Attribute::Ratio {
-            absolute: php_float(value.index(0).as_ref()),
-            text: string_parameter(value.index(1))?,
+            absolute: php_float(Some(&indexed(value, 0)?)),
+            text: string_parameter(Some(indexed(value, 1)?))?,
         });
     }
     if SIZE.contains(&name) {
-        return Ok(Attribute::Size(php_int(value.index(0).as_ref())));
+        return Ok(Attribute::Size(php_int(Some(&indexed(value, 0)?))));
     }
     if DATE_TIME.contains(&name) {
         // `new DateTime($value)`; mediainfo's dates parse, and only the shape matters here.

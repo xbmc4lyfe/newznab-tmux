@@ -198,7 +198,11 @@ pub async fn store(
     if let Some(row) = rows::media_info_row(&container) {
         add_media_info(pool, release_id, &row).await?;
     }
-    add_extra(pool, release_id, &rows::extra(&container)).await?;
+    let extra = rows::extra(&container);
+    add_extra(pool, release_id, &extra.inserts).await?;
+    if extra.failed {
+        bail!("a warning ended the media pass");
+    }
     search.update_release(release_id).await;
     Ok(())
 }

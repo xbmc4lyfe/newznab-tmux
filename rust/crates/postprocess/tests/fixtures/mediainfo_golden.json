@@ -270,14 +270,14 @@
     },
     {
         "name": "truncated.xml",
-        "parse_error": "TypeError",
+        "parse_error": "ErrorException",
         "media_info": null,
         "extra": null,
         "extra_error": null
     },
     {
         "name": "typeerrors.xml",
-        "parse_error": "TypeError",
+        "parse_error": "ErrorException",
         "media_info": null,
         "extra": null,
         "extra_error": null
@@ -327,52 +327,9 @@
     },
     {
         "name": "whitespace.xml",
-        "parse_error": null,
-        "media_info": {
-            "row": {
-                "movie_name": {
-                    "unbindable": true
-                },
-                "file_name": "Tom & Jerry  S01",
-                "unique_id": "42"
-            }
-        },
-        "extra": {
-            "video": [
-                {
-                    "containerformat": "Matroska",
-                    "overallbitrate": "",
-                    "videoduration": "00h:00m:00s",
-                    "videoformat": "AB",
-                    "videocodec": "",
-                    "videowidth": "",
-                    "videoheight": "",
-                    "videoaspect": "",
-                    "videoframerate": "",
-                    "videolibrary": ""
-                }
-            ],
-            "audio": [
-                {
-                    "audioid": "7 (0x7)",
-                    "audioformat": "DTS XLL",
-                    "audiomode": "",
-                    "audiobitratemode": "",
-                    "audiobitrate": "",
-                    "audiochannels": 2,
-                    "audiosamplerate": "",
-                    "audiolibrary": "lib",
-                    "audiolanguage": "German",
-                    "audiotitle": ""
-                }
-            ],
-            "subs": [
-                {
-                    "subsid": "9",
-                    "subslanguage": "German"
-                }
-            ]
-        },
+        "parse_error": "ErrorException",
+        "media_info": null,
+        "extra": null,
         "extra_error": null
     }
 ]
