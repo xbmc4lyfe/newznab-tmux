@@ -135,14 +135,14 @@ pub async fn multiprocess(
     let outcome = match kind {
         Kind::Additional => additional(ctx, stop).await,
         Kind::Nfo => nfo(ctx, stop).await,
-        Kind::Movies => nntmux_metadata::process_movie_buckets(ctx, renamed_only).await,
+        Kind::Movies => nntmux_metadata::process_movie_buckets(ctx, renamed_only, stop).await,
         Kind::Tv => {
             let renamed = if renamed_only {
                 Renamed::Only
             } else {
                 Renamed::Configured
             };
-            nntmux_metadata::process_tv(ctx, 0, "", renamed).await
+            nntmux_metadata::process_tv_buckets(ctx, renamed, stop).await
         }
         Kind::Anime | Kind::Books | Kind::Music | Kind::Console | Kind::Games | Kind::Amazon => {
             unbucketed(ctx, kind).await

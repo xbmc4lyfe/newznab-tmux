@@ -7,6 +7,7 @@ use nntmux_metadata::LookupMode;
 use nntmux_metadata::MetadataSettings;
 use nntmux_metadata::movies::commands::{MovieReverifyOptions, reverify_matches};
 use nntmux_metadata::movies::{MovieLookup, parse_movie_name};
+use nntmux_runtime::Shutdown;
 use serde_json::{Value, json};
 use sqlx::{MySqlPool, Row};
 use wiremock::matchers::{method, path, query_param};
@@ -366,6 +367,7 @@ async fn every_movie_bucket_is_dispatched() {
         h.services.clone(),
         &MetadataSettings::default(),
         true,
+        &Shutdown::default(),
     )
     .await
     .unwrap();
@@ -375,6 +377,7 @@ async fn every_movie_bucket_is_dispatched() {
         h.services.clone(),
         &MetadataSettings::default(),
         false,
+        &Shutdown::default(),
     )
     .await
     .unwrap();
@@ -407,14 +410,41 @@ async fn bucket_workers_keep_the_configured_renamed_only_mode() {
         ..MetadataSettings::default()
     };
 
-    nntmux_metadata::movies::dispatch_buckets(h.services.clone(), &settings, false)
-        .await
-        .unwrap();
+    nntmux_metadata::movies::dispatch_buckets(
+        h.services.clone(),
+        &settings,
+        false,
+        &Shutdown::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(release_imdb(&h.db.pool, plain).await.0, None);
     assert_eq!(
         release_imdb(&h.db.pool, renamed).await.0.as_deref(),
         Some("")
     );
+    h.db.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_movie_bucket_starts_after_a_stop() {
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
+    let waiting = insert_release_in(&h.db.pool, "Nothing.Known.2011.BluRay", GUID, 2040).await;
+    let stop = Shutdown::default();
+    stop.request();
+
+    nntmux_metadata::movies::dispatch_buckets(
+        h.services.clone(),
+        &MetadataSettings::default(),
+        false,
+        &stop,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(release_imdb(&h.db.pool, waiting).await.0, None);
     h.db.drop_database().await.unwrap();
 }

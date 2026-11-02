@@ -114,10 +114,27 @@ pub async fn process_movies(
 }
 
 /// `multiprocessing:postprocess mov`: every movie bucket, in parallel.
-pub async fn process_movie_buckets(ctx: &Ctx, renamed_only: bool) -> Result<()> {
+/// Once `stop` is requested no further bucket starts.
+pub async fn process_movie_buckets(
+    ctx: &Ctx,
+    renamed_only: bool,
+    stop: &nntmux_runtime::Shutdown,
+) -> Result<()> {
     let services = services::Services::shared(ctx)?;
     let settings = MetadataSettings::load(&services.db).await?;
-    movies::dispatch_buckets(services, &settings, renamed_only).await
+    movies::dispatch_buckets(services, &settings, renamed_only, stop).await
+}
+
+/// `multiprocessing:postprocess tv`: every TV bucket, in parallel. Once `stop` is requested no
+/// further bucket starts.
+pub async fn process_tv_buckets(
+    ctx: &Ctx,
+    renamed: Renamed,
+    stop: &nntmux_runtime::Shutdown,
+) -> Result<()> {
+    let services = services::Services::shared(ctx)?;
+    let settings = MetadataSettings::load(&services.db).await?;
+    tv::dispatch_buckets(services, &settings, renamed, stop).await
 }
 
 /// PHP's `processTv`: with no bucket it dispatches over the buckets, otherwise it runs
@@ -126,9 +143,7 @@ pub async fn process_tv(ctx: &Ctx, group_id: i64, guid_char: &str, renamed: Rena
     if !guid_char.is_empty() {
         return process_tv_pipeline(ctx, group_id, guid_char, renamed).await;
     }
-    let services = services::Services::shared(ctx)?;
-    let settings = MetadataSettings::load(&services.db).await?;
-    tv::dispatch_buckets(services, &settings, renamed).await
+    process_tv_buckets(ctx, renamed, &nntmux_runtime::Shutdown::default()).await
 }
 
 pub async fn process_tv_pipeline(

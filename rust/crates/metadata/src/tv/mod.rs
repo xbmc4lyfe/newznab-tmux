@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
-use nntmux_runtime::Ctx;
+use nntmux_runtime::{Ctx, Shutdown};
 use sqlx::{MySql, MySqlPool, Row, Transaction};
 use tracing::{error, info};
 
@@ -737,10 +737,12 @@ pub fn check_guid_char(guid_char: &str) -> Result<()> {
 }
 
 /// `PostProcessRunner::processTv`: every GUID bucket with work, in parallel.
+/// Once `stop` is requested no further bucket starts; running buckets finish.
 pub async fn dispatch_buckets(
     services: Arc<Services>,
     settings: &MetadataSettings,
     renamed: Renamed,
+    stop: &Shutdown,
 ) -> Result<()> {
     if !settings.tv_lookup.enabled() {
         return Ok(());
@@ -772,6 +774,7 @@ pub async fn dispatch_buckets(
     };
     let pipeline = Arc::new(Pipeline::new(services));
     let results: Vec<Result<Stats>> = stream::iter(buckets)
+        .take_while(|_| std::future::ready(!stop.requested()))
         .map(|bucket| {
             let pipeline = pipeline.clone();
             let settings = settings.clone();

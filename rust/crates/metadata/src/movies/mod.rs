@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use md5::{Digest, Md5};
 use nntmux_core::pcre::Pcre;
 use nntmux_predb::selector::similar_text_percent;
-use nntmux_runtime::Ctx;
+use nntmux_runtime::{Ctx, Shutdown};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{MySql, QueryBuilder, Row};
@@ -1242,10 +1242,12 @@ impl MovieLookup {
 /// `PostProcessRunner::processMovies`: every GUID bucket with movies to look up, up to
 /// `post_threads_non` at a time. `renamed_only` narrows the work to renamed releases on top of
 /// the configured mode, as the runner's flag did.
+/// Once `stop` is requested no further bucket starts; running buckets finish.
 pub async fn dispatch_buckets(
     services: Arc<Services>,
     settings: &MetadataSettings,
     renamed_only: bool,
+    stop: &Shutdown,
 ) -> Result<()> {
     if !settings.movie_lookup.enabled() {
         return Ok(());
@@ -1286,6 +1288,7 @@ pub async fn dispatch_buckets(
         .into_iter()
         .filter(|bucket| check_guid_char(bucket).is_ok());
     let results: Vec<Result<()>> = futures_util::stream::iter(buckets)
+        .take_while(|_| std::future::ready(!stop.requested()))
         .map(|bucket| {
             let services = services.clone();
             let settings = settings.clone();
