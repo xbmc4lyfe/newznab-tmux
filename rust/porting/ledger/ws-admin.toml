@@ -587,7 +587,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/settings/{domain}"
 source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -617,7 +617,8 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/site-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@legacySite"
-status = "todo"
+status = "dropped"
+note = "Redirected an old admin URL to the settings page. `nntmux-ctl admin settings show site` and `show tmux` cover it."
 
 [[entry]]
 kind = "route"
@@ -647,7 +648,8 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/tmux-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@legacyTmux"
-status = "todo"
+status = "dropped"
+note = "Redirected an old admin URL to the settings page. `nntmux-ctl admin settings show site` and `show tmux` cover it."
 
 [[entry]]
 kind = "route"
@@ -1087,7 +1089,8 @@ status = "todo"
 kind = "route"
 id = "PUT /admin/settings/{domain}"
 source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@update"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin settings set|cleanup-rules|color-exclusions`. The site logo was an image upload for the web pages and is left out."
 
 [[entry]]
 kind = "route"
