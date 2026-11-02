@@ -149,6 +149,22 @@ pub async fn erase(ctx: &Ctx, id: u32, permanent: bool, now: NaiveDateTime) -> R
         .await?
         .with_context(|| format!("user {id} doesn't exist"))?;
     let schema = Schema::load(&mut tx).await?;
+    // The PHP matched invitations, payments and activity rows on the address and name too.
+    // Another account (a new live one, since a deleted account's identifiers are free) may hold
+    // either; then that identifier no longer points at this account and isn't used.
+    let (email_shared, username_shared): (i64, i64) = sqlx::query_as(
+        "SELECT CAST(COALESCE(MAX(email = ?), 0) AS SIGNED), \
+         CAST(COALESCE(MAX(username = ?), 0) AS SIGNED) FROM users \
+         WHERE id <> ? AND (email = ? OR username = ?)",
+    )
+    .bind(&email)
+    .bind(&username)
+    .bind(id)
+    .bind(&email)
+    .bind(&username)
+    .fetch_one(&mut *tx)
+    .await?;
+    let (email_shared, username_shared) = (email_shared != 0, username_shared != 0);
     let anonymous_username = format!("deleted_user_{id}");
     let anonymous_email = format!("deleted-user-{id}@deleted.invalid");
 
@@ -211,7 +227,7 @@ pub async fn erase(ctx: &Ctx, id: u32, permanent: bool, now: NaiveDateTime) -> R
     }
 
     // `minimizeInvitations`.
-    if schema.has("invitations", "email") {
+    if schema.has("invitations", "email") && !email_shared {
         sqlx::query("UPDATE invitations SET email = ? WHERE email = ?")
             .bind(&anonymous_email)
             .bind(&email)
@@ -236,15 +252,20 @@ pub async fn erase(ctx: &Ctx, id: u32, permanent: bool, now: NaiveDateTime) -> R
         schema.has("payments", "email"),
         schema.has("payments", "username"),
     );
-    if pay_email || pay_username {
+    let (by_email, by_username) = (pay_email && !email_shared, pay_username && !username_shared);
+    if by_email || by_username {
         let mut sets = Vec::new();
         let mut wheres = Vec::new();
         if pay_email {
             sets.push("email = ?");
-            wheres.push("email = ?");
         }
         if pay_username {
             sets.push("username = ?");
+        }
+        if by_email {
+            wheres.push("email = ?");
+        }
+        if by_username {
             wheres.push("username = ?");
         }
         let sql = format!(
@@ -259,10 +280,10 @@ pub async fn erase(ctx: &Ctx, id: u32, permanent: bool, now: NaiveDateTime) -> R
         if pay_username {
             query = query.bind(&anonymous_username);
         }
-        if pay_email {
+        if by_email {
             query = query.bind(&email);
         }
-        if pay_username {
+        if by_username {
             query = query.bind(&username);
         }
         query.execute(&mut *tx).await?;
@@ -272,9 +293,10 @@ pub async fn erase(ctx: &Ctx, id: u32, permanent: bool, now: NaiveDateTime) -> R
     if schema.has("user_activities", "username") {
         let rows: Vec<(u64, Option<String>)> = sqlx::query_as(
             "SELECT id, CAST(metadata AS CHAR) FROM user_activities \
-             WHERE user_id = ? OR username = ? ORDER BY id",
+             WHERE user_id = ? OR (? = 0 AND username = ?) ORDER BY id",
         )
         .bind(id)
+        .bind(username_shared)
         .bind(&username)
         .fetch_all(&mut *tx)
         .await?;

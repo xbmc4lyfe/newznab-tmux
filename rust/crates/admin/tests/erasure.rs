@@ -274,5 +274,43 @@ async fn erasure_anonymizes_retained_records_and_deletes_the_rest() -> Result<()
     );
     assert!(erasure::erase(&ctx, gone, true, now).await.is_err());
 
+    // A live account that took a deleted account's address and name keeps its own records.
+    let old = user(&db, "kate").await?;
+    seed(&db, old, "kate").await?;
+    let account = users::require(&db.pool, "kate").await?;
+    assert!(users::delete(&ctx, &account, now).await?);
+    let new = user(&db, "kate").await?;
+    seed(&db, new, "kate").await?;
+    erasure::erase(&ctx, old, true, now).await?;
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM payments WHERE email = 'kate@example.com' AND username = 'kate' \
+             AND ? > 0",
+            new
+        )
+        .await?,
+        2
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM invitations WHERE email = 'kate@example.com' AND used_by = ?",
+            new
+        )
+        .await?,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT COUNT(*) FROM user_activities WHERE user_id = ? AND (username <> 'kate' \
+             OR JSON_EXISTS(metadata, '$.gdpr_minimized'))",
+            new
+        )
+        .await?,
+        0
+    );
+
     db.drop_database().await
 }
