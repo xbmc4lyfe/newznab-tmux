@@ -383,3 +383,38 @@ async fn every_movie_bucket_is_dispatched() {
     }
     h.db.drop_database().await.unwrap();
 }
+
+#[tokio::test]
+async fn bucket_workers_keep_the_configured_renamed_only_mode() {
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
+    let plain = insert_release_in(&h.db.pool, "Nothing.Known.2011.BluRay", GUID, 2040).await;
+    let renamed = insert_release_in(
+        &h.db.pool,
+        "Also.Unknown.2012.BluRay",
+        "a0000000000000000000000000000002",
+        2040,
+    )
+    .await;
+    sqlx::query("UPDATE releases SET isrenamed = 1 WHERE id = ?")
+        .bind(renamed)
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+    let settings = MetadataSettings {
+        movie_lookup: LookupMode::RenamedOnly,
+        ..MetadataSettings::default()
+    };
+
+    nntmux_metadata::movies::dispatch_buckets(h.services.clone(), &settings, false)
+        .await
+        .unwrap();
+
+    assert_eq!(release_imdb(&h.db.pool, plain).await.0, None);
+    assert_eq!(
+        release_imdb(&h.db.pool, renamed).await.0.as_deref(),
+        Some("")
+    );
+    h.db.drop_database().await.unwrap();
+}

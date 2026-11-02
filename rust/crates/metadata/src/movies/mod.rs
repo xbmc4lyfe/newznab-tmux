@@ -1275,12 +1275,16 @@ pub async fn dispatch_buckets(
     .fetch_optional(&services.db)
     .await?;
     let threads = usize::try_from(threads.unwrap_or(1).max(1))?;
-    // The runner passed 2 (renamed only) or 1 (every release) to each bucket worker.
+    // PHP's bucket workers got no renamed argument, so they used the configured mode;
+    // `renamed_only` narrows that further.
     let mode = if renamed_only {
         LookupMode::RenamedOnly
     } else {
-        LookupMode::All
+        settings.movie_lookup
     };
+    let buckets = buckets
+        .into_iter()
+        .filter(|bucket| check_guid_char(bucket).is_ok());
     let results: Vec<Result<()>> = futures_util::stream::iter(buckets)
         .map(|bucket| {
             let services = services.clone();
