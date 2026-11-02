@@ -226,7 +226,8 @@ note = "The fixnames role runs levels 7 and 8. ws-naming's PAR2 PR is still to l
 kind = "schedule"
 id = "command: 'admin:warm-dashboard')->everyFifteenMinutes()->withoutOverlapping();"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "Only rebuilt the cached snapshot the admin dashboard page read. Phase 1 has no web UI and nothing else reads it; ws-admin drops the command too."
 
 [[entry]]
 kind = "schedule"
