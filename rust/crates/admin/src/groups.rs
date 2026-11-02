@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail};
 use chrono::NaiveDateTime;
 use nntmux_ingest::groups::ServerGroup;
+use nntmux_runtime::{Ctx, Shutdown};
 use nntmux_verify::context::Verify;
 use sqlx::{FromRow, MySqlPool, QueryBuilder};
 use tracing::warn;
@@ -289,12 +290,60 @@ const RESET_STATS: &str = "backfill_target = 1, first_record = 0, first_record_p
 /// binaries, parts and group links go with them by foreign key), then starts its counters over
 /// and turns it off. Verification is held out meanwhile, and the group's unpublished candidates
 /// are expired, so work already queued can't publish into the group afterwards.
-pub async fn reset(verify: &Verify, id: u32) -> Result<()> {
-    nntmux_verify::reset::fenced(verify, || async {
-        nntmux_verify::candidates::expire_group(verify, id).await?;
-        reset_rows(&verify.db, id).await
+pub async fn reset(lock: &Exclusive<'_>, id: u32) -> Result<()> {
+    let verify = lock.verify;
+    lock.run(|| async {
+        nntmux_verify::reset::fenced(verify, || async {
+            nntmux_verify::candidates::expire_group(verify, id).await?;
+            reset_rows(&verify.db, id).await
+        })
+        .await
     })
     .await
+}
+
+/// What a destructive group change holds out while it runs: processing, through the same drain
+/// deploys use, so no ingestion job writes headers for the group with a group it read earlier, and
+/// verification, through its reset fence.
+pub struct Exclusive<'a> {
+    pub ctx: &'a Ctx,
+    pub verify: &'a Verify,
+    /// How long to wait for active processing to finish, in seconds.
+    pub drain_timeout: u64,
+}
+
+impl Exclusive<'_> {
+    /// Drains processing under a token of its own, runs `work`, then resumes. Resuming by that
+    /// token leaves an operator's earlier pause in place.
+    async fn run<F, Fut, T>(&self, work: F) -> Result<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let token = format!(
+            "admin-group-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        nntmux_ops::runtime_state::drain(
+            self.ctx,
+            self.drain_timeout,
+            Some(&token),
+            &Shutdown::default(),
+        )
+        .await
+        .context("draining processing before the group change")?;
+        let outcome = work().await;
+        let resumed = nntmux_ops::runtime_state::resume(self.ctx, Some(&token)).await;
+        let value = outcome?;
+        resumed.with_context(|| {
+            format!(
+                "the group change finished, but processing couldn't be resumed; run \
+                 `nntmux-ctl ops drain --resume --token {token}` once it's checked"
+            )
+        })?;
+        Ok(value)
+    }
 }
 
 async fn reset_rows(db: &MySqlPool, id: u32) -> Result<()> {
@@ -321,8 +370,10 @@ async fn reset_rows(db: &MySqlPool, id: u32) -> Result<()> {
 /// resets every group. `collection_groups` is emptied with them, which Laravel left orphaned. It
 /// runs as a verification reset, like `nntmux:reset-truncate`, which clears all queued
 /// verification work.
-pub async fn reset_all(verify: &Verify) -> Result<u64> {
-    nntmux_verify::reset::run(verify, || reset_all_rows(&verify.db)).await
+pub async fn reset_all(lock: &Exclusive<'_>) -> Result<u64> {
+    let verify = lock.verify;
+    lock.run(|| nntmux_verify::reset::run(verify, || reset_all_rows(&verify.db)))
+        .await
 }
 
 async fn reset_all_rows(db: &MySqlPool) -> Result<u64> {
@@ -362,7 +413,12 @@ async fn reset_all_rows(db: &MySqlPool) -> Result<u64> {
 /// `UsenetGroup::purge`: resets one group, or all of them, then deletes its releases with their
 /// NZBs, files and search documents. A release that fails is reported and skipped. Verification
 /// stays held out until the releases are gone.
-pub async fn purge(verify: &Verify, id: Option<u32>) -> Result<(u64, u64)> {
+pub async fn purge(lock: &Exclusive<'_>, id: Option<u32>) -> Result<(u64, u64)> {
+    let verify = lock.verify;
+    lock.run(|| purge_fenced(verify, id)).await
+}
+
+async fn purge_fenced(verify: &Verify, id: Option<u32>) -> Result<(u64, u64)> {
     match id {
         Some(id) => {
             nntmux_verify::reset::fenced(verify, || async {
@@ -419,7 +475,12 @@ async fn delete_releases(db: &MySqlPool, id: Option<u32>) -> Result<(u64, u64)> 
 /// `UsenetGroup::deleteGroup`: purges the group, then removes it, all behind the verification
 /// fence. A group whose releases couldn't all be deleted is kept, so none is left pointing at a
 /// missing group.
-pub async fn delete(verify: &Verify, id: u32) -> Result<(u64, bool)> {
+pub async fn delete(lock: &Exclusive<'_>, id: u32) -> Result<(u64, bool)> {
+    let verify = lock.verify;
+    lock.run(|| delete_fenced(verify, id)).await
+}
+
+async fn delete_fenced(verify: &Verify, id: u32) -> Result<(u64, bool)> {
     let db = &verify.db;
     nntmux_verify::reset::fenced(verify, || async {
         nntmux_verify::candidates::expire_group(verify, id).await?;

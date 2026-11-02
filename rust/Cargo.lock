@@ -2316,6 +2316,7 @@ dependencies = [
  "nntmux-ingest",
  "nntmux-mail",
  "nntmux-nntp",
+ "nntmux-ops",
  "nntmux-runtime",
  "nntmux-testkit",
  "nntmux-verify",

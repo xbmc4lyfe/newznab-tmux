@@ -3,7 +3,9 @@ use chrono::NaiveDateTime;
 use nntmux_admin::groups::{
     self, Changes, Filter, Flag, NewGroup, format_size, parse_size, valid_name,
 };
+use nntmux_core::Config;
 use nntmux_ingest::groups::ServerGroup;
+use nntmux_runtime::Ctx;
 use nntmux_testkit::TestDb;
 use nntmux_verify::cache::Cache;
 use nntmux_verify::config::VerificationConfig;
@@ -131,6 +133,35 @@ async fn verification(db: &TestDb) -> Result<Option<Verify>> {
         Cache::new(redis, prefix.clone()),
         VerificationConfig::for_tests(std::env::temp_dir().join(prefix)),
     )))
+}
+
+/// A context on the test database, so the processing drain's keys and lock are this test's own.
+async fn context(db: &TestDb) -> Result<Ctx> {
+    let url = std::env::var("TEST_REDIS_URL")?;
+    let mut config = Config::from_env()?;
+    config.redis_url = url.clone();
+    config.database.database = db.name.clone();
+    Ok(Ctx {
+        config: std::sync::Arc::new(config),
+        db: db.pool.clone(),
+        redis: redis::aio::ConnectionManager::new(redis::Client::open(url)?).await?,
+    })
+}
+
+fn exclusive<'a>(ctx: &'a Ctx, verify: &'a Verify) -> groups::Exclusive<'a> {
+    groups::Exclusive {
+        ctx,
+        verify,
+        drain_timeout: 5,
+    }
+}
+
+async fn processing_flags(db: &TestDb) -> Result<Option<(bool, bool)>> {
+    Ok(sqlx::query_as(
+        "SELECT tmux_running, stop_requested FROM processing_runtime_states WHERE id = 1",
+    )
+    .fetch_optional(&db.pool)
+    .await?)
 }
 
 /// A queued candidate of `group` with its manifest row, counted in the pending bytes.
@@ -403,8 +434,13 @@ async fn reset_purge_and_delete_clear_a_group() -> Result<()> {
     let Some(verify) = verification(&db).await? else {
         return Ok(());
     };
+    let ctx = context(&db).await?;
+    let lock = exclusive(&ctx, &verify);
+    // Processing is running; each change drains it and puts it back.
+    nntmux_ops::runtime_state::start(&ctx).await?;
 
-    groups::reset(&verify, one).await?;
+    groups::reset(&lock, one).await?;
+    assert_eq!(processing_flags(&db).await?, Some((true, false)));
     let reset = groups::require(&db.pool, &one.to_string()).await?;
     assert_eq!(
         (
@@ -428,7 +464,7 @@ async fn reset_purge_and_delete_clear_a_group() -> Result<()> {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM releases").await?, 3);
     assert!(groups::require(&db.pool, &two.to_string()).await?.active);
 
-    assert_eq!(groups::purge(&verify, Some(two)).await?, (1, 0));
+    assert_eq!(groups::purge(&lock, Some(two)).await?, (1, 0));
     assert_eq!(
         count(
             &db,
@@ -440,11 +476,11 @@ async fn reset_purge_and_delete_clear_a_group() -> Result<()> {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM releases").await?, 2);
     assert_eq!(count(&db, "SELECT COUNT(*) FROM collections").await?, 1);
 
-    assert_eq!(groups::delete(&verify, three).await?, (1, true));
+    assert_eq!(groups::delete(&lock, three).await?, (1, true));
     assert!(groups::find(&db.pool, &three.to_string()).await?.is_none());
 
     // Purging everything resets every group and deletes the remaining release.
-    assert_eq!(groups::purge(&verify, None).await?, (1, 0));
+    assert_eq!(groups::purge(&lock, None).await?, (1, 0));
     for table in [
         "collections",
         "binaries",
@@ -496,8 +532,13 @@ async fn a_group_reset_retires_its_queued_verification_work() -> Result<()> {
     // A published candidate belongs to its release, and another group's work is untouched.
     candidate(&db, one, "c", Some(77)).await?;
     let other = candidate(&db, two, "d", None).await?;
+    let ctx = context(&db).await?;
+    // An operator's pause from before stays in place afterwards.
+    nntmux_ops::runtime_state::drain(&ctx, 5, None, &nntmux_runtime::Shutdown::default()).await?;
+    assert_eq!(processing_flags(&db).await?, Some((false, true)));
 
-    groups::reset(&verify, one).await?;
+    groups::reset(&exclusive(&ctx, &verify), one).await?;
+    assert_eq!(processing_flags(&db).await?, Some((false, true)));
 
     let rows: Vec<(String, String, u32)> = sqlx::query_as(
         "SELECT identity, status, groups_id FROM release_verification_candidates \
@@ -521,6 +562,41 @@ async fn a_group_reset_retires_its_queued_verification_work() -> Result<()> {
     assert_eq!(pending, 20);
     // The fence is gone afterwards.
     assert!(!nntmux_verify::locks::paused(&db.pool, None).await?);
-    let _ = two;
+
+    // Work that won't finish blocks the change, which leaves the group as it was.
+    nntmux_ops::runtime_state::resume(&ctx, None).await?;
+    let mut redis = ctx.redis.clone();
+    let busy = format!("nntmux:busy:{}:update:test", db.name);
+    redis::cmd("SET")
+        .arg(&busy)
+        .arg(1)
+        .arg("EX")
+        .arg(60)
+        .query_async::<()>(&mut redis)
+        .await?;
+    let blocked = groups::delete(
+        &groups::Exclusive {
+            ctx: &ctx,
+            verify: &verify,
+            drain_timeout: 1,
+        },
+        two,
+    )
+    .await;
+    redis::cmd("DEL")
+        .arg(&busy)
+        .query_async::<()>(&mut redis)
+        .await?;
+    assert!(blocked.is_err());
+    assert!(groups::find(&db.pool, &two.to_string()).await?.is_some());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM release_verification_candidates WHERE groups_id = ?"
+        )
+        .bind(two)
+        .fetch_one(&db.pool)
+        .await?,
+        "pending"
+    );
     db.drop_database().await
 }

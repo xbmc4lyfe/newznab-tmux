@@ -143,6 +143,9 @@ pub enum GroupCommand {
         /// Confirm. Without it, only show what would change.
         #[arg(long)]
         yes: bool,
+        /// Seconds to wait for active processing to drain first.
+        #[arg(long, default_value_t = DRAIN_TIMEOUT)]
+        drain_timeout: u64,
     },
     /// Reset a group (or `--all`) and delete its releases.
     Purge {
@@ -152,6 +155,9 @@ pub enum GroupCommand {
         /// Confirm. Without it, only show what would change.
         #[arg(long)]
         yes: bool,
+        /// Seconds to wait for active processing to drain first.
+        #[arg(long, default_value_t = DRAIN_TIMEOUT)]
+        drain_timeout: u64,
     },
     /// Purge a group, then remove it.
     Delete {
@@ -159,8 +165,14 @@ pub enum GroupCommand {
         /// Confirm. Without it, only show what would change.
         #[arg(long)]
         yes: bool,
+        /// Seconds to wait for active processing to drain first.
+        #[arg(long, default_value_t = DRAIN_TIMEOUT)]
+        drain_timeout: u64,
     },
 }
+
+/// How long a destructive group change waits for processing to drain, as deploys do.
+const DRAIN_TIMEOUT: u64 = 900;
 
 /// A per-group minimum, or the site setting.
 #[derive(Clone, Copy, Debug)]
@@ -569,7 +581,12 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
         GroupCommand::Disable { group, backfill } => {
             set_group_flag(db, &group, backfill, false).await?;
         }
-        GroupCommand::Reset { group, all, yes } => {
+        GroupCommand::Reset {
+            group,
+            all,
+            yes,
+            drain_timeout,
+        } => {
             if all {
                 if !yes {
                     println!(
@@ -578,7 +595,9 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                     );
                     return Ok(());
                 }
-                let reset = groups::reset_all(&verify_context(ctx)?).await?;
+                let reset =
+                    groups::reset_all(&exclusive(ctx, &verify_context(ctx)?, drain_timeout))
+                        .await?;
                 println!("All groups reset successfully ({reset}).");
                 return Ok(());
             }
@@ -591,10 +610,19 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                 );
                 return Ok(());
             }
-            groups::reset(&verify_context(ctx)?, found.id).await?;
+            groups::reset(
+                &exclusive(ctx, &verify_context(ctx)?, drain_timeout),
+                found.id,
+            )
+            .await?;
             println!("Group {} reset successfully", found.id);
         }
-        GroupCommand::Purge { group, all, yes } => {
+        GroupCommand::Purge {
+            group,
+            all,
+            yes,
+            drain_timeout,
+        } => {
             let found = if all {
                 None
             } else {
@@ -612,8 +640,11 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                 }
                 return Ok(());
             }
-            let (deleted, failed) =
-                groups::purge(&verify_context(ctx)?, found.as_ref().map(|found| found.id)).await?;
+            let (deleted, failed) = groups::purge(
+                &exclusive(ctx, &verify_context(ctx)?, drain_timeout),
+                found.as_ref().map(|found| found.id),
+            )
+            .await?;
             println!("Deleted {deleted} release(s).");
             if failed > 0 {
                 anyhow::bail!("{failed} release(s) couldn't be deleted; see the log.");
@@ -623,7 +654,11 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                 None => println!("All groups purged successfully"),
             }
         }
-        GroupCommand::Delete { group, yes } => {
+        GroupCommand::Delete {
+            group,
+            yes,
+            drain_timeout,
+        } => {
             let found = groups::require(db, &group).await?;
             if !yes {
                 println!(
@@ -632,7 +667,11 @@ async fn group(ctx: &Ctx, command: GroupCommand, now: chrono::NaiveDateTime) -> 
                 );
                 return Ok(());
             }
-            let (deleted, _) = groups::delete(&verify_context(ctx)?, found.id).await?;
+            let (deleted, _) = groups::delete(
+                &exclusive(ctx, &verify_context(ctx)?, drain_timeout),
+                found.id,
+            )
+            .await?;
             println!(
                 "Deleted {deleted} release(s). Group {} deleted successfully",
                 found.id
@@ -673,4 +712,16 @@ fn verify_context(ctx: &Ctx) -> Result<nntmux_verify::context::Verify> {
         nntmux_verify::cache::Cache::new(ctx.redis.clone(), "nntmux:"),
         nntmux_verify::config::VerificationConfig::from_env()?,
     ))
+}
+
+fn exclusive<'a>(
+    ctx: &'a Ctx,
+    verify: &'a nntmux_verify::context::Verify,
+    drain_timeout: u64,
+) -> groups::Exclusive<'a> {
+    groups::Exclusive {
+        ctx,
+        verify,
+        drain_timeout,
+    }
 }

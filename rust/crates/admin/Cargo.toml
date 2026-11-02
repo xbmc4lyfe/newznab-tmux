@@ -17,6 +17,7 @@ nntmux-core.workspace = true
 nntmux-ingest.workspace = true
 nntmux-mail.workspace = true
 nntmux-nntp.workspace = true
+nntmux-ops.workspace = true
 nntmux-runtime.workspace = true
 nntmux-verify.workspace = true
 nntmux-webkit.workspace = true
