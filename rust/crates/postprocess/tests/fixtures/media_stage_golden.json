@@ -1,0 +1,1054 @@
+{
+    "registers": [
+        {
+            "volume": "part1",
+            "settings": "defaults",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 104857600
+            },
+            "entries": [
+                {
+                    "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+                    "real_size": 37202,
+                    "source_index": 4,
+                    "head": {
+                        "len": 37202,
+                        "sha256": "bfe3a8f0835ce9ee1e712961c1d8e42a15f51b4b9b18b65eea936d7f7742eab5"
+                    },
+                    "range_start": 153,
+                    "in_volume_end": 37354,
+                    "volume_bytes_downloaded": 99582,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": true,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                },
+                {
+                    "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+                    "real_size": 186010,
+                    "source_index": 4,
+                    "head": {
+                        "len": 62003,
+                        "sha256": "e2daf6976b723c0ebc7f241ee79561598ef538f1229860a5b94f8cfb4dfbebb8"
+                    },
+                    "range_start": 37572,
+                    "in_volume_end": 99574,
+                    "volume_bytes_downloaded": 99582,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part1",
+            "settings": "small",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 20000,
+                "mediaMainVideoMinBytes": 30000
+            },
+            "entries": [
+                {
+                    "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+                    "real_size": 37202,
+                    "source_index": 4,
+                    "head": {
+                        "len": 20000,
+                        "sha256": "446b01effef1ec300cbcc42f6dcfb00ddfc425f35d43381d207f84a54ad8ec26"
+                    },
+                    "range_start": 153,
+                    "in_volume_end": 37354,
+                    "volume_bytes_downloaded": 99582,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                },
+                {
+                    "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+                    "real_size": 186010,
+                    "source_index": 4,
+                    "head": {
+                        "len": 20000,
+                        "sha256": "446b01effef1ec300cbcc42f6dcfb00ddfc425f35d43381d207f84a54ad8ec26"
+                    },
+                    "range_start": 37572,
+                    "in_volume_end": 99574,
+                    "volume_bytes_downloaded": 99582,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": false,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part1",
+            "settings": "slicing off",
+            "values": {
+                "mediaArchiveSlicing": false,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part1",
+            "settings": "thumbnails off",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": false,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "settings": "defaults",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 104857600
+            },
+            "entries": [
+                {
+                    "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+                    "real_size": 37202,
+                    "source_index": 4,
+                    "head": {
+                        "len": 37202,
+                        "sha256": "bfe3a8f0835ce9ee1e712961c1d8e42a15f51b4b9b18b65eea936d7f7742eab5"
+                    },
+                    "range_start": 153,
+                    "in_volume_end": 37354,
+                    "volume_bytes_downloaded": 60000,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": true,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                },
+                {
+                    "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+                    "real_size": 186010,
+                    "source_index": 4,
+                    "head": {
+                        "len": 22428,
+                        "sha256": "88fbbb520329f6a200b1827f5d527faafcaec8c655b4c44225dba39ef65e2d12"
+                    },
+                    "range_start": 37572,
+                    "in_volume_end": 99574,
+                    "volume_bytes_downloaded": 60000,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        39575,
+                        39575
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "settings": "small",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 20000,
+                "mediaMainVideoMinBytes": 30000
+            },
+            "entries": [
+                {
+                    "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+                    "real_size": 37202,
+                    "source_index": 4,
+                    "head": {
+                        "len": 20000,
+                        "sha256": "446b01effef1ec300cbcc42f6dcfb00ddfc425f35d43381d207f84a54ad8ec26"
+                    },
+                    "range_start": 153,
+                    "in_volume_end": 37354,
+                    "volume_bytes_downloaded": 60000,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                },
+                {
+                    "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+                    "real_size": 186010,
+                    "source_index": 4,
+                    "head": {
+                        "len": 20000,
+                        "sha256": "446b01effef1ec300cbcc42f6dcfb00ddfc425f35d43381d207f84a54ad8ec26"
+                    },
+                    "range_start": 37572,
+                    "in_volume_end": 99574,
+                    "volume_bytes_downloaded": 60000,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": false,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "settings": "slicing off",
+            "values": {
+                "mediaArchiveSlicing": false,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "settings": "thumbnails off",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": false,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "settings": "defaults",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 104857600
+            },
+            "entries": [
+                {
+                    "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+                    "real_size": 37202,
+                    "source_index": 4,
+                    "head": {
+                        "len": 19847,
+                        "sha256": "e500d8173c80229071f747a1aa7397aa544e05bec348fa468be65b22f2cf9fab"
+                    },
+                    "range_start": 153,
+                    "in_volume_end": 37354,
+                    "volume_bytes_downloaded": 20000,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        153,
+                        17355,
+                        17355
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "settings": "small",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 20000,
+                "mediaMainVideoMinBytes": 30000
+            },
+            "entries": [
+                {
+                    "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+                    "real_size": 37202,
+                    "source_index": 4,
+                    "head": {
+                        "len": 19847,
+                        "sha256": "e500d8173c80229071f747a1aa7397aa544e05bec348fa468be65b22f2cf9fab"
+                    },
+                    "range_start": 153,
+                    "in_volume_end": 37354,
+                    "volume_bytes_downloaded": 20000,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        153,
+                        17355,
+                        17355
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "settings": "slicing off",
+            "values": {
+                "mediaArchiveSlicing": false,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "settings": "thumbnails off",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": false,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part2",
+            "settings": "defaults",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 104857600
+            },
+            "entries": [
+                {
+                    "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+                    "real_size": 186010,
+                    "source_index": 4,
+                    "head": {
+                        "len": 62003,
+                        "sha256": "f7f243bd7e3ce5fd79e5a6b715f8298fc820efe348ff11e67d4089c89dd30d32"
+                    },
+                    "range_start": 88,
+                    "in_volume_end": 62090,
+                    "volume_bytes_downloaded": 62098,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part2",
+            "settings": "small",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 20000,
+                "mediaMainVideoMinBytes": 30000
+            },
+            "entries": [
+                {
+                    "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+                    "real_size": 186010,
+                    "source_index": 4,
+                    "head": {
+                        "len": 20000,
+                        "sha256": "fafe64f215ea4ce164336c05248a4288ae50ec30aa3401ab7241fe1ed3af468d"
+                    },
+                    "range_start": 88,
+                    "in_volume_end": 62090,
+                    "volume_bytes_downloaded": 62098,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": false,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part2",
+            "settings": "slicing off",
+            "values": {
+                "mediaArchiveSlicing": false,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part2",
+            "settings": "thumbnails off",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": false,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part3",
+            "settings": "defaults",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 104857600
+            },
+            "entries": [
+                {
+                    "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+                    "real_size": 186010,
+                    "source_index": 4,
+                    "head": {
+                        "len": 62004,
+                        "sha256": "bcb06188cce18e98265c11fb1ce0a63eae711bac79545be70a366ac5b0a84f2f"
+                    },
+                    "range_start": 88,
+                    "in_volume_end": 62091,
+                    "volume_bytes_downloaded": 62099,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": true,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part3",
+            "settings": "small",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 20000,
+                "mediaMainVideoMinBytes": 30000
+            },
+            "entries": [
+                {
+                    "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+                    "real_size": 186010,
+                    "source_index": 4,
+                    "head": {
+                        "len": 20000,
+                        "sha256": "b8fcd2d6a9ee9a9ee3d17e100ee1729fccad9bd8dc3b24e207b6dcdde76945c0"
+                    },
+                    "range_start": 88,
+                    "in_volume_end": 62091,
+                    "volume_bytes_downloaded": 62099,
+                    "volume_segments_downloaded": 3,
+                    "is_sample": false,
+                    "container": "matroska",
+                    "complete": false,
+                    "continuation": [
+                        0,
+                        0,
+                        0,
+                        0
+                    ]
+                }
+            ]
+        },
+        {
+            "volume": "part3",
+            "settings": "slicing off",
+            "values": {
+                "mediaArchiveSlicing": false,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "part3",
+            "settings": "thumbnails off",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": false,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "garbage",
+            "settings": "defaults",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 104857600
+            },
+            "entries": []
+        },
+        {
+            "volume": "garbage",
+            "settings": "small",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 20000,
+                "mediaMainVideoMinBytes": 30000
+            },
+            "entries": []
+        },
+        {
+            "volume": "garbage",
+            "settings": "slicing off",
+            "values": {
+                "mediaArchiveSlicing": false,
+                "processThumbnails": true,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        },
+        {
+            "volume": "garbage",
+            "settings": "thumbnails off",
+            "values": {
+                "mediaArchiveSlicing": true,
+                "processThumbnails": false,
+                "mediaSampleMaxBytes": 8388608,
+                "mediaMainVideoMinBytes": 0
+            },
+            "entries": []
+        }
+    ],
+    "chunks": [
+        {
+            "volume": "part1",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": {
+                "len": 62003,
+                "sha256": "e2daf6976b723c0ebc7f241ee79561598ef538f1229860a5b94f8cfb4dfbebb8"
+            }
+        },
+        {
+            "volume": "part1",
+            "name": "6f746865725c6469722f4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": {
+                "len": 62003,
+                "sha256": "e2daf6976b723c0ebc7f241ee79561598ef538f1229860a5b94f8cfb4dfbebb8"
+            }
+        },
+        {
+            "volume": "part1",
+            "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+            "chunk": {
+                "len": 37202,
+                "sha256": "bfe3a8f0835ce9ee1e712961c1d8e42a15f51b4b9b18b65eea936d7f7742eab5"
+            }
+        },
+        {
+            "volume": "part1",
+            "name": "6d6f7669652d73616d706c652e6d6b76",
+            "chunk": {
+                "len": 37202,
+                "sha256": "bfe3a8f0835ce9ee1e712961c1d8e42a15f51b4b9b18b65eea936d7f7742eab5"
+            }
+        },
+        {
+            "volume": "part1",
+            "name": "4578747261732f7061636b65642e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part1",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6e666f",
+            "chunk": null
+        },
+        {
+            "volume": "part1",
+            "name": "6d697373696e672e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": {
+                "len": 22428,
+                "sha256": "88fbbb520329f6a200b1827f5d527faafcaec8c655b4c44225dba39ef65e2d12"
+            }
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "name": "6f746865725c6469722f4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": {
+                "len": 22428,
+                "sha256": "88fbbb520329f6a200b1827f5d527faafcaec8c655b4c44225dba39ef65e2d12"
+            }
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+            "chunk": {
+                "len": 37202,
+                "sha256": "bfe3a8f0835ce9ee1e712961c1d8e42a15f51b4b9b18b65eea936d7f7742eab5"
+            }
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "name": "6d6f7669652d73616d706c652e6d6b76",
+            "chunk": {
+                "len": 37202,
+                "sha256": "bfe3a8f0835ce9ee1e712961c1d8e42a15f51b4b9b18b65eea936d7f7742eab5"
+            }
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "name": "4578747261732f7061636b65642e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6e666f",
+            "chunk": null
+        },
+        {
+            "volume": "part1 cut in the feature",
+            "name": "6d697373696e672e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "name": "6f746865725c6469722f4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+            "chunk": {
+                "len": 19847,
+                "sha256": "e500d8173c80229071f747a1aa7397aa544e05bec348fa468be65b22f2cf9fab"
+            }
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "name": "6d6f7669652d73616d706c652e6d6b76",
+            "chunk": {
+                "len": 19847,
+                "sha256": "e500d8173c80229071f747a1aa7397aa544e05bec348fa468be65b22f2cf9fab"
+            }
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "name": "4578747261732f7061636b65642e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6e666f",
+            "chunk": null
+        },
+        {
+            "volume": "part1 cut in the sample",
+            "name": "6d697373696e672e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part2",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": {
+                "len": 62003,
+                "sha256": "f7f243bd7e3ce5fd79e5a6b715f8298fc820efe348ff11e67d4089c89dd30d32"
+            }
+        },
+        {
+            "volume": "part2",
+            "name": "6f746865725c6469722f4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": {
+                "len": 62003,
+                "sha256": "f7f243bd7e3ce5fd79e5a6b715f8298fc820efe348ff11e67d4089c89dd30d32"
+            }
+        },
+        {
+            "volume": "part2",
+            "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part2",
+            "name": "6d6f7669652d73616d706c652e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part2",
+            "name": "4578747261732f7061636b65642e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part2",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6e666f",
+            "chunk": null
+        },
+        {
+            "volume": "part2",
+            "name": "6d697373696e672e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part3",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": {
+                "len": 62004,
+                "sha256": "bcb06188cce18e98265c11fb1ce0a63eae711bac79545be70a366ac5b0a84f2f"
+            }
+        },
+        {
+            "volume": "part3",
+            "name": "6f746865725c6469722f4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": {
+                "len": 62004,
+                "sha256": "bcb06188cce18e98265c11fb1ce0a63eae711bac79545be70a366ac5b0a84f2f"
+            }
+        },
+        {
+            "volume": "part3",
+            "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part3",
+            "name": "6d6f7669652d73616d706c652e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part3",
+            "name": "4578747261732f7061636b65642e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "part3",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6e666f",
+            "chunk": null
+        },
+        {
+            "volume": "part3",
+            "name": "6d697373696e672e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "garbage",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "garbage",
+            "name": "6f746865725c6469722f4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "garbage",
+            "name": "53616d706c652f6d6f7669652d73616d706c652e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "garbage",
+            "name": "6d6f7669652d73616d706c652e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "garbage",
+            "name": "4578747261732f7061636b65642e6d6b76",
+            "chunk": null
+        },
+        {
+            "volume": "garbage",
+            "name": "4d6f7669652e323032332e31303830702e426c755261792e783236342d4752502e6e666f",
+            "chunk": null
+        },
+        {
+            "volume": "garbage",
+            "name": "6d697373696e672e6d6b76",
+            "chunk": null
+        }
+    ],
+    "remembered": [
+        [
+            {
+                "name": "feature1",
+                "sample": false,
+                "kept": true,
+                "after": [
+                    "feature1"
+                ]
+            },
+            {
+                "name": "sample1",
+                "sample": true,
+                "kept": true,
+                "after": [
+                    "sample1",
+                    "feature1"
+                ]
+            },
+            {
+                "name": "feature2",
+                "sample": false,
+                "kept": false,
+                "after": [
+                    "sample1",
+                    "feature1"
+                ]
+            },
+            {
+                "name": "sample2",
+                "sample": true,
+                "kept": true,
+                "after": [
+                    "sample1",
+                    "sample2"
+                ]
+            },
+            {
+                "name": "sample3",
+                "sample": true,
+                "kept": false,
+                "after": [
+                    "sample1",
+                    "sample2"
+                ]
+            },
+            {
+                "name": "sample1",
+                "sample": true,
+                "kept": false,
+                "after": [
+                    "sample1",
+                    "sample2"
+                ]
+            }
+        ],
+        [
+            {
+                "name": "sample1",
+                "sample": true,
+                "kept": true,
+                "after": [
+                    "sample1"
+                ]
+            },
+            {
+                "name": "sample2",
+                "sample": true,
+                "kept": true,
+                "after": [
+                    "sample1",
+                    "sample2"
+                ]
+            },
+            {
+                "name": "feature1",
+                "sample": false,
+                "kept": false,
+                "after": [
+                    "sample1",
+                    "sample2"
+                ]
+            }
+        ],
+        [
+            {
+                "name": "feature1",
+                "sample": false,
+                "kept": true,
+                "after": [
+                    "feature1"
+                ]
+            },
+            {
+                "name": "feature2",
+                "sample": false,
+                "kept": true,
+                "after": [
+                    "feature1",
+                    "feature2"
+                ]
+            },
+            {
+                "name": "sample1",
+                "sample": true,
+                "kept": true,
+                "after": [
+                    "sample1",
+                    "feature2"
+                ]
+            },
+            {
+                "name": "feature1",
+                "sample": false,
+                "kept": false,
+                "after": [
+                    "sample1",
+                    "feature2"
+                ]
+            }
+        ]
+    ],
+    "splices": [
+        {
+            "container": "matroska",
+            "head": "1a45dfa36865616465721f43b6756669727374",
+            "mid": "6a756e6b1f43b6756c61746572",
+            "result": "1a45dfa36865616465721f43b6756c61746572"
+        },
+        {
+            "container": "matroska",
+            "head": "1a45dfa3686561646572",
+            "mid": "6a756e6b1f43b6756c61746572",
+            "result": null
+        },
+        {
+            "container": "matroska",
+            "head": "1a45dfa31f43b675",
+            "mid": "6e6f20636c7573746572",
+            "result": null
+        },
+        {
+            "container": "mpegts",
+            "head": "68656164",
+            "mid": "7979797979797947111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111114711111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111471111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111147111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111114711111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+            "result": "47111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111114711111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111471111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111147111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111114711111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+            "container": "mpegts",
+            "head": "68656164",
+            "mid": "7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a",
+            "result": null
+        },
+        {
+            "container": "mpeg",
+            "head": "68656164",
+            "mid": "7a7a000001ba7061636b",
+            "result": "000001ba7061636b"
+        },
+        {
+            "container": "mpeg",
+            "head": "68656164",
+            "mid": "6e6f207061636b",
+            "result": null
+        },
+        {
+            "container": "avi",
+            "head": "524946462e2e2e2e415649204c4953542e2e2e2e6864726c4c4953542e2e2e2e6d6f766930306463",
+            "mid": "78783031776264617461",
+            "result": "524946462e2e2e2e415649204c4953542e2e2e2e6864726c4c4953542e2e2e2e6d6f76693031776264617461"
+        },
+        {
+            "container": "avi",
+            "head": "524946462e2e2e2e415649204c4953542e2e2e2e6864726c4c4953542e2e2e2e6d6f7669",
+            "mid": "783964632031326462",
+            "result": "524946462e2e2e2e415649204c4953542e2e2e2e6864726c4c4953542e2e2e2e6d6f766931326462"
+        },
+        {
+            "container": "avi",
+            "head": "6d6f766920617420746865207374617274",
+            "mid": "30306463",
+            "result": null
+        },
+        {
+            "container": "avi",
+            "head": "524946462e2e2e2e41564920585858582e2e2e2e6d6f7669",
+            "mid": "30306463",
+            "result": null
+        },
+        {
+            "container": "avi",
+            "head": "524946462e2e2e2e415649204c4953542e2e2e2e6d6f7669",
+            "mid": "6e6f206368756e6b2061623031",
+            "result": null
+        },
+        {
+            "container": "mov",
+            "head": "68656164",
+            "mid": "6d6964",
+            "result": null
+        },
+        {
+            "container": "asf",
+            "head": "68656164",
+            "mid": "6d6964",
+            "result": null
+        },
+        {
+            "container": "ogg",
+            "head": "68656164",
+            "mid": "6d6964",
+            "result": null
+        }
+    ]
+}
