@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use async_trait::async_trait;
 use nntmux_namefix::update::ReleaseSearch;
+use nntmux_postprocess::additional::candidates;
 use nntmux_postprocess::additional::orchestrator::{self, Services};
 use nntmux_postprocess::additional::processor::Outcome;
 use nntmux_postprocess::config::{Config, Settings};
@@ -165,5 +166,46 @@ async fn single_releases_are_processed_by_guid() -> Result<()> {
     let result = orchestrator::process_single_guid(&mut services, "c1").await;
     assert!(result.is_successful(), "{result:?}");
     assert_eq!(result.release_id, id);
+    db.drop_database().await
+}
+
+#[tokio::test]
+async fn claims_are_renewed_and_lapsed_ones_left_to_their_new_holder() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let (mine, _) = queued(pool, "e1", "x").await?;
+    let (taken, _) = queued(pool, "e2", "y").await?;
+    sqlx::query(
+        "UPDATE releases SET additional_pp_claim_token = 'mine', \
+         additional_pp_claimed_at = '2020-01-01 00:00:00' WHERE id IN (?, ?)",
+    )
+    .bind(mine)
+    .bind(taken)
+    .execute(pool)
+    .await?;
+    // The second claim lapsed and another worker took it.
+    sqlx::query("UPDATE releases SET additional_pp_claim_token = 'theirs' WHERE id = ?")
+        .bind(taken)
+        .execute(pool)
+        .await?;
+
+    let held = candidates::renew_claims(pool, &[mine, taken], "mine").await?;
+
+    assert_eq!(held, vec![mine]);
+    let stamps: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT additional_pp_claim_token, \
+         CAST(additional_pp_claimed_at > '2025-01-01' AS SIGNED) FROM releases \
+         WHERE id IN (?, ?) ORDER BY id",
+    )
+    .bind(mine)
+    .bind(taken)
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(
+        stamps,
+        vec![("mine".to_owned(), 1), ("theirs".to_owned(), 0)]
+    );
     db.drop_database().await
 }

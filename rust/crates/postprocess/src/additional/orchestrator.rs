@@ -345,9 +345,26 @@ pub async fn start(
         claimed_ids: releases.iter().map(|release| release.id).collect(),
         ..BatchResult::default()
     };
+    // Releases wait their turn and run one at a time, so a batch can outlast the claim TTL.
+    let pending = Arc::new(std::sync::Mutex::new(batch.claimed_ids.clone()));
+    let heartbeat = spawn_claim_heartbeat(
+        services.pool.clone(),
+        Arc::clone(&pending),
+        token.clone(),
+        Scope::new(&services.config).claim_ttl_seconds,
+    );
     for release in releases {
         let (id, guid) = (release.id, release.guid.clone());
         let release_started = Instant::now();
+        match candidates::renew_claims(&services.pool, &[id], &token).await {
+            Ok(held) if held.is_empty() => {
+                // Its claim lapsed and another worker took it; that worker processes it.
+                remove_pending(&pending, id);
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("could not renew the claim on release {id}: {error:#}"),
+        }
         let result = match services.process(release, &main_tmp).await {
             Ok(result) => result,
             Err(error) => {
@@ -358,13 +375,52 @@ pub async fn start(
             }
         };
         batch.results.push(result);
+        remove_pending(&pending, id);
         if let Err(error) = candidates::clear_claim(&services.pool, id, Some(&token)).await {
             eprintln!("could not clear the claim on release {id}: {error:#}");
         }
     }
+    drop(heartbeat);
     workspace::clear_directory(&main_tmp, false);
     batch.elapsed_seconds = started.elapsed().as_secs_f64();
     Ok(batch)
+}
+
+/// A background task stopped when its handle drops, even if the batch is cancelled.
+struct Heartbeat(tokio::task::JoinHandle<()>);
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Renews the batch's unfinished claims every third of the claim TTL while the handle lives.
+fn spawn_claim_heartbeat(
+    pool: MySqlPool,
+    pending: Arc<std::sync::Mutex<Vec<i64>>>,
+    token: String,
+    claim_ttl_seconds: i64,
+) -> Heartbeat {
+    let every = Duration::from_secs(u64::try_from(claim_ttl_seconds / 3).unwrap_or(0).max(1));
+    Heartbeat(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            let ids = pending.lock().map(|ids| ids.clone()).unwrap_or_default();
+            if ids.is_empty() {
+                continue;
+            }
+            if let Err(error) = candidates::renew_claims(&pool, &ids, &token).await {
+                eprintln!("could not renew batch claims: {error:#}");
+            }
+        }
+    }))
+}
+
+fn remove_pending(pending: &std::sync::Mutex<Vec<i64>>, id: i64) {
+    if let Ok(mut ids) = pending.lock() {
+        ids.retain(|pending| *pending != id);
+    }
 }
 
 /// A release found by GUID, its late-article candidate and its GUID bucket.
