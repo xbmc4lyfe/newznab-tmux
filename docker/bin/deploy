@@ -147,7 +147,8 @@ known=" $("$inspect" services < "$work/all.json" | tr '\n' ' ') "
 COMPOSE_FILE="$stack/docker-compose.yml" "$compose" --profile '*' config --services > "$work/roster"
 data_services=" $("$inspect" data "$base_data" "$image" < "$work/all.json" 3< "$work/roster" | tr '\n' ' ') "
 # Settings that would let Compose act outside these checks (a build section, shared namespaces,
-# dependency restarts, an app service without a health check or with several replicas).
+# dependency restarts, an app service without a health check, with several replicas, or with
+# another database connection than migrate's).
 refused=$("$inspect" refuse "$image" < "$work/all.json")
 if [ -n "$refused" ]; then
     echo "The Compose model has settings the deploy can't run safely:" >&2

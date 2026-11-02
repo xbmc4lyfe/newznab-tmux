@@ -128,6 +128,23 @@ def refusals(model: dict, image: str) -> list[str]:
         replicas = (svc.get("deploy") or {}).get("replicas", svc.get("scale", 1))
         if app and replicas not in (None, 1):
             out.append(f"{name}: runs {replicas} replicas; an app service runs exactly one")
+    # The pending check, migrations and the barrier all use migrate's database, so every app role
+    # must connect to that same one.
+    keys = ("DB_URL", "DB_CONNECTION", "DB_HOST", "DB_PORT", "DB_SOCKET", "DB_DATABASE")
+
+    def connection(svc: dict) -> dict:
+        env = svc.get("environment") or {}
+        if isinstance(env, list):
+            env = dict(item.split("=", 1) if "=" in item else (item, None) for item in env)
+        return {key: env.get(key) for key in keys}
+
+    reference = connection(services.get("migrate") or {})
+    for name, svc in sorted(services.items()):
+        if svc.get("image") != image or name == "migrate":
+            continue
+        differs = [key for key in keys if connection(svc)[key] != reference[key]]
+        if differs:
+            out.append(f"{name}: {', '.join(differs)} differ from migrate's, so it may use an unmigrated, unfenced database")
     return out
 
 
