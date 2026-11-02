@@ -17,9 +17,9 @@ Recent work in this fork includes:
 
 Modernization is incremental. The application currently uses Laravel 13, Livewire, Tailwind CSS, Alpine.js, and Vite; we continue simplifying inherited code and replacing outdated components as we work through the pipeline.
 
-See the [fork's commit history](https://github.com/xbmc4lyfe/newznab-tmux/commits/master/) for individual changes.
+See the [fork's commit history](https://github.com/xbmc4lyfe/newznab-tmux/commits/rust-native/) for individual changes.
 
-The [Rust benchmark dashboard](https://xbmc4lyfe.github.io/newznab-tmux/performance-current.html) refreshes on every master build and benchmark completion, including reruns. It reports current-commit yEnc comparisons, BODY/fingerprint profiles, release rendering and Rust target coverage gaps. Median screens and diagnostic profiles do not establish the project's 1.5× common-path and uncommon p99 adoption requirements. Failed, missing and inconclusive measurements remain visible; raw evidence is linked through Actions and retained for 14 days. Run the existing performance workflows for local/manual investigations; those experiments are excluded from the current-master dashboard.
+The [Rust benchmark dashboard](https://xbmc4lyfe.github.io/newznab-tmux/performance-current.html) refreshes on every rust-native build and benchmark completion, including reruns. It reports current-commit yEnc comparisons, BODY/fingerprint profiles, release rendering and Rust target coverage gaps. Median screens and diagnostic profiles do not establish the project's 1.5× common-path and uncommon p99 adoption requirements. Failed, missing and inconclusive measurements remain visible; raw evidence is linked through Actions and retained for 14 days. Run the existing performance workflows for local/manual investigations; those experiments are excluded from the current-rust-native dashboard.
 
 Read the [personal fork documentation](https://xbmc4lyfe.github.io/newznab-tmux/) for the Rust migration, benchmark evidence, fork history, and local setup. [NNTmux](https://github.com/NNTmux/newznab-tmux) remains the main project; this fork is a personal project under development and testing.
 
@@ -101,13 +101,13 @@ just docker logs s=indexer                     # Follow indexing logs
 just docker tmux                               # Attach to tmux; detach with Ctrl-a, then d
 just docker down                               # Stop containers; retain bind-mounted data
 just docker up DEPLOY_BY=local-start           # Start an initialized stack
-just deploy                                    # Sync origin/master & deploy dirty services
+just deploy                                    # Sync origin/rust-native & deploy dirty services
 just deploy web                                # Redeploy one component (or just deploy-web)
 just docker backup                             # Database dump in docker/backups/
 just docker help                               # All available commands
 ```
 
-When you run `just deploy-plan`, `just build-stack`, or `just deploy` (or `just deploy <component>` / `just deploy-<component>` for a single component), the deployment guard automatically verifies that the checkout is on the default branch (`master`), fetches `origin/master` from GitHub, and fast-forwards the checkout before planning, building, pausing affected application writers, running migrations when needed, and recreating the targeted or affected services. Use `deploy` for updates; `init` reapplies the starter groups and tuning.
+When you run `just deploy-plan`, `just build-stack`, or `just deploy` (or `just deploy <component>` / `just deploy-<component>` for a single component), the deployment guard automatically verifies that the checkout is on the default branch (`rust-native`), fetches `origin/rust-native` from GitHub, and fast-forwards the checkout before planning, building, pausing affected application writers, running migrations when needed, and recreating the targeted or affected services. Use `deploy` for updates; `init` reapplies the starter groups and tuning.
 
 Persistent data lives in `docker/data/`, logs in `docker/logs/`, and database dumps in `docker/backups/`. The backup command covers MariaDB; preserve application configuration and NZB/storage files separately. If initialization fails, inspect `just docker logs` before retrying; a partially initialized database needs recovery rather than a reset.
 
