@@ -8,6 +8,7 @@ pub mod gdpr;
 pub mod groups;
 pub mod roles;
 pub mod settings;
+pub mod users;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -46,6 +47,140 @@ pub enum Command {
     /// (the admin settings pages).
     #[command(subcommand)]
     Settings(SettingsCommand),
+    /// User accounts (the admin user and deleted user pages). A user is named by id or
+    /// username, or `id:N` / `name:X` when a username is a number.
+    #[command(subcommand)]
+    User(UserCommand),
+}
+
+/// `nntmux-ctl admin user ...`
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// List accounts, deleted ones included, newest usernames first.
+    List {
+        /// Usernames containing this text.
+        #[arg(long)]
+        username: Option<String>,
+        /// Addresses containing this text.
+        #[arg(long)]
+        email: Option<String>,
+        /// Hosts containing this text.
+        #[arg(long)]
+        host: Option<String>,
+        /// Role id.
+        #[arg(long)]
+        role: Option<i64>,
+        /// Only verified accounts.
+        #[arg(long, conflicts_with = "unverified")]
+        verified: bool,
+        /// Only unverified accounts.
+        #[arg(long)]
+        unverified: bool,
+        /// Created on or after this date (YYYY-MM-DD).
+        #[arg(long)]
+        created_from: Option<chrono::NaiveDate>,
+        /// Created on or before this date (YYYY-MM-DD).
+        #[arg(long)]
+        created_to: Option<chrono::NaiveDate>,
+        /// Only soft-deleted accounts, most recently deleted first.
+        #[arg(long)]
+        deleted: bool,
+        /// Sort order, such as `createdat_desc`.
+        #[arg(long, default_value = "", value_parser = parse_user_order)]
+        order: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+    /// Show one account.
+    Show { user: String },
+    /// Add an account. The password is read from standard input.
+    Add {
+        username: String,
+        email: String,
+        /// Role id; the default role without it.
+        #[arg(long)]
+        role: Option<i32>,
+        #[arg(long, default_value = "")]
+        notes: String,
+        /// Invites; the role's default without it.
+        #[arg(long)]
+        invites: Option<i32>,
+        /// Mark the address verified.
+        #[arg(long)]
+        verified: bool,
+    },
+    /// Change an account. Role changes are `admin role`'s.
+    Edit {
+        user: String,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        invites: Option<i32>,
+        #[arg(long)]
+        movieview: Option<bool>,
+        #[arg(long)]
+        musicview: Option<bool>,
+        #[arg(long)]
+        gameview: Option<bool>,
+        #[arg(long)]
+        consoleview: Option<bool>,
+        #[arg(long)]
+        bookview: Option<bool>,
+        /// Read a new password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Soft-delete accounts. They can be restored.
+    Delete {
+        #[arg(required = true)]
+        users: Vec<String>,
+        /// Delete Admin accounts too.
+        #[arg(long)]
+        allow_admin: bool,
+        /// Confirm. Without it, only show what would change.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Restore soft-deleted accounts.
+    Restore {
+        #[arg(required = true)]
+        users: Vec<String>,
+    },
+    /// Mark addresses verified.
+    Verify {
+        #[arg(required = true)]
+        users: Vec<String>,
+    },
+    /// Email a new verification link to unverified accounts.
+    ResendVerification {
+        #[arg(required = true)]
+        users: Vec<String>,
+    },
+    /// List an account's passkeys.
+    Passkeys { user: String },
+    /// Delete one passkey by its id.
+    DeletePasskey { id: u64 },
+    /// Remove every passkey from an account, so it signs in with its password again.
+    WipePasskeys {
+        user: String,
+        /// Confirm.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+fn parse_user_order(text: &str) -> Result<String> {
+    if text.is_empty() || users::ORDERINGS.contains(&text) {
+        Ok(text.to_owned())
+    } else {
+        anyhow::bail!("the orders are: {}", users::ORDERINGS.join(", "))
+    }
 }
 
 /// `nntmux-ctl admin settings ...`
@@ -291,6 +426,7 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
         Command::Role(command) => role(&ctx, command, now).await?,
         Command::Group(command) => group(&ctx, command, now).await?,
         Command::Settings(command) => settings_command(&ctx.db, command, now).await?,
+        Command::User(command) => user_command(&ctx, command, now).await?,
     }
     Ok(())
 }
@@ -851,4 +987,269 @@ fn exclusive<'a>(
         verify,
         drain_timeout,
     }
+}
+
+fn read_password() -> Result<String> {
+    let mut password = String::new();
+    std::io::stdin()
+        .read_line(&mut password)
+        .context("reading the password from standard input")?;
+    Ok(password.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn when(value: Option<chrono::NaiveDateTime>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+async fn user_command(ctx: &Ctx, command: UserCommand, now: chrono::NaiveDateTime) -> Result<()> {
+    let db = &ctx.db;
+    match command {
+        UserCommand::List {
+            username,
+            email,
+            host,
+            role,
+            verified,
+            unverified,
+            created_from,
+            created_to,
+            deleted,
+            order,
+            limit,
+            offset,
+        } => {
+            let filter = users::Filter {
+                username,
+                email,
+                host,
+                role,
+                verified: flag(verified, unverified),
+                created_from,
+                created_to,
+                deleted_only: deleted,
+                ordering: order,
+                limit,
+                offset,
+            };
+            for user in users::list(db, &filter, now).await? {
+                println!(
+                    "{:>6}  {:<24} {:<32} {:<12} verified={} grabs={} api/day={} dl/day={} created={} last_login={}{}",
+                    user.id,
+                    user.username,
+                    user.email,
+                    user.role.as_deref().unwrap_or("-"),
+                    if user.verified != 0 { "yes" } else { "no" },
+                    user.grabs,
+                    user.daily_api_count,
+                    user.daily_download_count,
+                    when(user.created_at),
+                    when(user.lastlogin),
+                    user.deleted_at.map_or_else(String::new, |at| format!(
+                        " DELETED {at} by {}",
+                        user.deleted_by.as_deref().unwrap_or("-")
+                    )),
+                );
+            }
+        }
+        UserCommand::Show { user } => {
+            let account = users::require(db, &user).await?;
+            let (api, downloads) = users::daily_counts(db, account.id, now).await?;
+            let passkeys = users::passkeys(db, account.id).await?;
+            println!("id: {}", account.id);
+            println!("username: {}", account.username);
+            println!("email: {}", account.email);
+            println!(
+                "verified: {}",
+                if account.is_verified() { "yes" } else { "no" }
+            );
+            println!(
+                "role: {} ({}), expires {}",
+                account.role.as_deref().unwrap_or("-"),
+                account.roles_id,
+                when(account.rolechangedate)
+            );
+            if let Some(pending) = account.pending_roles_id {
+                println!(
+                    "pending role: {pending} from {}",
+                    when(account.pending_role_start_date)
+                );
+            }
+            println!("host: {}", account.host.as_deref().unwrap_or("-"));
+            println!("notes: {}", account.notes.as_deref().unwrap_or(""));
+            println!("invites: {}", account.invites);
+            println!("grabs: {}", account.grabs);
+            println!("rate limit: {}", account.rate_limit);
+            println!("api requests today: {api}, downloads today: {downloads}");
+            println!(
+                "views: movie={} music={} game={} console={} book={}",
+                account.movieview,
+                account.musicview,
+                account.gameview,
+                account.consoleview,
+                account.bookview
+            );
+            println!("created: {}", when(account.created_at));
+            println!(
+                "last login: {}, api access: {}",
+                when(account.lastlogin),
+                when(account.apiaccess)
+            );
+            println!("passkeys: {}", passkeys.len());
+            if let Some(at) = account.deleted_at {
+                println!(
+                    "deleted: {at} by {}",
+                    account.deleted_by.as_deref().unwrap_or("-")
+                );
+            }
+        }
+        UserCommand::Add {
+            username,
+            email,
+            role,
+            notes,
+            invites,
+            verified,
+        } => {
+            let password = read_password()?;
+            let id = users::add(
+                db,
+                &users::NewUser {
+                    username,
+                    email,
+                    password,
+                    role,
+                    notes,
+                    invites,
+                    verified,
+                },
+            )
+            .await?;
+            println!("added user {id}");
+        }
+        UserCommand::Edit {
+            user,
+            username,
+            email,
+            notes,
+            invites,
+            movieview,
+            musicview,
+            gameview,
+            consoleview,
+            bookview,
+            password_stdin,
+        } => {
+            let account = users::require(db, &user).await?;
+            let password = if password_stdin {
+                Some(read_password()?)
+            } else {
+                None
+            };
+            users::update(
+                db,
+                &account,
+                &users::Changes {
+                    username,
+                    email,
+                    password,
+                    notes,
+                    invites,
+                    movieview,
+                    musicview,
+                    gameview,
+                    consoleview,
+                    bookview,
+                },
+            )
+            .await?;
+            println!("updated {}", account.username);
+        }
+        UserCommand::Delete {
+            users: names,
+            allow_admin,
+            yes,
+        } => {
+            let mut targets = Vec::new();
+            for name in &names {
+                let account = users::require(db, name).await?;
+                users::guard_admin(db, &account, allow_admin).await?;
+                targets.push(account);
+            }
+            for account in targets {
+                if !yes {
+                    println!(
+                        "would delete {} ({}); pass --yes to delete",
+                        account.username, account.id
+                    );
+                } else if users::delete(ctx, &account, now).await? {
+                    println!("deleted {}", account.username);
+                } else {
+                    println!("{} was already deleted", account.username);
+                }
+            }
+        }
+        UserCommand::Restore { users: names } => {
+            for name in &names {
+                let account = users::require(db, name).await?;
+                if users::restore(ctx, &account, now).await? {
+                    println!("restored {}", account.username);
+                } else {
+                    println!("{} isn't deleted", account.username);
+                }
+            }
+        }
+        UserCommand::Verify { users: names } => {
+            for name in &names {
+                let account = users::require(db, name).await?;
+                if users::verify(ctx, &account).await? {
+                    println!("verified {}", account.username);
+                } else {
+                    println!("{} was already verified", account.username);
+                }
+            }
+        }
+        UserCommand::ResendVerification { users: names } => {
+            for name in &names {
+                let account = users::require(db, name).await?;
+                users::resend_verification(ctx, &account).await?;
+                println!("sent a verification link to {}", account.username);
+            }
+        }
+        UserCommand::Passkeys { user } => {
+            let account = users::require(db, &user).await?;
+            for passkey in users::passkeys(db, account.id).await? {
+                println!(
+                    "{:>6}  {}  created {}  last used {}",
+                    passkey.id,
+                    passkey.name,
+                    when(passkey.created_at),
+                    when(passkey.last_used_at)
+                );
+            }
+        }
+        UserCommand::DeletePasskey { id } => {
+            let passkey = users::passkey(db, id)
+                .await?
+                .with_context(|| format!("passkey {id} doesn't exist"))?;
+            users::delete_passkey(db, &passkey).await?;
+            println!("deleted passkey {id} ({})", passkey.name);
+        }
+        UserCommand::WipePasskeys { user, yes } => {
+            let account = users::require(db, &user).await?;
+            if !yes {
+                let count = users::passkeys(db, account.id).await?.len();
+                println!(
+                    "would remove {count} passkey(s) from {}; pass --yes to remove them",
+                    account.username
+                );
+            } else {
+                let wiped = users::wipe_passkeys(db, &account).await?;
+                println!(
+                    "{wiped} passkeys removed from {}. They can now sign in with their password or an admin-issued reset.",
+                    account.username
+                );
+            }
+        }
+    }
+    Ok(())
 }
