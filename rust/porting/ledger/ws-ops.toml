@@ -330,7 +330,8 @@ status = "ported"
 kind = "schedule"
 id = "command: 'nntmux:populate-steam-apps')->monthly();"
 source = "routes/console.php"
-status = "todo"
+status = "dropped"
+note = "Its command is dropped: games are out of scope."
 
 [[entry]]
 kind = "schedule"
