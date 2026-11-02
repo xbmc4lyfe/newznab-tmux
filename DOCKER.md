@@ -1,323 +1,117 @@
-# Docker Development Environment
+# Docker stack
 
-> Docker / Sail setup for NNTmux — a Laravel 12 Usenet indexer.
+The Rust-native NNTmux stack. Everything is in [`docker/`](docker/): the Compose file, the stack Justfile, the deploy script and the config. The image is built from the root [`Dockerfile`](Dockerfile). For how the rewrite is organised see [rust/WORKSTREAMS.md](rust/WORKSTREAMS.md); for moving production from PHP see [rust/CUTOVER.md](rust/CUTOVER.md).
 
 ## Prerequisites
 
-- [just](https://github.com/casey/just) 1.43 or newer (older distribution packages lack modules and `module_directory()`)
-- Docker & **Docker Compose v2.22+** (the Justfile uses `pull --ignore-buildable`)
-- A GitHub (scopeless) token for Composer private packages
-- [Laravel Sail](https://laravel.com/docs/12.x/sail) (included as a dev dependency)
+- Git, Python 3, and [just](https://github.com/casey/just) 1.43 or newer (older packages lack modules).
+- Docker with Compose v2. Docker Desktop or OrbStack on macOS; Docker Engine plus the Compose plugin on Linux.
+- Usenet provider credentials.
+- A large host. MariaDB has an 8 GiB buffer pool (`docker/config/mariadb/conf.d/99-nntmux.cnf`) and the memory limits in `docker/.env` total roughly 30 GiB. Lower both for a smaller machine.
 
-## Quick Start
+## What runs
 
-```bash
-# 1. Copy and configure your environment
-cp .env.example .env
-# Edit .env — set DB credentials, COMPOSER_AUTH, and uncomment the
-# "Docker service hostnames" block at the bottom.
+All app services use one image (`APP_IMAGE`, default `nntmux/rust:local`) with a different command. Each serves `/healthz` and `/metrics` on port 9187.
 
-# 2. Build and start
-just build
-just up
+| Service | Command | Purpose |
+|---|---|---|
+| `migrate` | `nntmux-ctl migrate` | One-shot. Applies pending schema migrations; every app service waits for it. |
+| `web` | `nntmux-web` | Site, Newznab API, RSS, NZB downloads. Behind `proxy` (Caddy) on `APP_PORT` (8080). |
+| `supervisor` | `nntmux-worker supervisor` | Scheduled tasks. Holds a database lease, so a second copy waits. |
+| `releases`, `fixnames`, `predb` | `nntmux-worker <role>` | Release assembly and NZBs, name fixing, PreDB. |
+| `fingerprint`, `verify` | `nntmux-worker <role>` | Release fingerprints and verification. Long units; 1920 s stop grace. |
+| `search-sync` | `nntmux-worker search-sync` | Keeps Manticore current. |
+| `ingest`, `backfill`, `postprocess`, `mail` | `nntmux-worker <role>` | Not ported yet: in the Compose `pending` profile, so a normal `up` skips them. |
+| `mariadb`, `redis`, `manticore`, `mailpit` | | Data services and a mail catcher (Mailpit at 127.0.0.1:8025). |
+| `prometheus`, `pushgateway`, `grafana`, exporters | | Monitoring. |
 
-# 3. Install NNTmux (first run only)
-just artisan cmd="nntmux:install"
+State is bind-mounted under `docker/data/` and `docker/logs/`. Dumps go to `docker/backups/`.
 
-# 4. Build frontend assets
-just npm-build
-```
+## Fresh install
 
-## Environment Configuration
-
-When running via Docker, uncomment the **Docker service hostnames** block
-at the bottom of `.env` so the app resolves container names:
-
-```dotenv
-DB_HOST=mariadb
-REDIS_HOST=redis
-MANTICORESEARCH_HOST=manticore
-MAIL_HOST=mailpit
-MAIL_PORT=1025
-```
-
-### Search Engine Selection
-
-Set `COMPOSE_PROFILES` in `.env` to match your `SEARCH_DRIVER`:
-
-| `SEARCH_DRIVER` | `COMPOSE_PROFILES` |
-|------------------|--------------------|
-| `manticore`      | `manticore`        |
-
-Only the selected search service container will start.
-
-### ManticoreSearch Image Updates
-
-Both `docker-compose.yml` and `docker-compose.yml.prod-dist` intentionally use
-the unpinned `manticoresearch/manticore` image. This keeps ManticoreSearch on
-the latest published Docker image whenever images are pulled, but it also means
-production can receive ManticoreSearch changes without a repository diff.
-
-Before pulling and restarting production, validate the new image in staging by
-creating indexes, indexing a small batch, and running representative searches,
-filters, sorting, pagination, deletes, suggestions, fuzzy searches, and any raw
-SQL diagnostics/reconciliation commands.
-
-Manticore Search 27.1.5 is part of the 25.x-27.x release line that introduced
-built-in authentication/authorization, sharded tables, conversational search,
-vector-search improvements, and replication layout changes. The app does not
-enable Manticore auth by default, but if auth is enabled on the server set either
-`MANTICORESEARCH_USERNAME`/`MANTICORESEARCH_PASSWORD` or
-`MANTICORESEARCH_TOKEN` before running the app, index-creation commands, or raw
-HTTP diagnostics. Roll auth out in staging first; anonymous local Docker usage
-continues to work with these variables blank.
-
-Native Ubuntu/Debian package installs are managed by `systemd`, not Docker. If
-the package install fails while starting `manticore.service`, especially with
-`Status: "Replaying binlogs..."` and `accept() failed ... Too many open files`,
-or if `searchd` prints a backtrace during binlog replay, use
-[`docs/manticore-ubuntu-package.md`](docs/manticore-ubuntu-package.md) to raise
-the service file descriptor limit, preserve crash evidence, quarantine bad
-binlogs if needed, and finish `dpkg` configuration.
-
-## Just Recipes
-
-Run `just` or `just help` to see all recipes, or `just docker <recipe>` (or `just --justfile docker/Justfile <recipe>`) for the self-hosted `docker/` stack.
-
-### Self-Hosted Stack (`docker/Justfile`)
-
-| Recipe | Description |
-|--------|-------------|
-| `just deploy-plan` | Sync `origin/rust-native` and show per-service change classification, dirty image targets, and selective rollout plan |
-| `just deploy` | Smart guarded deploy: syncs `origin/rust-native`, skips non-runtime edits, builds/drains/recreates only affected services |
-| `just deploy <component>` | Sync `origin/rust-native` and redeploy the named component(s) (`web`, `horizon`, `scheduler`, `indexer`, `proxy`, `monitoring`, `redis`, `manticore`, `mariadb`, `mailpit`, `grafana`, `prometheus`) |
-| `just deploy-<component>` | Shortcut recipes (`just deploy-web`, `just deploy-horizon`, `just deploy-scheduler`, `just deploy-indexer`, `just deploy-proxy`, `just deploy-monitoring`, `just deploy-redis`, `just deploy-manticore`, `just deploy-mariadb`, `just deploy-mailpit`, `just deploy-grafana`, `just deploy-prometheus`) |
-| `just build-stack` | Sync `origin/rust-native` and build dirty self-hosted service image targets (`selfhosted-web`, `selfhosted-horizon`, `selfhosted-scheduler`, `selfhosted-indexer`) |
-| `just docker build-base` | Build the cached OS + PHP extension base image (`nntmux/base:local`) |
-| `just docker up` | Initial bringup or guarded deploy when app containers exist |
-
-### Lifecycle
-
-| Recipe            | Description                                                     |
-|-------------------|-----------------------------------------------------------------|
-| `just up`         | Start all services (detached)                                   |
-| `just down`       | Stop all services                                               |
-| `just restart`    | Restart all services                                            |
-| `just recreate`   | Force-recreate containers without rebuilding                    |
-| `just build`      | Build the app image (cached)                                    |
-| `just rebuild`    | Pull fresh base images + `--no-cache` build + force-recreate    |
-| `just pull`       | Pull latest enabled-profile base images (skips buildable ones)  |
-| `just update`     | Infra-only: pull + `--pull` build + restart                     |
-| `just upgrade`    | App upgrade: `update` + composer + npm + migrate + caches       |
-| `just fresh`      | **Destroy volumes**, pull, rebuild, recreate (DATA LOSS)        |
-
-### Development
-
-| Recipe              | Description                                           |
-|---------------------|-------------------------------------------------------|
-| `just shell`        | Bash shell in the app container                       |
-| `just root-shell`   | Root bash shell in the app container                  |
-| `just tinker`       | Laravel Tinker REPL                                   |
-| `just artisan cmd=` | Run any artisan command                               |
-| `just migrate`      | Run pending migrations                                |
-| `just migrate-fresh`| Drop all tables and re-migrate (DATA LOSS)            |
-| `just seed`         | Run database seeders                                  |
-| `just cache-clear`  | Clear config / route / view / app caches (and stale `bootstrap/cache` files) |
-| `just optimize`     | Dev-safe: warm view cache + spatie/laravel-data           |
-| `just optimize-deploy` | Production: also caches config/routes (bakes absolute paths) |
-| `just queue-work`   | Foreground queue worker                               |
-| `just queue-restart`| Signal queue workers to restart                       |
-| `just tmux-start`   | Start the NNTmux tmux processing engine               |
-| `just tmux-stop`    | Stop the tmux processing engine                       |
-| `just tmux-attach`  | Attach to the running tmux session                    |
-| `just horizon`      | Show Horizon queue status                             |
-| `just fix-permissions` | Chown project to host UID + register git `safe.directory` |
-
-### Testing & Quality
-
-| Recipe           | Description                                          |
-|------------------|------------------------------------------------------|
-| `just test`      | PHPUnit tests (`filter=Name` optional)               |
-| `just pint`      | Pint formatter on dirty files                        |
-| `just pint-all`  | Pint formatter on all files                          |
-| `just phpstan`   | PHPStan static analysis (2G memory limit)            |
-| `just rector`    | Rector dry-run (no changes)                          |
-| `just rector-fix`| Apply Rector refactorings                            |
-
-### Frontend & Types
-
-| Recipe                | Description                          |
-|-----------------------|--------------------------------------|
-| `just npm-build`      | `npm install` + `npm run build`      |
-| `just npm-dev`        | Start Vite dev server                |
-| `just ts-types`       | Regenerate TypeScript types          |
-| `just ts-types-check` | CI: fail if generated types drift    |
-| `just data-cache`     | Cache spatie/laravel-data structures |
-
-### Logs & Status
-
-| Recipe              | Description                                                      |
-|---------------------|------------------------------------------------------------------|
-| `just logs`         | Tail all container logs (or `SERVICE=name` for one)              |
-| `just tail-laravel` | Tail `storage/logs/laravel.log` inside the app container         |
-| `just status` / `ps`| Show running containers                                          |
-| `just top`          | Show processes inside each container                             |
-| `just images`       | Show images used by each service                                 |
-| `just health`       | Healthcheck status per service                                   |
-
-### Monitoring
-
-Prometheus, Grafana, the Pushgateway and exporters from `docker-compose.monitoring.yml`. Run `php artisan monitoring:install --sail` once (it sets `MONITORING_ENABLED=true`); from then on `just up`, `just down` and the other lifecycle recipes include them. Grafana is embedded at **Admin → System → Monitoring** (proxied at `/grafana/`).
-
-| Recipe                 | Description                                                    |
-|------------------------|----------------------------------------------------------------|
-| `just monitoring-up`   | Start only the monitoring containers                           |
-| `just monitoring-down` | Stop and remove only them (volumes are kept)                   |
-| `just monitoring-logs` | Follow their logs                                              |
-
-### Cleanup
-
-| Recipe        | Description                                                   |
-|---------------|---------------------------------------------------------------|
-| `just clean`  | Prune stopped containers / dangling images                    |
-| `just nuke`   | **Remove ALL** project containers, images, volumes (DATA LOSS)|
-
-### Flags
-
-These can be combined with the recipes above:
-
-| Flag           | Effect                                                                |
-|----------------|-----------------------------------------------------------------------|
-| `FORCE=1`      | Skip confirmation prompts on `fresh`, `nuke`, `migrate-fresh` (CI use)|
-| `MAINTENANCE=1`| Wrap `upgrade` migrations in `artisan down` / `artisan up`            |
-| `SERVICE=name` | Restrict `logs` to a specific compose service                         |
-| `CMD="…"`      | Free-form command for `artisan` (alternative to `cmd=`)               |
-| `MONITORING_ENABLED=true\|false` | Override `.env` for this run of any lifecycle recipe (`up`, `down`, `restart`, `recreate`, `pull`, `build`, `rebuild`, `update`, `upgrade`, `fresh`, `logs`, `status`, `nuke`, `check-env`) |
-| `filter=Name`  | Pass `--filter=Name` to `just test`                                   |
-
-Examples:
+For an empty database only:
 
 ```bash
-just fresh FORCE=1                      # non-interactive teardown + rebuild
-just upgrade MAINTENANCE=1              # zero-downtime-ish upgrade with maint mode
-just logs SERVICE=mariadb               # tail only mariadb
-just test filter=ReleaseSearchTest      # run a single test
-just up MONITORING_ENABLED=true         # include the monitoring overlay even though .env disables it
-just artisan cmd='some:command --label="two words"'   # cmd is parsed with shell quoting, never globbed
+# docker/config/usenet_servers.json: {"usenet_servers": [{"host", "port", "ssl", "username", "password", "connections"}]}
+chmod 600 docker/config/usenet_servers.json
+export NNTP_PRIMARY_HOST=news.example.com NNTP_ALT_HOST=news.example.com
+just docker init
 ```
 
-`cmd=` (and `CMD`) is split with shell quoting rules into a real argument array, so quoted words
-stay together and `*` is passed literally; an unbalanced quote is an error. The same applies to
-`just docker artisan cmd=…`.
+`init` runs `docker/bin/generate-env` (writes `docker/.env` and `docker/config/app.env` with generated secrets; existing values are never overwritten), builds the image, starts MariaDB, Redis, Manticore and Mailpit, runs `nntmux-ctl init` (schema, seed, administrator, search tables), applies `docker/config/seed/groups.sql` and `tuning.sql`, then starts the rest and waits for health. `nntmux-ctl init` refuses a database that already has tables. Review the seed files first: they enable starter groups and set worker counts for a large provider plan.
 
-### Trailing `KEY=VALUE` arguments for `docker/Justfile`
+Open <http://localhost:8080> and log in as `admin`. The password is `ADMIN_PASS` in `docker/config/app.env`.
 
-Precedence is trailing arguments, then the environment, then `docker/.env`, then defaults. An
-explicitly empty trailing argument counts as supplied: `just deploy COMPOSE_FILE= WEB_IMAGE=`
-discards the `docker/.env` values and uses the defaults (`docker/docker-compose.yml`, and the
-`nntmux/web:local` or `APP_IMAGE`-derived tag). An empty `COMPOSE_FILE` therefore means "the default
-stack file", not "no file". Only arguments can clear a value; an empty variable in the environment is
-indistinguishable from an unset one and does not override `docker/.env`.
+## Everyday commands
 
-`DC`, `COMPOSE_FILE` and the `HELPER_`/`BASE_`/`APP_`/`WEB_`/`HORIZON_`/`SCHEDULER_`/`INDEXER_IMAGE` keys
-in `docker/.env` must be literal values. The Justfile and `docker/bin/compose` read them without
-Compose's `$` interpolation, so an unquoted or double-quoted value containing `$` (for example
-`APP_IMAGE=${REGISTRY}/nntmux:${TAG}`) stops the recipe with an error; single-quote the value for a
-verbatim `$`. Other keys, such as `MARIADB_IMAGE`, are left to Compose and may interpolate.
-
-> **Note:** `just pull` / `update` / `rebuild` use `docker compose pull --ignore-buildable`,
-> which only pulls images for services in the active `COMPOSE_PROFILES` and skips images
-> that are built locally (e.g. `sail-8.5/app`). Requires Docker Compose v2.22+.
-
-You can also use `./sail` directly for anything not covered above —
-unknown commands are passed through to `docker compose`.
-
-## Networking
-
-Sail creates a Docker network called `sail` with these default port mappings:
-
-| Service        | Container Port | Host Port (default)                      |
-|----------------|----------------|------------------------------------------|
-| HTTP (nginx)   | 80             | `APP_PORT` (80)                          |
-| Vite           | 5173           | `VITE_PORT` (5173)                       |
-| MariaDB        | 3306           | `FORWARD_DB_PORT` (3306)                 |
-| Redis          | 6379           | `FORWARD_REDIS_PORT` (6379)              |
-| Manticore SQL  | 9306           | 9306                                     |
-| Manticore HTTP | 9308           | 9308                                     |
-| Mailpit SMTP   | 1025           | `FORWARD_MAILPIT_PORT` (1025)            |
-| Mailpit Web    | 8025           | `FORWARD_MAILPIT_DASHBOARD_PORT` (8025)  |
-| Prometheus     | 9090           | `FORWARD_PROMETHEUS_PORT` (9090), 127.0.0.1 only, monitoring overlay |
-
-If a port is already in use on your host, change the corresponding
-`FORWARD_*` / `APP_PORT` variable in `.env`.
-
-## Database
-
-On first run MariaDB creates a user/database from your `.env`:
-
-```dotenv
-DB_USERNAME=
-DB_PASSWORD=
-DB_DATABASE=nntmux
-```
-
-Import an existing SQL dump or run `just artisan cmd="nntmux:install"` for
-a fresh installation.
-
-## Backups
-
-Add this optional service to `docker-compose.yml` for automated MariaDB backups:
-
-```yaml
-    backup:
-        image: fradelg/mysql-cron-backup
-        depends_on:
-            - mariadb
-        restart: always
-        volumes:
-            - ./docker/backups:/backup
-        environment:
-            - MYSQL_USER=${DB_USERNAME}
-            - MYSQL_PASS=${DB_PASSWORD}
-            - MYSQL_DB=${DB_DATABASE}
-            - CRON_TIME=0 3 * * *
-            - MYSQL_HOST=mariadb
-            - MYSQL_PORT=3306
-            - TIMEOUT=10s
-            - GZIP_LEVEL=9
-            - MAX_BACKUPS=5
-            - INIT_BACKUP=0
-            - EXIT_BACKUP=1
-        networks:
-            - sail
-```
-
-## Production
-
-For production deployments use `docker-compose.yml.prod-dist` as a starting
-point. It includes separate `webapp`, `worker`, and `scheduler` services
-and uses the root `Dockerfile` (FrankenPHP-based).
+Run from the repository root. `just docker help` lists them all.
 
 ```bash
-cp docker-compose.yml.prod-dist docker-compose.yml
-# Edit .env for production settings
-docker compose up -d
+just docker ps                        # status and health
+just docker logs s=releases           # follow logs (s=service)
+just docker restart s=verify          # restart one service; workers drain first
+just docker ctl cmd="search inspect"  # nntmux-ctl in a one-off container
+just docker status                    # groups, binaries, releases, predb counts
+just docker mysql                     # MariaDB client (bundled MariaDB only)
+just docker backup                    # dump to docker/backups/, keeps 7
+just docker down                      # stop the stack; data is kept
+just docker up                        # first start of a new stack; refuses an existing one
 ```
+
+Pass `KEY=VALUE` after a recipe to set an option for one run, for example `just deploy DEPLOY_BY=me`. The recipes read `docker/.env` for the keys they need.
+
+## Deploy
+
+`just deploy` runs [`docker/bin/deploy`](docker/bin/deploy). Only the deployment owner runs it. It needs `DEPLOY_BY`.
+
+1. Takes a lock directory (`DEPLOY_LOCK_DIR`, default `docker/.deploy.lock`). If another deploy holds it, it exits with status 75.
+2. Requires the checkout to be on `DEPLOY_GIT_BRANCH` (default `main`) with no commits missing from `DEPLOY_GIT_REMOTE` (default `origin`), and fast-forwards it. `DEPLOY_SYNC_REMOTE=0` skips this, for offline testing only.
+3. Preflight, before anything changes. It refuses to run while containers of services the Compose file no longer defines are running (the PHP `horizon`, `scheduler` and `indexer` after the cutover), while `docker/config/app.env` has a `$` Compose would interpolate (single-quote such values), or when a data service's (`DEPLOY_DATA_SERVICES`, default `mariadb redis manticore`) Compose definition, image or mounted config changed. `DEPLOY_RECREATE_DATA=1` allows that, and recreates those data services as a separate step before `migrate`, in a window you planned.
+4. Builds the image while the old stack keeps running. It is labelled with the newest commit that changed its sources (`docker/bin/source-revision`), so a docs- or test-only commit builds the same cached image and recreates nothing.
+5. When a migration is pending (`nntmux-ctl migrate --pending`) or a data service is recreated, it stops every running app service (each drains) and holds `nntmux-ctl verify barrier`, which pauses verification workers on every host until the rollout is healthy. The barrier is labelled with the database it fences: a later deploy adopts it only for the same database and otherwise stops, and recreating the database takes a fresh barrier on the replacement before migrating it. After a failure the writers stay stopped and the barrier stays held, and the next deploy checks for pending migrations whatever its targets.
+6. Runs `migrate` on its own, before any app service is recreated. A failed migration leaves the stack as it was (stopped, if step 5 quiesced it).
+7. Runs `docker compose up -d --wait` (timeout `DEPLOY_HEALTH_TIMEOUT`, default 600 s). Changed services are recreated; unchanged ones are left alone. Compose doesn't notice an edited mounted file, so services whose mounted config (Caddyfile, Prometheus, Grafana provisioning) changed since the last healthy deploy are force-recreated. The hashes live in `DEPLOY_CONFIG_STAMP` (default `docker/.deploy.config`).
+8. Checks that every running app container runs the image just built and sets Grafana's admin password from `GRAFANA_ADMIN_PASSWORD`. It releases the barrier only once every app service runs healthy and no migration is pending, so a targeted deploy after a failed one keeps it held and exits non-zero until the whole stack is deployed.
+9. Appends `deploy result=started` and `deploy result=finished rc=<n>` lines to `DEPLOY_LOG` (default `docker/.deploy.log`).
+
+Remote verification workers (`docker/worker`) aren't part of the stack; the barrier in step 5 keeps them out during a migration or data-service change. `DEPLOY_REMOTE_DRAIN_TIMEOUT` (default 900 s) is how long it waits for them to finish.
+
+Workers get SIGTERM, stop claiming work, and finish in-flight units within their `stop_grace_period` (30 s `web`, 120 s default, 1920 s `fingerprint`, `verify` and `postprocess`). A long job can delay a rollout.
+
+`just deploy-plan` (or `DRY_RUN=1 just deploy`) prints what would happen without building. `just deploy <service>` rolls out only the named services.
+
+## Configuration
+
+- `docker/.env`: Compose settings (ports, memory limits, image tags, `DEPLOY_*`, the Grafana password). Template: `docker/.env.example`.
+- `docker/config/app.env`: application settings read by every role: `DB_*`, `REDIS_*`, `MANTICORESEARCH_*`, `NNTP_*`, `APP_KEY`, metadata provider keys. Template: `docker/config/app.env.example`.
+- Keep both private. They are ignored by Git and kept out of the image.
+- An external MariaDB: set `DB_*` in `app.env`, plus `MYSQL_ATTR_SSL_CA` for TLS, and use a `COMPOSE_FILE` override list. `migrate` doesn't require the bundled `mariadb` service. `just docker mysql` and `backup` work only with the bundled one.
+
+## Monitoring
+
+- Grafana listens on `127.0.0.1:${GRAFANA_PORT:-3000}` with its own login: user `nntmux-grafana-admin`, password `GRAFANA_ADMIN_PASSWORD` in `docker/.env`. It isn't reachable through the web app. Provisioned dashboards are NNTmux Host, Services and Processing.
+- Prometheus listens on `127.0.0.1:${PROMETHEUS_PORT:-9090}` and scrapes every role's `:9187/metrics` as job `nntmux-roles`, plus node, MariaDB, Redis and Manticore exporters and the Pushgateway. The supervisor pushes database-derived `nntmux_*` metrics there each minute. Config: `docker/config/prometheus/prometheus.yml`; alert rules: `docker/monitoring/prometheus/rules/`; dashboards: `docker/monitoring/grafana/`.
+- Add a role to the `nntmux-roles` targets in the PR that moves it out of the `pending` profile.
+
+## API for NZBHydra2
+
+Add NNTmux to NZBHydra2 as a Newznab indexer at `/api/v1/api` with a user's API key. Check it with `/api/v1/api?t=caps`, then `t=search`, `t=tvsearch`, `t=movie` and `t=get`. The JSON API is under `/api/v2/`.
+
+## Remote verifier
+
+[`docker/worker/`](docker/worker/docker-compose.yml) runs only the `verify` role on another host. It uses the primary's MariaDB, publishes verified candidates through the primary's internal endpoint, and runs a small private Redis. It needs no NZB storage or Manticore.
+
+On the primary, `INTERNAL_BIND` and `INTERNAL_PORT` (default `127.0.0.1:8090`) publish Caddy's internal listener. It has no authentication, so bind it only to an interface the worker host reaches. On the worker host, from `docker/worker/`:
+
+1. Copy `config/app.env.example` to `config/app.env`. Fill in the database login, this host's NNTP account, `RELEASE_VERIFICATION_HOST`, a slot range no other host uses, and `RELEASE_VERIFICATION_PUBLISH_URL`.
+2. Copy the database CA to `config/ca.pem`.
+3. Load the primary's exact image: `ssh <primary> 'docker save nntmux/rust:local' | docker load`. A worker on older code must not run after a migration.
+4. `docker compose up -d`.
+
+Before the primary migrates verification tables, run `docker compose stop` here so the role finishes its active candidates (stop grace 900 s), then start it again on the new image.
 
 ## Troubleshooting
 
-| Problem                         | Solution                                                              |
-|---------------------------------|-----------------------------------------------------------------------|
-| Permission errors on storage/   | `just fix-permissions` (chowns project to your host UID)              |
-| `composer install` permission denied | `just fix-permissions`, then re-run `just composer-install`      |
-| `npm`/`ncu` EACCES on host (`package.json`) | `just fix-permissions` chowns to host UID, not container `sail` |
-| `fatal: detected dubious ownership` (git) | `just fix-permissions` registers `safe.directory` in the container |
-| Container `sail` UID ≠ host UID  | Set `WWWUSER=$(id -u)` / `WWWGROUP=$(id -g)` in `.env`, then `just rebuild` |
-| Host artisan/npm fails with `/var/www/html/...` paths | Stale `bootstrap/cache/config.php` from a container `config:cache`. Run `just cache-clear` and prefer `just optimize` (dev-safe) over `optimize-deploy` in development |
-| Port already in use             | Change `APP_PORT`, `FORWARD_DB_PORT`, etc. in `.env`                  |
-| Containers won't start          | `just logs` to inspect, or `just rebuild` to start fresh              |
-| Stale images after upgrade      | `just update` (pulls base images + rebuild + restart)                 |
-| Need a completely clean slate   | `just fresh` (destroys all volumes; add `FORCE=1` for non-interactive)|
-| CI / scripted teardown          | `just fresh FORCE=1` or `just nuke FORCE=1` to skip prompts           |
-| supervisorctl not connecting    | `just root-shell` then `supervisorctl status` to verify socket path   |
-
+- A failed `init` against a partly initialized database needs recovery, not a reset. Read `just docker logs` first.
+- A stale `docker/.deploy.lock`: check `docker/.deploy.log` and that no deploy is running, then remove the directory by hand.
+- Commands that need the bundled database (`mysql`, `backup`, `status`) fail on an external MariaDB. Use your own client.

@@ -6,8 +6,12 @@ async fn a_fresh_database_gets_the_whole_schema_and_a_second_run_does_nothing() 
     let Some(db) = TestDb::create_empty().await? else {
         return Ok(());
     };
+    assert_eq!(nntmux_db::migrate::pending(&db.pool).await?, [1, 2, 3]);
+    assert!(nntmux_db::migrate::is_empty(&db.pool).await?);
     let ran = nntmux_db::migrate::run(&db.pool).await?;
     assert_eq!(ran, [1, 2, 3]);
+    assert!(nntmux_db::migrate::pending(&db.pool).await?.is_empty());
+    assert!(!nntmux_db::migrate::is_empty(&db.pool).await?);
 
     let tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE()",

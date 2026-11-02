@@ -1,94 +1,28 @@
-# NNTmux docker/ stack lifecycle.
+# NNTmux docker/ stack lifecycle (Rust-native).
 # Run from repo root: just docker <recipe>  or: just -f docker/Justfile <recipe>
 set positional-arguments := true
 set shell := ["bash", "-cu"]
 # The running just binary, so nested calls work where just is not on PATH (noninteractive SSH).
 export JUST := just_executable()
 
-# module_directory() is this directory both standalone and when loaded as `mod docker` from the root.
-# Physical path, as `make -C docker` used: a symlinked justfile path must not change DC/COMPOSE_FILE.
 CURDIR := canonicalize(module_directory())
-REPO := parent_directory(CURDIR)
-
-# No dotenv-load: just searches parent directories when docker/.env is absent (fresh installs)
-# and would export the Laravel root .env into Compose. LOAD_ENV reads only this directory's .env.
-export COMPOSE_FILE := env("COMPOSE_FILE", "")
-export DC := env("DC", "")
-# Empty defaults let docker/.env supply these; LOAD_ENV applies the real defaults afterwards.
-export HELPER_IMAGE := env("HELPER_IMAGE", "")
-export BASE_IMAGE := env("BASE_IMAGE", "")
-export APP_IMAGE := env("APP_IMAGE", "")
-export DEPLOY_MIN_INTERVAL := env("DEPLOY_MIN_INTERVAL", "")
-export DEPLOY_DRAIN_TIMEOUT := env("DEPLOY_DRAIN_TIMEOUT", "")
-export DEPLOY_SCHEDULER_DRAIN_TIMEOUT := env("DEPLOY_SCHEDULER_DRAIN_TIMEOUT", "")
-export DEPLOY_HEALTH_TIMEOUT := env("DEPLOY_HEALTH_TIMEOUT", "")
-export DEPLOY_BY := env("DEPLOY_BY", "")
-export DEPLOY_TARGETS := env("DEPLOY_TARGETS", "")
-export DEPLOY_SYNC_REMOTE := env("DEPLOY_SYNC_REMOTE", "")
-export DEPLOY_GIT_REMOTE := env("DEPLOY_GIT_REMOTE", "")
-export DEPLOY_GIT_BRANCH := env("DEPLOY_GIT_BRANCH", "")
-export FORCE := env("FORCE", "")
-export s := env("s", "")
-export cmd := env("cmd", "")
-
-# Recipe prelude. Precedence: trailing KEY=VAL arguments, then the environment, then docker/.env,
-# then defaults. Like Make's former `-include .env`, only the keys these recipes use are read, and
-# the database credentials stay unexported shell variables (Compose parses .env itself).
+COMPOSE := CURDIR + "/bin/compose"
 ENV_FILE := CURDIR + "/.env"
-LOAD_ENV := '''preset=" "
-    TARGET_ARGS=""
+ENV_KEYS := "COMPOSE_FILE COMPOSE_OVERLAY_FILE DC APP_IMAGE DEPLOY_BY DEPLOY_SYNC_REMOTE DEPLOY_GIT_REMOTE DEPLOY_GIT_BRANCH DEPLOY_HEALTH_TIMEOUT DEPLOY_LOCK_DIR DEPLOY_LOG DEPLOY_CONFIG_STAMP DEPLOY_DATA_SERVICES DEPLOY_RECREATE_DATA APP_ENV_FILE APP_PORT DB_DATABASE DB_ROOTPASSWORD DRY_RUN s cmd"
+
+# Recipe prelude. Precedence: trailing KEY=VAL arguments, then the environment, then docker/.env.
+# docker/.env is read with the parser docker/bin/compose shares (Compose's quoting rules), never
+# sourced, and only the keys above are taken. ARGS holds the remaining arguments.
+LOAD_ENV := '''ARGS=()
     for arg in "$@"; do
-        if [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then export "$arg"; preset="$preset${BASH_REMATCH[1]} "; else TARGET_ARGS="${TARGET_ARGS:+$TARGET_ARGS }$arg"; fi
+        if [[ "$arg" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then export "$arg"; else ARGS+=("$arg"); fi
     done
-    for key in COMPOSE_FILE COMPOSE_OVERLAY_FILE DC DEPLOY_BY DEPLOY_TARGETS DEPLOY_SYNC_REMOTE DEPLOY_GIT_REMOTE DEPLOY_GIT_BRANCH DEPLOY_REPO DEPLOY_LOCK_DIR DEPLOY_LOG DEPLOY_STAMP DEPLOY_SUCCESS_TIME APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT; do
-        [ -z "${!key:-}" ] || preset="$preset$key "
-    done
-    interpolated=" "
-    # One `dotenv KEY FLAG VALUE` line per key present, every word shell-quoted, from the parser
-    # docker/bin/compose shares: Compose's rules (escapes in double quotes decoded, last one wins).
-    dotenv() {
-        # Compose interpolates unquoted and double-quoted values; this reader does not, nor does it
-        # read a value across lines (FLAG is then not "-"). Single-quoted values are literal in Compose.
-        case "$1" in
-            COMPOSE_FILE|COMPOSE_OVERLAY_FILE|DC|DEPLOY_SYNC_REMOTE|DEPLOY_GIT_REMOTE|DEPLOY_GIT_BRANCH|DEPLOY_REPO|DEPLOY_LOCK_DIR|DEPLOY_LOG|DEPLOY_STAMP|DEPLOY_SUCCESS_TIME|DB_DATABASE|DB_ROOTPASSWORD|HELPER_IMAGE|BASE_IMAGE|APP_IMAGE|WEB_IMAGE|HORIZON_IMAGE|SCHEDULER_IMAGE|INDEXER_IMAGE)
-                [ "$2" = - ] || interpolated="$interpolated$1 " ;;
-        esac
-        # Arguments and the environment win over the file.
-        case "$preset" in *" $1 "*) ;; *) printf -v "$1" '%s' "$3" ;; esac
-    }
+    dotenv() { [ -n "${!1+set}" ] || export "$1=$3"; }
     if [ -f "''' + ENV_FILE + '''" ]; then
-        dotenv_values=$(python3 -I "''' + CURDIR + '''/bin/compose_dotenv.py" "''' + ENV_FILE + '''" COMPOSE_FILE COMPOSE_OVERLAY_FILE DC DEPLOY_BY DEPLOY_TARGETS DEPLOY_SYNC_REMOTE DEPLOY_GIT_REMOTE DEPLOY_GIT_BRANCH DEPLOY_REPO DEPLOY_LOCK_DIR DEPLOY_LOG DEPLOY_STAMP DEPLOY_SUCCESS_TIME APP_PORT DB_DATABASE DB_ROOTPASSWORD HELPER_IMAGE BASE_IMAGE APP_IMAGE WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT DEPLOY_LEGACY_DRAIN_TIMEOUT) || exit 1
-        eval "$dotenv_values"
-        if [ "$interpolated" != " " ]; then
-            printf '%s\n' "docker/.env:${interpolated% } must be literal but uses \$ interpolation (or a multi-line value), which the Justfile and docker/bin/compose do not evaluate. Write the final value or single-quote it." >&2
-            exit 1
-        fi
-    fi
-    # Like the former Makefile, a DC line in docker/.env replaces the default Compose command.
-    : "${DC:=docker compose --project-directory ''' + quote(CURDIR) + '''}"
-    if [ -z "${COMPOSE_FILE:-}" ]; then
-        case "$preset" in
-            *" COMPOSE_FILE "*) COMPOSE_FILE="''' + CURDIR + '''/docker-compose.yml" ;;
-            *) COMPOSE_FILE="''' + CURDIR + '''/docker-compose.yml${COMPOSE_OVERLAY_FILE:+:$COMPOSE_OVERLAY_FILE}" ;;
-        esac
-    fi
-    : "${HELPER_IMAGE:=alpine:3.22.2}" "${BASE_IMAGE:=nntmux/base:local}" "${APP_IMAGE:=nntmux/app:local}"
-    : "${DEPLOY_MIN_INTERVAL:=900}" "${DEPLOY_DRAIN_TIMEOUT:=900}" "${DEPLOY_SCHEDULER_DRAIN_TIMEOUT:=1800}" "${DEPLOY_HEALTH_TIMEOUT:=240}"
-    export COMPOSE_FILE DC DEPLOY_BY DEPLOY_TARGETS HELPER_IMAGE BASE_IMAGE APP_IMAGE DEPLOY_MIN_INTERVAL DEPLOY_DRAIN_TIMEOUT DEPLOY_SCHEDULER_DRAIN_TIMEOUT DEPLOY_HEALTH_TIMEOUT
-    for key in WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE DEPLOY_LEGACY_DRAIN_TIMEOUT DEPLOY_SYNC_REMOTE DEPLOY_GIT_REMOTE DEPLOY_GIT_BRANCH DEPLOY_REPO DEPLOY_LOCK_DIR DEPLOY_LOG DEPLOY_STAMP DEPLOY_SUCCESS_TIME; do [ -z "${!key:-}" ] || export "$key"; done'''
+        eval "$(python3 -I "''' + CURDIR + '''/bin/compose_dotenv.py" "''' + ENV_FILE + '''" ''' + ENV_KEYS + ''')"
+    fi'''
 
-# Runs argv[2:] followed by argv[1] parsed with shell quoting (shlex): no eval, no word splitting of
-# the parsed words and no globbing, so `cmd='some:command --label="two words" *'` reaches Artisan as
-# `some:command`, `--label=two words`, `*`. An empty string adds no arguments.
-EXEC_SPLIT := '''import os, shlex, sys
-try:
-    extra = shlex.split(sys.argv[1])
-except ValueError as error:
-    sys.exit("Invalid quoting in cmd: " + str(error))
-argv = sys.argv[2:] + extra
-os.execvp(argv[0], argv)'''
-
-DATA_DIRS := "data/storage data/install data/mariadb data/redis data/manticore data/caddy/data data/caddy/config data/prometheus data/grafana logs/mariadb logs/manticore logs/caddy backups"
+DATA_DIRS := "data/storage data/mariadb data/redis data/manticore data/caddy/data data/caddy/config data/prometheus data/grafana logs/mariadb logs/manticore logs/caddy backups"
 
 # Show available stack recipes
 help *args:
@@ -98,281 +32,123 @@ help *args:
 env *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{LOAD_ENV}}
     "{{CURDIR}}/bin/generate-env"
-    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" perms "$@"
+    "$JUST" --justfile "{{module_file()}}" perms "$@"
 
 # Create bind-mount directories
 dirs *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{LOAD_ENV}}
     cd "{{CURDIR}}" && mkdir -p {{DATA_DIRS}}
 
 # Linux hosts: let the app containers' user (33:33) use their bind mounts
 perms *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    {{LOAD_ENV}}
-    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" dirs "$@"
+    "$JUST" --justfile "{{module_file()}}" dirs
     if [ "$(uname -s)" = Linux ]; then
-        docker run --rm -v "{{CURDIR}}:/stack" "$HELPER_IMAGE" sh -c \
-            "chown -R 33:33 /stack/data/storage /stack/data/install && chown $(id -u):33 /stack/config/app.env && chmod 0640 /stack/config/app.env"
+        docker run --rm -v "{{CURDIR}}:/stack" alpine:3.22.2 sh -c \
+            "chown -R 33:33 /stack/data/storage && chown $(id -u):33 /stack/config/app.env && chmod 0640 /stack/config/app.env"
     fi
 
-# Build only the cached base OS/PHP-extension image (nntmux/base:local)
-build-base *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{LOAD_ENV}}
-    docker build --target base -t "$BASE_IMAGE" -f "{{REPO}}/Dockerfile" "{{REPO}}"
-
-# Build dirty self-hosted service image targets; skipped when nothing runtime-relevant changed
+# Build the app image (APP_IMAGE, default nntmux/rust:local) from the repo root
 build *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    case "$preset" in *" DEPLOY_TARGETS "*) ;; *) [ -z "$TARGET_ARGS" ] || DEPLOY_TARGETS="$TARGET_ARGS" ;; esac
-    export DEPLOY_TARGETS
-    if [ "${APP_IMAGE:-nntmux/app:local}" != "nntmux/app:local" ]; then
-        [ -n "${WEB_IMAGE:-}" ] && [ "$WEB_IMAGE" != "nntmux/web:local" ] || WEB_IMAGE="$APP_IMAGE"
-        [ -n "${HORIZON_IMAGE:-}" ] && [ "$HORIZON_IMAGE" != "nntmux/horizon:local" ] || HORIZON_IMAGE="$APP_IMAGE"
-        [ -n "${SCHEDULER_IMAGE:-}" ] && [ "$SCHEDULER_IMAGE" != "nntmux/scheduler:local" ] || SCHEDULER_IMAGE="$APP_IMAGE"
-        [ -n "${INDEXER_IMAGE:-}" ] && [ "$INDEXER_IMAGE" != "nntmux/indexer:local" ] || INDEXER_IMAGE="$APP_IMAGE"
-    else
-        WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
-        HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
-        SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
-        INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
-    fi
-    export WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE
-    SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 \
-        REQUIRE_IMAGE="$WEB_IMAGE $HORIZON_IMAGE $SCHEDULER_IMAGE $INDEXER_IMAGE" \
-        DEPLOY_STAMP="{{CURDIR}}/.build.stamp" FORCE="$FORCE" DEPLOY_TARGETS="$DEPLOY_TARGETS" \
-        DEPLOY_MIN_INTERVAL=0 RECORD_DEPLOY_TIME=0 \
-        DEPLOY_CONFIG_COMMAND= CHECK_UNCHANGED_COMMAND= CHECK_HEALTH_COMMAND= \
-        DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run build -- \
-        "{{CURDIR}}/bin/build-images"
+    rev=$("{{CURDIR}}/bin/source-revision")
+    docker build --label "org.opencontainers.image.revision=$rev" -t "${APP_IMAGE:-nntmux/rust:local}" "{{CURDIR}}/.."
 
-# Build dirty self-hosted service images (or all when FORCE=1) without touching running containers
-build-stack *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" build "$@"
-
-# Internal: build dirty service image targets without acquiring a second guard
-build-images *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{LOAD_ENV}}
-    case "$preset" in *" DEPLOY_TARGETS "*) ;; *) [ -z "$TARGET_ARGS" ] || DEPLOY_TARGETS="$TARGET_ARGS" ;; esac
-    export DEPLOY_TARGETS
-    "{{CURDIR}}/bin/build-images"
-
-# Inspect per-service change detection, build targets, and selective rollout actions without deploying
-deploy-plan *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{LOAD_ENV}}
-    case "$preset" in *" DEPLOY_TARGETS "*) ;; *) [ -z "$TARGET_ARGS" ] || DEPLOY_TARGETS="$TARGET_ARGS" ;; esac
-    export DEPLOY_TARGETS
-    if [ ! -f "{{CURDIR}}/.env" ]; then
-        export DB_PASSWORD="${DB_PASSWORD:-preview}" DB_ROOTPASSWORD="${DB_ROOTPASSWORD:-preview}"
-    fi
-    DEPLOY_CONFIG_COMMAND="{{CURDIR}}/bin/deploy-current" "{{CURDIR}}/bin/deploy-plan" --explain
-
-# Smart selective deploy: skips non-runtime changes, builds/drains/recreates only affected (or requested) containers
+# Guarded rollout: lock, branch check, build, migrate, recreate changed services, wait healthy
 deploy *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    case "$preset" in *" DEPLOY_TARGETS "*) ;; *) [ -z "$TARGET_ARGS" ] || DEPLOY_TARGETS="$TARGET_ARGS" ;; esac
-    export DEPLOY_TARGETS
-    if [ "${DRY_RUN:-0}" = "1" ]; then
-        if [ ! -f "{{CURDIR}}/.env" ]; then
-            export DB_PASSWORD="${DB_PASSWORD:-preview}" DB_ROOTPASSWORD="${DB_ROOTPASSWORD:-preview}"
-        fi
-        DEPLOY_CONFIG_COMMAND="{{CURDIR}}/bin/deploy-current" "{{CURDIR}}/bin/deploy-plan" --explain
-        exit 0
-    fi
-    if [ "${APP_IMAGE:-nntmux/app:local}" != "nntmux/app:local" ]; then
-        [ -n "${WEB_IMAGE:-}" ] && [ "$WEB_IMAGE" != "nntmux/web:local" ] || WEB_IMAGE="$APP_IMAGE"
-        [ -n "${HORIZON_IMAGE:-}" ] && [ "$HORIZON_IMAGE" != "nntmux/horizon:local" ] || HORIZON_IMAGE="$APP_IMAGE"
-        [ -n "${SCHEDULER_IMAGE:-}" ] && [ "$SCHEDULER_IMAGE" != "nntmux/scheduler:local" ] || SCHEDULER_IMAGE="$APP_IMAGE"
-        [ -n "${INDEXER_IMAGE:-}" ] && [ "$INDEXER_IMAGE" != "nntmux/indexer:local" ] || INDEXER_IMAGE="$APP_IMAGE"
-    else
-        WEB_IMAGE="${WEB_IMAGE:-nntmux/web:local}"
-        HORIZON_IMAGE="${HORIZON_IMAGE:-nntmux/horizon:local}"
-        SCHEDULER_IMAGE="${SCHEDULER_IMAGE:-nntmux/scheduler:local}"
-        INDEXER_IMAGE="${INDEXER_IMAGE:-nntmux/indexer:local}"
-    fi
-    export WEB_IMAGE HORIZON_IMAGE SCHEDULER_IMAGE INDEXER_IMAGE
-    SKIP_IF_UNCHANGED=1 STAMP_ON_SUCCESS=1 RECORD_DEPLOY_TIME=1 \
-        REQUIRE_IMAGE="$WEB_IMAGE $HORIZON_IMAGE $SCHEDULER_IMAGE $INDEXER_IMAGE" \
-        DEPLOY_CONFIG_COMMAND="{{CURDIR}}/bin/deploy-current" \
-        CHECK_UNCHANGED_COMMAND="{{CURDIR}}/bin/deploy-current" \
-        CHECK_HEALTH_COMMAND="{{CURDIR}}/bin/deploy-current" \
-        DEPLOY_MIN_INTERVAL="$DEPLOY_MIN_INTERVAL" \
-        DEPLOY_DRAIN_TIMEOUT="$DEPLOY_DRAIN_TIMEOUT" \
-        DEPLOY_SCHEDULER_DRAIN_TIMEOUT="$DEPLOY_SCHEDULER_DRAIN_TIMEOUT" \
-        DEPLOY_HEALTH_TIMEOUT="$DEPLOY_HEALTH_TIMEOUT" \
-        APP_IMAGE="$APP_IMAGE" WEB_IMAGE="$WEB_IMAGE" HORIZON_IMAGE="$HORIZON_IMAGE" \
-        SCHEDULER_IMAGE="$SCHEDULER_IMAGE" INDEXER_IMAGE="$INDEXER_IMAGE" \
-        FORCE="$FORCE" DEPLOY_TARGETS="$DEPLOY_TARGETS" \
-        DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run deploy -- \
-        "{{CURDIR}}/bin/deploy-app"
+    exec "{{CURDIR}}/bin/deploy" ${ARGS[@]+"${ARGS[@]}"}
 
-# Deploy only the web service
-deploy-web *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy web "$@"
-
-# Deploy only the Horizon queue worker service
-deploy-horizon *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy horizon "$@"
-
-# Deploy only the scheduler service (with cooperative drain)
-deploy-scheduler *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy scheduler "$@"
-
-# Deploy only the indexer service (with cooperative tmux:drain)
-deploy-indexer *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy indexer "$@"
-
-# Deploy only the Caddy reverse proxy service
-deploy-proxy *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy proxy "$@"
-
-# Deploy only the monitoring services (Prometheus, Grafana, Pushgateway, exporters)
-deploy-monitoring *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy monitoring "$@"
-
-# Deploy only the Redis service (drains writers first)
-deploy-redis *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy redis "$@"
-
-# Deploy only the Manticore search service (drains writers first)
-deploy-manticore *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy manticore "$@"
-
-# Deploy only the MariaDB database service (drains writers and migrates)
-deploy-mariadb *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy mariadb "$@"
-
-# Deploy only the Mailpit service
-deploy-mailpit *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy mailpit "$@"
-
-# Deploy only the Grafana service
-deploy-grafana *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy grafana "$@"
-
-# Deploy only the Prometheus service
-deploy-prometheus *args:
-    @"$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" deploy prometheus "$@"
-
-# First-time install: build, migrate+seed, indexes, groups, tuning, predb seed, start
-init *args:
+# What deploy would do, without building or changing anything
+deploy-plan *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" env "$@"
-    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" dirs "$@"
-    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" build "$@"
-    "{{CURDIR}}/bin/compose" up -d --wait mariadb redis manticore mailpit
-    if [ -f "{{CURDIR}}/data/install/install.lock" ]; then
-        echo "install.lock present; skipping nntmux:deploy-init"
-    else
-        "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan nntmux:deploy-init --no-interaction
-    fi
-    "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan monitoring:install --sail --no-interaction
-    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" seed-db "$@"
-    "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan predb:import-feed --pages=20 || true
-    "{{CURDIR}}/bin/compose" up -d
+    DRY_RUN=1 exec "{{CURDIR}}/bin/deploy" ${ARGS[@]+"${ARGS[@]}"}
+
+# First-time install on an empty database: env, build, nntmux-ctl init, seed, start
+init *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    "$JUST" --justfile "{{module_file()}}" env
+    {{LOAD_ENV}}
+    "$JUST" --justfile "{{module_file()}}" build
+    "{{COMPOSE}}" up -d --wait mariadb redis manticore mailpit
+    "{{COMPOSE}}" run --rm --no-deps migrate nntmux-ctl init
+    "$JUST" --justfile "{{module_file()}}" seed-db
+    "{{COMPOSE}}" up -d --wait
     echo "NNTmux: http://localhost:${APP_PORT:-8080}  (admin password: grep ADMIN_PASS docker/config/app.env)"
 
-# Apply config/seed/groups.sql + tuning.sql and clear the settings cache
+# Apply config/seed/groups.sql + tuning.sql to the bundled MariaDB
 seed-db *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "{{CURDIR}}/bin/compose" exec -T mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE}" < "{{CURDIR}}/config/seed/groups.sql"
-    "{{CURDIR}}/bin/compose" exec -T mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE}" < "{{CURDIR}}/config/seed/tuning.sql"
-    "{{CURDIR}}/bin/compose" run --rm --no-deps web php artisan cache:clear
+    "{{COMPOSE}}" exec -T mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE:-nntmux}" < "{{CURDIR}}/config/seed/groups.sql"
+    "{{COMPOSE}}" exec -T mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE:-nntmux}" < "{{CURDIR}}/config/seed/tuning.sql"
 
-# Re-seed groups/tuning and restart the indexer to pick it up
-seed *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{LOAD_ENV}}
-    "$JUST" --justfile "{{module_file()}}" --working-directory "{{CURDIR}}" seed-db "$@"
-    "{{CURDIR}}/bin/compose" restart indexer
-
-# First bringup, or safe guarded deploy when app containers already exist
+# First start of a new stack. An existing stack changes only through the guarded deploy.
 up *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    DEPLOY_BY="$DEPLOY_BY" exec "{{CURDIR}}/bin/deploy-guard" run up -- "{{CURDIR}}/bin/up-app"
+    # `up` recreates whatever changed, without the deploy's lock, preflight or writer quiesce.
+    if [ -n "$("{{COMPOSE}}" ps -aq)" ]; then
+        echo "The stack already has containers. Roll changes out with 'just deploy', or use" >&2
+        echo "'just restart' to restart services as they are." >&2
+        exit 1
+    fi
+    "{{COMPOSE}}" up -d --wait ${ARGS[@]+"${ARGS[@]}"}
 
-# Stop the stack (tmux session stops cleanly)
+# Stop the stack. Workers drain in-flight work within their stop grace.
 down *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "{{CURDIR}}/bin/compose" down
+    "{{COMPOSE}}" down
 
-# Restart app services (s=service for one)
+# Restart services (s=service for one; workers drain first)
 restart *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    if [ -n "${s:-}" ]; then
-        "{{CURDIR}}/bin/compose" restart $s
-    else
-        "{{CURDIR}}/bin/compose" restart web horizon scheduler indexer
-    fi
+    "{{COMPOSE}}" restart ${s:-}
 
 # Service status / health
 ps *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "{{CURDIR}}/bin/compose" ps
+    "{{COMPOSE}}" ps
 
 # Follow logs (s=service)
 logs *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "{{CURDIR}}/bin/compose" logs -f --tail=200 ${s:-}
+    "{{COMPOSE}}" logs -f --tail=200 ${s:-}
 
-# Attach to the indexer tmux session (detach: Ctrl-a d)
-tmux *args:
+# Run nntmux-ctl in a one-off container: just -f docker/Justfile ctl cmd="search inspect"
+ctl *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "{{CURDIR}}/bin/compose" exec indexer tmux attach -t nntmux
+    exec python3 -I -c 'import os, shlex, sys; argv = sys.argv[2:] + shlex.split(sys.argv[1]); os.execvp(argv[0], argv)' \
+        "${cmd:-}" "{{COMPOSE}}" run --rm --no-deps migrate nntmux-ctl
 
-# Shell in the web container
-shell *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{LOAD_ENV}}
-    "{{CURDIR}}/bin/compose" exec web bash
-
-# Run artisan: just -f docker/Justfile artisan cmd="predb:import-feed --dry-run"
-artisan *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{LOAD_ENV}}
-    exec python3 -I -c '{{EXEC_SPLIT}}' "${cmd:-}" "{{CURDIR}}/bin/compose" exec web php artisan
-
-# MariaDB client as root
+# MariaDB client as root (bundled MariaDB only)
 mysql *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
-    "{{CURDIR}}/bin/compose" exec mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE}"
+    "{{COMPOSE}}" exec mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE:-nntmux}"
 
-# Dump MariaDB to backups/ (keeps 7)
+# Dump the bundled MariaDB to backups/ (keeps 7)
 backup *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -383,7 +159,7 @@ backup *args:
     out="{{CURDIR}}/backups/nntmux-$(date +%Y%m%d-%H%M%S).sql.gz"
     tmp="$out.partial"
     trap 'rm -f "$tmp"' EXIT
-    "{{CURDIR}}/bin/compose" exec -T mariadb mariadb-dump -uroot -p"${DB_ROOTPASSWORD}" --single-transaction --quick --routines "${DB_DATABASE}" \
+    "{{COMPOSE}}" exec -T mariadb mariadb-dump -uroot -p"${DB_ROOTPASSWORD}" --single-transaction --quick --routines "${DB_DATABASE:-nntmux}" \
         | gzip > "$tmp"
     mv "$tmp" "$out"
     ls -1t "{{CURDIR}}/backups"/nntmux-*.sql.gz | tail -n +8 | xargs -r rm --
@@ -397,4 +173,4 @@ status *args:
     echo "SELECT COUNT(*) active_groups, SUM(last_record>0) scanned FROM usenet_groups WHERE active=1; \
     SELECT (SELECT COUNT(*) FROM collections) collections, (SELECT COUNT(*) FROM binaries) binaries, (SELECT COUNT(*) FROM releases) releases; \
     SELECT source, COUNT(*) pres FROM predb GROUP BY source ORDER BY 2 DESC LIMIT 10;" \
-        | "{{CURDIR}}/bin/compose" exec -T mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE}" -t
+        | "{{COMPOSE}}" exec -T mariadb mariadb -uroot -p"${DB_ROOTPASSWORD}" "${DB_DATABASE:-nntmux}" -t

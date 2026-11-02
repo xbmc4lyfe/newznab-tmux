@@ -14,8 +14,7 @@ from compose_dotenv import parse  # noqa: E402
 # Keys this wrapper and the Justfile's LOAD_ENV read literally. Compose interpolates unquoted and
 # double-quoted dotenv values (`${REGISTRY}/app:${TAG}`) but neither parser can, so a `$` there would be
 # exported unexpanded and shadow Compose's own resolution. Single-quoted values are literal in Compose.
-LITERAL_KEYS = ("DC", "COMPOSE_FILE", "COMPOSE_OVERLAY_FILE", "HELPER_IMAGE", "BASE_IMAGE", "APP_IMAGE",
-                "WEB_IMAGE", "HORIZON_IMAGE", "SCHEDULER_IMAGE", "INDEXER_IMAGE")
+LITERAL_KEYS = ("DC", "COMPOSE_FILE", "COMPOSE_OVERLAY_FILE", "APP_IMAGE")
 parsed = parse(stack / ".env")
 file_env = {key: value for key, (value, _) in parsed.items()}
 # The last assignment wins, so only it can be interpolated (or span lines, which is not read whole).
@@ -36,17 +35,6 @@ if "COMPOSE_FILE" not in os.environ:
     os.environ["COMPOSE_FILE"] = cf
 elif not os.environ["COMPOSE_FILE"]:
     os.environ["COMPOSE_FILE"] = str(stack / "docker-compose.yml")
-
-# An explicitly empty variable (`WEB_IMAGE=` as a just argument) overrides docker/.env: it means
-# "use the default", exactly as Compose reads `${WEB_IMAGE:-default}`.
-app_img = (os.environ["APP_IMAGE"] if "APP_IMAGE" in os.environ else file_env.get("APP_IMAGE", "")) or "nntmux/app:local"
-if app_img != "nntmux/app:local":
-    for role in ("web", "horizon", "scheduler", "indexer"):
-        key = f"{role.upper()}_IMAGE"
-        default_img = f"nntmux/{role}:local"
-        val = os.environ[key] if key in os.environ else file_env.get(key, "")
-        if not val or val == default_img:
-            os.environ[key] = app_img
 
 try:
     command = shlex.split(os.environ.get("DC", ""))
