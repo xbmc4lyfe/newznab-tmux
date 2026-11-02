@@ -1,5 +1,6 @@
 //! The per-worker download service against a scripted NNTP server.
 
+#[allow(dead_code)]
 mod support;
 
 use md5::{Digest, Md5};

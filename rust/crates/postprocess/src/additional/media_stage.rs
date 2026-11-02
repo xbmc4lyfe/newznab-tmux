@@ -66,12 +66,28 @@ impl StageSettings {
 /// The media steps the stage hands its files to.
 #[async_trait]
 pub trait MediaSteps: Send + Sync {
-    /// `getSample`.
-    async fn sample(&self, file: &Path, tmp: &Path, guid: &str, hints: &MediaSourceHints) -> bool;
+    /// `getSample`; without hints the file is taken as whole.
+    async fn sample(
+        &self,
+        file: &Path,
+        tmp: &Path,
+        guid: &str,
+        hints: Option<&MediaSourceHints>,
+    ) -> bool;
     /// `getMediaInfo`.
     async fn media_info(&self, file: &Path, release_id: i64) -> bool;
     /// `getVideo`.
-    async fn video(&self, file: &Path, tmp: &Path, guid: &str, hints: &MediaSourceHints) -> bool;
+    async fn video(
+        &self,
+        file: &Path,
+        tmp: &Path,
+        guid: &str,
+        hints: Option<&MediaSourceHints>,
+    ) -> bool;
+    /// `isUsableImage`.
+    async fn usable_image(&self, file: &Path) -> bool;
+    /// `getJPGSample`.
+    async fn jpg_sample(&self, file: &Path, guid: &str) -> bool;
 }
 
 /// The real media steps: previews, and media info into the database.
@@ -84,8 +100,14 @@ pub struct ReleaseMedia<'a> {
 
 #[async_trait]
 impl MediaSteps for ReleaseMedia<'_> {
-    async fn sample(&self, file: &Path, tmp: &Path, guid: &str, hints: &MediaSourceHints) -> bool {
-        self.previews.get_sample(file, tmp, guid, Some(hints)).await
+    async fn sample(
+        &self,
+        file: &Path,
+        tmp: &Path,
+        guid: &str,
+        hints: Option<&MediaSourceHints>,
+    ) -> bool {
+        self.previews.get_sample(file, tmp, guid, hints).await
     }
 
     async fn media_info(&self, file: &Path, release_id: i64) -> bool {
@@ -93,8 +115,22 @@ impl MediaSteps for ReleaseMedia<'_> {
             .await
     }
 
-    async fn video(&self, _: &Path, _: &Path, _: &str, _: &MediaSourceHints) -> bool {
+    async fn video(&self, _: &Path, _: &Path, _: &str, _: Option<&MediaSourceHints>) -> bool {
         self.previews.get_video()
+    }
+
+    async fn usable_image(&self, file: &Path) -> bool {
+        self.previews.is_usable_image(file).await
+    }
+
+    async fn jpg_sample(&self, file: &Path, guid: &str) -> bool {
+        match self.previews.get_jpg_sample(self.pool, file, guid).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                eprintln!("could not save the sample picture of {guid}: {error:#}");
+                false
+            }
+        }
     }
 }
 
@@ -235,7 +271,7 @@ impl MediaSourceStage<'_> {
             let tmp = context.tmp_path.clone();
             if self
                 .media
-                .sample(&mid_path, &tmp, &guid, &MediaSourceHints::mid(0))
+                .sample(&mid_path, &tmp, &guid, Some(&MediaSourceHints::mid(0)))
                 .await
             {
                 context.found_sample = true;
@@ -280,7 +316,7 @@ impl MediaSourceStage<'_> {
     ) {
         let guid = context.release.guid.clone();
         let tmp = context.tmp_path.clone();
-        if !context.found_sample && self.media.sample(path, &tmp, &guid, hints).await {
+        if !context.found_sample && self.media.sample(path, &tmp, &guid, Some(hints)).await {
             context.found_sample = true;
             events.push(StageEvent::SampleCreated);
         }
@@ -289,7 +325,10 @@ impl MediaSourceStage<'_> {
             events.push(StageEvent::MediaInfoAdded);
         }
         // Only a sample makes a fair clip; a feature's first seconds are usually logos.
-        if is_sample && !context.found_video && self.media.video(path, &tmp, &guid, hints).await {
+        if is_sample
+            && !context.found_video
+            && self.media.video(path, &tmp, &guid, Some(hints)).await
+        {
             context.found_video = true;
             events.push(StageEvent::VideoCreated);
         }

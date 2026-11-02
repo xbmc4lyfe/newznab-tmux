@@ -18,9 +18,7 @@ use nntmux_postprocess::archive_info::ArchiveInfo;
 use nntmux_postprocess::media::container::{MediaSourceHints, SourcePosition};
 use nntmux_postprocess::media::slicer::{self, SlicerSettings};
 use sha2::{Digest, Sha256};
-use support::{serve, service};
-
-const SEGMENT: usize = 20_000;
+use support::{SEGMENT, part, post, serve, service};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(
@@ -29,53 +27,6 @@ fn fixture(name: &str) -> Vec<u8> {
             .join(name),
     )
     .unwrap()
-}
-
-/// One article of a multi-part yEnc post.
-fn part(name: &str, file: &[u8], number: usize) -> Vec<u8> {
-    let begin = (number - 1) * SEGMENT;
-    let data = &file[begin..file.len().min(begin + SEGMENT)];
-    let single = nntmux_yenc::encode(data, name.as_bytes(), 128, false).unwrap();
-    let body_start = single.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
-    let body_end = single.windows(7).rposition(|w| w == b"\r\n=yend").unwrap();
-    let mut article = format!(
-        "=ybegin part={number} line=128 size={} name={name}\r\n=ypart begin={} end={}\r\n",
-        file.len(),
-        begin + 1,
-        begin + data.len()
-    )
-    .into_bytes();
-    article.extend_from_slice(&single[body_start..body_end]);
-    article.extend_from_slice(
-        format!(
-            "\r\n=yend size={} part={number} pcrc32={}",
-            data.len(),
-            nntmux_yenc::crc32(data)
-        )
-        .as_bytes(),
-    );
-    article
-}
-
-/// A posted file's NZB entry and its articles, as `prefix-N@x`.
-fn post(prefix: &'static str, name: &str, file: &[u8]) -> (NzbFile, Vec<(&'static str, Vec<u8>)>) {
-    let count = file.len().div_ceil(SEGMENT);
-    let ids: Vec<&'static str> = (1..=count)
-        .map(|number| &*Box::leak(format!("{prefix}-{number}@x").into_boxed_str()))
-        .collect();
-    let articles = ids
-        .iter()
-        .enumerate()
-        .map(|(index, id)| (*id, part(name, file, index + 1)))
-        .collect();
-    let nzb = NzbFile {
-        title: format!("\"{name}\" yEnc (1/{count})"),
-        segments: ids.iter().map(|id| (*id).to_owned()).collect(),
-        size: (file.len() as f64 * 1.05) as i64,
-        filecount: 1,
-        firstsegment: true,
-    };
-    (nzb, articles)
 }
 
 #[derive(Clone, Debug)]
@@ -113,8 +64,14 @@ impl Recorder {
 
 #[async_trait]
 impl MediaSteps for Recorder {
-    async fn sample(&self, file: &Path, _: &Path, _: &str, hints: &MediaSourceHints) -> bool {
-        let number = self.record("sample", file, Some(hints));
+    async fn sample(
+        &self,
+        file: &Path,
+        _: &Path,
+        _: &str,
+        hints: Option<&MediaSourceHints>,
+    ) -> bool {
+        let number = self.record("sample", file, hints);
         self.succeed_from.is_some_and(|from| number >= from)
     }
 
@@ -123,8 +80,22 @@ impl MediaSteps for Recorder {
         false
     }
 
-    async fn video(&self, file: &Path, _: &Path, _: &str, hints: &MediaSourceHints) -> bool {
-        self.record("video", file, Some(hints));
+    async fn video(
+        &self,
+        file: &Path,
+        _: &Path,
+        _: &str,
+        hints: Option<&MediaSourceHints>,
+    ) -> bool {
+        self.record("video", file, hints);
+        false
+    }
+
+    async fn usable_image(&self, _: &Path) -> bool {
+        false
+    }
+
+    async fn jpg_sample(&self, _: &Path, _: &str) -> bool {
         false
     }
 }

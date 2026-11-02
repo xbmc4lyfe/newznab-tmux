@@ -386,6 +386,39 @@ impl ReleaseFiles {
         }
     }
 
+    /// Deletes the release only while it is still the publication this attempt read: same row,
+    /// same claim and the same stored NZB. The row stays locked from the check through the
+    /// deletion, so a replacement installed meanwhile is never removed. False when the release
+    /// changed (or is already gone) and nothing was deleted.
+    pub async fn delete_release_if_current(&mut self, context: &ReleaseContext) -> Result<bool> {
+        let Some(digest) = context.nzb_source_digest.as_deref() else {
+            return Ok(false);
+        };
+        let mut attempt = 0;
+        let deleted = loop {
+            attempt += 1;
+            let mut tx = self.pool.begin().await?;
+            let result = match delete_locked(&mut tx, context, digest).await {
+                Ok(deleted) => tx.commit().await.map(|()| deleted).map_err(Into::into),
+                Err(failure) => Err(failure),
+            };
+            match result {
+                Err(failure) if attempt < 3 && nntmux_verify::txn::is_lock_error(&failure) => {
+                    tokio::time::sleep(nntmux_verify::txn::lock_backoff(attempt)).await;
+                }
+                other => break other?,
+            }
+        };
+        if deleted {
+            let release = &context.release;
+            self.sync.discard(release.id);
+            if let Err(failure) = nntmux_verify::releases::delete_release_files(&release.guid) {
+                eprintln!("release {}: file cleanup failed: {failure:#}", release.id);
+            }
+        }
+        Ok(deleted)
+    }
+
     fn image_exists(&self, directory: &str, basename: &str) -> bool {
         let directory = self.settings.covers_path.join(directory);
         let mut extensions = vec![self.settings.image_extension.as_str()];
@@ -990,6 +1023,58 @@ impl SecondsOnly for NaiveDateTime {
         use chrono::Timelike;
         self.with_nanosecond(0).unwrap_or(self)
     }
+}
+
+/// The guarded deletion, inside the caller's transaction: the row is locked first, then checked
+/// against the attempt's identity, claim and NZB digest, then removed with its source.
+async fn delete_locked(
+    conn: &mut MySqlConnection,
+    context: &ReleaseContext,
+    digest: &str,
+) -> Result<bool> {
+    let release = &context.release;
+    let row =
+        sqlx::query("SELECT guid, additional_pp_claim_token FROM releases WHERE id = ? FOR UPDATE")
+            .bind(release.id)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let guid: Option<String> = row.try_get("guid")?;
+    let token: Option<String> = row.try_get("additional_pp_claim_token")?;
+    if guid.as_deref() != Some(release.guid.as_str())
+        || token != context.par2_evidence_snapshot.claim_token
+    {
+        return Ok(false);
+    }
+    let current = nntmux_verify::nzb::read(&mut *conn, &release.guid).await?;
+    if current
+        .as_deref()
+        .map(nntmux_verify::nzb::digest)
+        .as_deref()
+        != Some(digest)
+    {
+        return Ok(false);
+    }
+    sqlx::query("DELETE FROM release_nzb_contents WHERE guid = ?")
+        .bind(&release.guid)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM release_fingerprint_jobs WHERE release_id = ?")
+        .bind(release.id)
+        .execute(&mut *conn)
+        .await?;
+    nntmux_verify::releases::request_search_delete(conn, release.id).await?;
+    sqlx::query("DELETE FROM user_downloads WHERE releases_id = ?")
+        .bind(release.id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query("DELETE FROM releases WHERE id = ?")
+        .bind(release.id)
+        .execute(&mut *conn)
+        .await?;
+    Ok(true)
 }
 
 fn push_value(query: &mut QueryBuilder<MySql>, value: &Value) {
