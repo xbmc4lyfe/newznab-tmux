@@ -60,6 +60,41 @@ pub async fn run(pool: &MySqlPool) -> Result<Vec<u32>> {
     ran
 }
 
+/// Whether the database has no tables yet, apart from `rust_migrations`: a new install, which
+/// no worker on any host can be using.
+pub async fn is_empty(pool: &MySqlPool) -> Result<bool> {
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = DATABASE() AND table_name <> 'rust_migrations'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(tables == 0)
+}
+
+/// The migrations `run` would apply, without changing anything. A database with no
+/// `rust_migrations` table reports every migration, so a deployment treats it as a schema change.
+pub async fn pending(pool: &MySqlPool) -> Result<Vec<u32>> {
+    let recorded: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = DATABASE() AND table_name = 'rust_migrations'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let applied: Vec<u32> = if recorded == 0 {
+        Vec::new()
+    } else {
+        sqlx::query_scalar("SELECT version FROM rust_migrations")
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(MIGRATIONS
+        .iter()
+        .map(|migration| migration.version)
+        .filter(|version| !applied.contains(version))
+        .collect())
+}
+
 async fn run_locked(connection: &mut MySqlConnection) -> Result<Vec<u32>> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS rust_migrations (

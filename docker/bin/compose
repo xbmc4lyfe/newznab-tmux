@@ -14,8 +14,7 @@ from compose_dotenv import parse  # noqa: E402
 # Keys this wrapper and the Justfile's LOAD_ENV read literally. Compose interpolates unquoted and
 # double-quoted dotenv values (`${REGISTRY}/app:${TAG}`) but neither parser can, so a `$` there would be
 # exported unexpanded and shadow Compose's own resolution. Single-quoted values are literal in Compose.
-LITERAL_KEYS = ("DC", "COMPOSE_FILE", "COMPOSE_OVERLAY_FILE", "HELPER_IMAGE", "BASE_IMAGE", "APP_IMAGE",
-                "WEB_IMAGE", "HORIZON_IMAGE", "SCHEDULER_IMAGE", "INDEXER_IMAGE")
+LITERAL_KEYS = ("DC", "COMPOSE_FILE", "COMPOSE_OVERLAY_FILE", "APP_IMAGE")
 parsed = parse(stack / ".env")
 file_env = {key: value for key, (value, _) in parsed.items()}
 # The last assignment wins, so only it can be interpolated (or span lines, which is not read whole).
@@ -37,21 +36,36 @@ if "COMPOSE_FILE" not in os.environ:
 elif not os.environ["COMPOSE_FILE"]:
     os.environ["COMPOSE_FILE"] = str(stack / "docker-compose.yml")
 
-# An explicitly empty variable (`WEB_IMAGE=` as a just argument) overrides docker/.env: it means
-# "use the default", exactly as Compose reads `${WEB_IMAGE:-default}`.
-app_img = (os.environ["APP_IMAGE"] if "APP_IMAGE" in os.environ else file_env.get("APP_IMAGE", "")) or "nntmux/app:local"
-if app_img != "nntmux/app:local":
-    for role in ("web", "horizon", "scheduler", "indexer"):
-        key = f"{role.upper()}_IMAGE"
-        default_img = f"nntmux/{role}:local"
-        val = os.environ[key] if key in os.environ else file_env.get(key, "")
-        if not val or val == default_img:
-            os.environ[key] = app_img
-
 try:
     command = shlex.split(os.environ.get("DC", ""))
 except ValueError:
     sys.exit("Invalid quoting in DC Compose command.")
 if not command:
     command = ["docker", "compose", "--project-directory", str(stack)]
+
+# The deploy also runs plain `docker` (build, ps, inspect, the barrier), which talks to the daemon
+# DOCKER_HOST/DOCKER_CONTEXT select. A DC that picks another daemon itself would split the two, so
+# daemon selection must come from that shared environment.
+DAEMON_FLAGS = ("-H", "--host", "-c", "--context", "--config", "--tls", "--tlsverify", "--tlscacert",
+                "--tlscert", "--tlskey")
+
+
+def selects_daemon(arg: str) -> bool:
+    return any(arg == flag or arg.startswith(flag + "=") or (len(flag) == 2 and arg.startswith(flag) and
+                                                            len(arg) > 2 and not arg.startswith("--"))
+               for flag in DAEMON_FLAGS)
+
+
+program = os.path.basename(command[0])
+if program == "docker":
+    # Global options precede the subcommand. Only debug and log options are harmless there.
+    for arg in command[1:]:
+        if not arg.startswith("-"):
+            break
+        if arg not in ("-D", "--debug") and not arg.startswith(("-l", "--log-level")):
+            sys.exit(f"DC passes the Docker option {arg!r} before compose. Select the daemon with "
+                     f"DOCKER_HOST or DOCKER_CONTEXT instead, so every docker call reaches the same one.")
+if any(selects_daemon(arg) for arg in command[1:]):
+    sys.exit("DC passes a daemon-selecting option (-H/--host, -c/--context, --config or TLS). Select the "
+             "daemon with DOCKER_HOST or DOCKER_CONTEXT instead, so every docker call reaches the same one.")
 os.execvp(command[0], [*command, *sys.argv[1:]])
