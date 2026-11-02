@@ -96,7 +96,10 @@ async fn run_one(
 ) -> Result<ReleaseResult> {
     if reset {
         sqlx::query(
-            "UPDATE releases SET passwordstatus = -1, haspreview = -1, archive_retry_at = NULL, \
+            // An unidentifiable release (`passwordstatus = 3`) keeps its status, as in
+            // `nntmux:resetpp`, so it stays out of the archive queue and search results.
+            "UPDATE releases SET passwordstatus = IF(passwordstatus = 3, 3, -1), haspreview = -1, \
+             archive_retry_at = NULL, \
              jpgstatus = 0, videostatus = 0, nfostatus = -1 WHERE id = ?",
         )
         .bind(id)
