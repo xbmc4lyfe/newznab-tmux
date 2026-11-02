@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish bounded benchmark summaries for the current master build, never PR artifacts.
+"""Publish bounded benchmark summaries for the current rust-native build, never PR artifacts.
 
 CI reporting only; standard library, no application boot or artifact extraction.
 """
@@ -160,7 +160,7 @@ def select_run(runs, sha):
     if not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{40}', sha):
         return None
     eligible = [run for run in runs if isinstance(run, dict) and run.get('head_sha') == sha and run.get('event') == 'push'
-                and run.get('head_branch') == 'master'
+                and run.get('head_branch') == 'rust-native'
                 and isinstance(run.get('head_repository'), dict)
                 and run['head_repository'].get('full_name') == REPOSITORY]
     return max(eligible, key=lambda run: int(run['id']), default=None)
@@ -702,13 +702,13 @@ def complete_cpp_comparison(summary):
 def last_valid_comparison(fetch=api, archive_download=download):
     """Find a complete historical C++ matrix without replacing current-build state.
 
-    Search is bounded to the newest 20 trusted master push runs. In-progress,
+    Search is bounded to the newest 20 trusted rust-native push runs. In-progress,
     failed, cancelled or partial attempts are never replaced by an older attempt
     of that same run. Both architecture summaries must belong to its latest attempt.
     """
-    result = dict(status='No complete comparison in newest 20 trusted master push runs', results=[], unavailable_runs=0, expired_artifacts=0, searched_runs=0)
+    result = dict(status='No complete comparison in newest 20 trusted rust-native push runs', results=[], unavailable_runs=0, expired_artifacts=0, searched_runs=0)
     try:
-        runs = fetch('actions/workflows/yenc-performance.yml/runs?branch=master&event=push&per_page=20')['workflow_runs']
+        runs = fetch('actions/workflows/yenc-performance.yml/runs?branch=rust-native&event=push&per_page=20')['workflow_runs']
         trusted = [run for run in runs if isinstance(run, dict) and select_run([run], run.get('head_sha')) is not None]
         for run in sorted(trusted, key=lambda row: int(row['id']), reverse=True)[:20]:
             if run.get('status') != 'completed':
@@ -775,7 +775,7 @@ def collect_dispatches(sha, fetch, archive_download):
         if not expected:
             continue
         try:
-            candidates = fetch(f'actions/workflows/{workflow}/runs?branch=master&event=workflow_dispatch&head_sha={sha}&per_page=20')['workflow_runs']
+            candidates = fetch(f'actions/workflows/{workflow}/runs?branch=rust-native&event=workflow_dispatch&head_sha={sha}&per_page=20')['workflow_runs']
             trusted = [r for r in candidates if isinstance(r, dict) and r.get('event') == 'workflow_dispatch'
                 and type(r.get('id')) is int and r['id'] > 0 and type(r.get('run_attempt')) is int and r['run_attempt'] > 0
                 and select_run([dict(r, event='push')], sha) is not None]
@@ -823,7 +823,7 @@ def collect(sha, root, fetch=api, archive_download=download):
                   rust_exports=rust_interfaces(root))
     for workflow, expected in WORKFLOWS.items():
         try:
-            runs = fetch(f'actions/workflows/{workflow}/runs?branch=master&event=push&head_sha={sha}&per_page=100')['workflow_runs']
+            runs = fetch(f'actions/workflows/{workflow}/runs?branch=rust-native&event=push&head_sha={sha}&per_page=100')['workflow_runs']
             run = select_run(runs, sha)
             state = (run.get('conclusion') or run['status']) if run else 'Not run for this commit'
         except (OSError, ValueError, KeyError, TypeError):
@@ -1012,16 +1012,16 @@ def render(report):
     body = ['<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
             '<title>NNTmux Rust benchmarks</title><style>body{font:16px system-ui;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#182332}table{border-collapse:collapse;width:100%;margin:1rem 0}th,td{text-align:left;padding:.55rem;border-bottom:1px solid #ccd5dd}code{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#175eaa}details{margin:1rem 0}</style>',
             '<h1>NNTmux Rust benchmarks</h1>',
-            f'<p>Master build <code>{escape(report["head_sha"])}</code>. Updated {escape(report["generated_at"])}. <a href="results.json">Machine-readable results</a>.</p>',
+            f'<p>rust-native build <code>{escape(report["head_sha"])}</code>. Updated {escape(report["generated_at"])}. <a href="results.json">Machine-readable results</a>.</p>',
             '<p>Coverage is incomplete. Comparative median screens and diagnostic profiles are separate evidence. These builds do not establish the required 1.5× gain for every common path and representative uncommon p99 workload, or production throughput.</p>',
-            '<p>Each master push runs fresh yEnc comparisons, BODY/fingerprint profiles, NZB digest/CPU comparisons, archive diagnostics, locked PHP-reader header comparisons and sample-planning comparisons on x86/ARM, plus release rendering on x86. Missing, failed, cancelled and inconclusive results remain visible. Trusted manual runs of this exact master commit appear separately below; feature-branch and older-source experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
+            '<p>Each rust-native push runs fresh yEnc comparisons, BODY/fingerprint profiles, NZB digest/CPU comparisons, archive diagnostics, locked PHP-reader header comparisons and sample-planning comparisons on x86/ARM, plus release rendering on x86. Missing, failed, cancelled and inconclusive results remain visible. Trusted manual runs of this exact rust-native commit appear separately below; feature-branch and older-source experiments are excluded. Raw evidence is retained in Actions for 14 days; published summaries last until the next build.</p>',
             '<h2>Build checks</h2><table><tr><th>Workflow</th><th>Latest state</th><th>Evidence</th></tr>']
     for row in report['workflows']:
         body.append(f'<tr><td>{escape(row["workflow"])}</td><td>{escape(row.get("status", "unknown"))}</td><td>{run_link(row)}</td></tr>')
     body.append('</table><h2>Current measurements</h2>')
     if report.get('frozen_reports_available'):
         body.append('<p><a href="benchmarks/">Historical speedup charts, PHP call paths and native flamegraphs</a>. These frozen reports retain their own executed-commit and run provenance; they are separate from this build.</p>')
-    manual_heading = ['<h2>Trusted manual measurements</h2><p>The three newest trusted master dispatches per producer are shown separately. Each uses its latest attempt. Failures and unavailable selections remain visible; older manual results do not replace newer failures or automatic push screens. Qualification and screen modes retain their own sample counts and uncertainty.</p><table><tr><th>Producer</th><th>Latest attempt state</th><th>Run</th></tr>']
+    manual_heading = ['<h2>Trusted manual measurements</h2><p>The three newest trusted rust-native dispatches per producer are shown separately. Each uses its latest attempt. Failures and unavailable selections remain visible; older manual results do not replace newer failures or automatic push screens. Qualification and screen modes retain their own sample counts and uncertainty.</p><table><tr><th>Producer</th><th>Latest attempt state</th><th>Run</th></tr>']
     for row in report.get('dispatch_runs', []):
         manual_heading.append('<tr><td>' + escape(row['workflow']) + '</td><td>' + escape(row.get('status', 'unknown')) + '</td><td>' + run_link(row) + '</td></tr>')
     manual_heading.append('</table>')
