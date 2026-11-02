@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use nntmux_nntp::{NntpClient, NntpConfig, Provider, TlsOptions};
 use nntmux_postprocess::additional::download::{DownloadService, MappingPolicy};
+use nntmux_postprocess::additional::planner::NzbFile;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -104,4 +105,57 @@ pub fn client(port: u16) -> NntpClient {
 
 pub fn article(name: &str, payload: &[u8]) -> Vec<u8> {
     nntmux_yenc::encode(payload, name.as_bytes(), 128, true).expect("encodes")
+}
+
+pub const SEGMENT: usize = 20_000;
+
+/// One article of a multi-part yEnc post.
+pub fn part(name: &str, file: &[u8], number: usize) -> Vec<u8> {
+    let begin = (number - 1) * SEGMENT;
+    let data = &file[begin..file.len().min(begin + SEGMENT)];
+    let single = nntmux_yenc::encode(data, name.as_bytes(), 128, false).unwrap();
+    let body_start = single.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+    let body_end = single.windows(7).rposition(|w| w == b"\r\n=yend").unwrap();
+    let mut article = format!(
+        "=ybegin part={number} line=128 size={} name={name}\r\n=ypart begin={} end={}\r\n",
+        file.len(),
+        begin + 1,
+        begin + data.len()
+    )
+    .into_bytes();
+    article.extend_from_slice(&single[body_start..body_end]);
+    article.extend_from_slice(
+        format!(
+            "\r\n=yend size={} part={number} pcrc32={}",
+            data.len(),
+            nntmux_yenc::crc32(data)
+        )
+        .as_bytes(),
+    );
+    article
+}
+
+/// A posted file's NZB entry and its articles, as `prefix-N@x`.
+pub fn post(
+    prefix: &'static str,
+    name: &str,
+    file: &[u8],
+) -> (NzbFile, Vec<(&'static str, Vec<u8>)>) {
+    let count = file.len().div_ceil(SEGMENT);
+    let ids: Vec<&'static str> = (1..=count)
+        .map(|number| &*Box::leak(format!("{prefix}-{number}@x").into_boxed_str()))
+        .collect();
+    let articles = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (*id, part(name, file, index + 1)))
+        .collect();
+    let nzb = NzbFile {
+        title: format!("\"{name}\" yEnc (1/{count})"),
+        segments: ids.iter().map(|id| (*id).to_owned()).collect(),
+        size: (file.len() as f64 * 1.05) as i64,
+        filecount: 1,
+        firstsegment: true,
+    };
+    (nzb, articles)
 }

@@ -2,16 +2,19 @@
 //! and names.
 
 pub mod archive_extraction;
+pub mod archive_fallback;
 pub mod archive_naming;
 pub mod candidates;
 pub mod context;
 pub mod diagnose;
 pub mod download;
+pub mod file_type;
 pub mod media_source;
 pub mod media_stage;
 pub mod nzb_contents;
 pub mod par2_mapping;
 pub mod planner;
+pub mod processor;
 pub mod queue;
 pub mod release_file_evidence;
 pub mod release_files;
