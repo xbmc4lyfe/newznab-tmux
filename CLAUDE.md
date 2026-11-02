@@ -2,7 +2,7 @@
 
 ## Claude routing
 
-These model rules apply to Claude subagents. Keep the human-selected main-session model unchanged. Delegate bounded independent work when useful; do small coupled work directly. Read `AGENTS.md` and `.ai/rules/index.md` before editing. Follow their Git review gates, macOS/Linux platform policy, and Rust benchmark requirements. The routing table in `AGENTS.md` applies only to Codex delegation. Required reviews may use Antigravity or Codex.
+These model rules apply to Claude subagents. Keep the human-selected main-session model unchanged. Delegate bounded independent work when useful; do small coupled work directly. Read `AGENTS.md` and `.ai/rules/index.md` before editing. Follow their Git review gates, macOS/Linux platform policy, and performance benchmark requirements. The routing table in `AGENTS.md` applies only to Codex delegation. Required reviews may use Antigravity or Codex.
 
 | Delegated task | Model | Effort |
 | --- | --- | --- |

@@ -5,6 +5,8 @@
 pub mod container;
 pub mod frames;
 pub mod images;
+pub mod slicer;
+pub mod splicer;
 
 use std::path::{Path, PathBuf};
 

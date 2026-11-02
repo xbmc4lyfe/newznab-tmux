@@ -21,6 +21,16 @@ mod webauthn;
 use axum::Router;
 use nntmux_runtime::Ctx;
 
+/// Emails a signed verification link, as `sendEmailVerificationNotification` did.
+pub async fn send_verification_email(
+    ctx: &Ctx,
+    id: i64,
+    email: &str,
+    username: &str,
+) -> anyhow::Result<()> {
+    auth::send_verification(ctx, id, email, username).await
+}
+
 pub fn router() -> Router<Ctx> {
     let pages = Router::new()
         .merge(auth::router())

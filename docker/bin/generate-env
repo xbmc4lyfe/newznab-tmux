@@ -146,7 +146,11 @@ def main() -> None:
 
     # docker/.env
     compose_values = parse(DOCKER_DIR / ".env.example")
-    compose_values.update({"DB_PASSWORD": db_password, "DB_ROOTPASSWORD": db_root})
+    grafana = existing_compose.get("GRAFANA_ADMIN_PASSWORD") or ""
+    grafana = grafana if grafana not in PLACEHOLDERS else password()
+    compose_values.update(
+        {"DB_PASSWORD": db_password, "DB_ROOTPASSWORD": db_root, "GRAFANA_ADMIN_PASSWORD": grafana}
+    )
     compose_values = merge(existing_compose, compose_values)
     write_secret(compose_env_path, render(DOCKER_DIR / ".env.example", compose_values))
 

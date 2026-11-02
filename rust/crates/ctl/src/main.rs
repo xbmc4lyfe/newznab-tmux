@@ -17,7 +17,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Apply pending schema migrations.
-    Migrate,
+    Migrate {
+        /// Only report, as `pending=<n> empty=<0|1>`, how many migrations are pending and whether the
+        /// database has no tables yet; change nothing.
+        #[arg(long)]
+        pending: bool,
+    },
     /// Set up a new deployment on an empty database: schema, seed, administrator and search
     /// tables (`nntmux:deploy-init`). Refuses any database that already has tables.
     Init,
@@ -55,8 +60,14 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     nntmux_telemetry::init(&config.log_filter, false)?;
 
-    if matches!(cli.command, Command::Migrate) {
+    if let Command::Migrate { pending } = cli.command {
         let pool = nntmux_db::connect(&config.database).await?;
+        if pending {
+            let versions = nntmux_db::migrate::pending(&pool).await?;
+            let empty = nntmux_db::migrate::is_empty(&pool).await?;
+            println!("pending={} empty={}", versions.len(), u8::from(empty));
+            return Ok(());
+        }
         let ran = nntmux_db::migrate::run(&pool).await?;
         println!("applied {} migration(s)", ran.len());
         return Ok(());
@@ -64,7 +75,7 @@ async fn main() -> Result<()> {
 
     let ctx = Ctx::connect(config).await?;
     match cli.command {
-        Command::Migrate => unreachable!("handled above"),
+        Command::Migrate { .. } => unreachable!("handled above"),
         Command::Init => init::run(&ctx).await,
         Command::Ingest(command) => nntmux_ingest::ctl(ctx, command).await,
         Command::Categorize(command) => nntmux_categorize::ctl(ctx, command).await,

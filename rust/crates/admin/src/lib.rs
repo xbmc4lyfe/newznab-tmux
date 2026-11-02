@@ -7,6 +7,9 @@ pub mod captcha;
 pub mod gdpr;
 pub mod groups;
 pub mod roles;
+pub mod settings;
+pub mod user_role;
+pub mod users;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -41,6 +44,199 @@ pub enum Command {
     /// Newsgroups (the admin group pages).
     #[command(subcommand)]
     Group(GroupCommand),
+    /// Site, registration, ingestion, post-processing, metadata and tmux settings
+    /// (the admin settings pages).
+    #[command(subcommand)]
+    Settings(SettingsCommand),
+    /// User accounts (the admin user and deleted user pages). A user is named by id or
+    /// username, or `id:N` / `name:X` when a username is a number.
+    #[command(subcommand)]
+    User(UserCommand),
+}
+
+/// `nntmux-ctl admin user ...`
+#[derive(Debug, Subcommand)]
+pub enum UserCommand {
+    /// List accounts, deleted ones included, newest usernames first.
+    List {
+        /// Usernames containing this text.
+        #[arg(long)]
+        username: Option<String>,
+        /// Addresses containing this text.
+        #[arg(long)]
+        email: Option<String>,
+        /// Hosts containing this text.
+        #[arg(long)]
+        host: Option<String>,
+        /// Role id.
+        #[arg(long)]
+        role: Option<i64>,
+        /// Only verified accounts.
+        #[arg(long, conflicts_with = "unverified")]
+        verified: bool,
+        /// Only unverified accounts.
+        #[arg(long)]
+        unverified: bool,
+        /// Created on or after this date (YYYY-MM-DD).
+        #[arg(long)]
+        created_from: Option<chrono::NaiveDate>,
+        /// Created on or before this date (YYYY-MM-DD).
+        #[arg(long)]
+        created_to: Option<chrono::NaiveDate>,
+        /// Only soft-deleted accounts, most recently deleted first.
+        #[arg(long)]
+        deleted: bool,
+        /// Sort order, such as `createdat_desc`.
+        #[arg(long, default_value = "", value_parser = parse_user_order)]
+        order: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+    /// Show one account.
+    Show { user: String },
+    /// Add an account. The password is read from standard input.
+    Add {
+        username: String,
+        email: String,
+        /// Role id; the default role without it.
+        #[arg(long)]
+        role: Option<i32>,
+        #[arg(long, default_value = "")]
+        notes: String,
+        /// Invites; the role's default without it.
+        #[arg(long)]
+        invites: Option<i32>,
+        /// Mark the address verified.
+        #[arg(long)]
+        verified: bool,
+    },
+    /// Change an account. Role changes are `admin role`'s.
+    Edit {
+        user: String,
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        invites: Option<i32>,
+        #[arg(long)]
+        movieview: Option<bool>,
+        #[arg(long)]
+        musicview: Option<bool>,
+        #[arg(long)]
+        gameview: Option<bool>,
+        #[arg(long)]
+        consoleview: Option<bool>,
+        #[arg(long)]
+        bookview: Option<bool>,
+        /// Read a new password from standard input.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Soft-delete accounts. They can be restored.
+    Delete {
+        #[arg(required = true)]
+        users: Vec<String>,
+        /// Delete Admin accounts too.
+        #[arg(long)]
+        allow_admin: bool,
+        /// Confirm. Without it, only show what would change.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Restore soft-deleted accounts.
+    Restore {
+        #[arg(required = true)]
+        users: Vec<String>,
+    },
+    /// Mark addresses verified.
+    Verify {
+        #[arg(required = true)]
+        users: Vec<String>,
+    },
+    /// Email a new verification link to unverified accounts.
+    ResendVerification {
+        #[arg(required = true)]
+        users: Vec<String>,
+    },
+    /// Change an account's role or its expiry, as the edit form's role fields did. A role
+    /// change applies now, or with `--stack` after the current role ends. An expiry set here
+    /// is kept and skips promotions.
+    Role {
+        user: String,
+        /// The new role, by id or name.
+        #[arg(long)]
+        role: Option<String>,
+        /// Queue the new role after the current one while the current one runs.
+        #[arg(long, requires = "role")]
+        stack: bool,
+        /// Set the current role's expiry (YYYY-MM-DD).
+        #[arg(long, conflicts_with = "clear_expiry")]
+        expires: Option<chrono::NaiveDate>,
+        /// Remove the current role's expiry.
+        #[arg(long)]
+        clear_expiry: bool,
+        /// Drop a queued role first.
+        #[arg(long)]
+        cancel_pending: bool,
+    },
+    /// List an account's passkeys.
+    Passkeys { user: String },
+    /// Delete one passkey by its id.
+    DeletePasskey { id: u64 },
+    /// Remove every passkey from an account, so it signs in with its password again.
+    WipePasskeys {
+        user: String,
+        /// Confirm.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+fn parse_user_order(text: &str) -> Result<String> {
+    if text.is_empty() || users::ORDERINGS.contains(&text) {
+        Ok(text.to_owned())
+    } else {
+        anyhow::bail!("the orders are: {}", users::ORDERINGS.join(", "))
+    }
+}
+
+/// `nntmux-ctl admin settings ...`
+#[derive(Debug, Subcommand)]
+pub enum SettingsCommand {
+    /// Show a domain's settings, or every domain's without one.
+    Show {
+        #[arg(value_enum)]
+        domain: Option<settings::Domain>,
+    },
+    /// Change settings, as `column=value` pairs. Sizes take MB or GB (`500MB`); yes/no
+    /// settings take 1 or 0; choices take their number or label.
+    Set {
+        #[arg(value_enum)]
+        domain: settings::Domain,
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
+    /// Replace the tmux cleanup rules. Without rules or `--clear`, list them.
+    CleanupRules {
+        rules: Vec<String>,
+        /// Remove every rule.
+        #[arg(long, conflicts_with = "rules")]
+        clear: bool,
+    },
+    /// Replace the excluded tmux colors (0-255, inside the color range). Without colors or
+    /// `--clear`, list them.
+    ColorExclusions {
+        #[arg(value_delimiter = ',')]
+        colors: Vec<u8>,
+        /// Remove every exclusion.
+        #[arg(long, conflicts_with = "colors")]
+        clear: bool,
+    },
 }
 
 /// `nntmux-ctl admin group ...`. A group is named by its id or its full name.
@@ -251,6 +447,95 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
         }
         Command::Role(command) => role(&ctx, command, now).await?,
         Command::Group(command) => group(&ctx, command, now).await?,
+        Command::Settings(command) => settings_command(&ctx.db, command, now).await?,
+        Command::User(command) => user_command(&ctx, command, now).await?,
+    }
+    Ok(())
+}
+
+async fn settings_command(
+    db: &sqlx::MySqlPool,
+    command: SettingsCommand,
+    now: chrono::NaiveDateTime,
+) -> Result<()> {
+    match command {
+        SettingsCommand::Show { domain } => {
+            let domains =
+                domain.map_or_else(|| settings::Domain::ALL.to_vec(), |domain| vec![domain]);
+            for (index, domain) in domains.into_iter().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                println!("[{domain}] {}", domain.guidance());
+                for (field, value) in settings::show(db, domain).await? {
+                    println!("  {} = {}", field.column, field.display(value.as_deref()));
+                }
+                if domain == settings::Domain::Tmux {
+                    println!(
+                        "  cleanup_rules = {}",
+                        settings::cleanup_rules(db).await?.join(",")
+                    );
+                    let colors = settings::color_exclusions(db).await?;
+                    println!(
+                        "  color_exclusions = {}",
+                        colors
+                            .iter()
+                            .map(u8::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
+            }
+        }
+        SettingsCommand::Set { domain, values } => {
+            let values = settings::assignments(domain, &values)?;
+            settings::update(db, domain, &values, now).await?;
+            let shown = settings::show(db, domain).await?;
+            for (field, _) in &values {
+                if let Some((_, value)) =
+                    shown.iter().find(|(shown, _)| shown.column == field.column)
+                {
+                    println!(
+                        "{domain}.{} = {}",
+                        field.column,
+                        field.display(value.as_deref())
+                    );
+                }
+            }
+            println!("{}", domain.guidance());
+        }
+        SettingsCommand::CleanupRules { rules, clear } => {
+            if clear || !rules.is_empty() {
+                settings::set_cleanup_rules(db, &rules, now).await?;
+            }
+            let rules = settings::cleanup_rules(db).await?;
+            println!(
+                "cleanup rules: {}",
+                if rules.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    rules.join(", ")
+                }
+            );
+        }
+        SettingsCommand::ColorExclusions { colors, clear } => {
+            if clear || !colors.is_empty() {
+                settings::set_color_exclusions(db, &colors, now).await?;
+            }
+            let colors = settings::color_exclusions(db).await?;
+            println!(
+                "excluded colors: {}",
+                if colors.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    colors
+                        .iter()
+                        .map(u8::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+        }
     }
     Ok(())
 }
@@ -724,4 +1009,303 @@ fn exclusive<'a>(
         verify,
         drain_timeout,
     }
+}
+
+fn read_password() -> Result<String> {
+    let mut password = String::new();
+    std::io::stdin()
+        .read_line(&mut password)
+        .context("reading the password from standard input")?;
+    Ok(password.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+fn when(value: Option<chrono::NaiveDateTime>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| value.to_string())
+}
+
+async fn user_command(ctx: &Ctx, command: UserCommand, now: chrono::NaiveDateTime) -> Result<()> {
+    let db = &ctx.db;
+    match command {
+        UserCommand::List {
+            username,
+            email,
+            host,
+            role,
+            verified,
+            unverified,
+            created_from,
+            created_to,
+            deleted,
+            order,
+            limit,
+            offset,
+        } => {
+            let filter = users::Filter {
+                username,
+                email,
+                host,
+                role,
+                verified: flag(verified, unverified),
+                created_from,
+                created_to,
+                deleted_only: deleted,
+                ordering: order,
+                limit,
+                offset,
+            };
+            for user in users::list(db, &filter, now).await? {
+                println!(
+                    "{:>6}  {:<24} {:<32} {:<12} verified={} grabs={} api/day={} dl/day={} created={} last_login={}{}",
+                    user.id,
+                    user.username,
+                    user.email,
+                    user.role.as_deref().unwrap_or("-"),
+                    if user.verified != 0 { "yes" } else { "no" },
+                    user.grabs,
+                    user.daily_api_count,
+                    user.daily_download_count,
+                    when(user.created_at),
+                    when(user.lastlogin),
+                    user.deleted_at.map_or_else(String::new, |at| format!(
+                        " DELETED {at} by {}",
+                        user.deleted_by.as_deref().unwrap_or("-")
+                    )),
+                );
+            }
+        }
+        UserCommand::Show { user } => {
+            let account = users::require(db, &user).await?;
+            let (api, downloads) = users::daily_counts(db, account.id, now).await?;
+            let passkeys = users::passkeys(db, account.id).await?;
+            println!("id: {}", account.id);
+            println!("username: {}", account.username);
+            println!("email: {}", account.email);
+            println!(
+                "verified: {}",
+                if account.is_verified() { "yes" } else { "no" }
+            );
+            println!(
+                "role: {} ({}), expires {}",
+                account.role.as_deref().unwrap_or("-"),
+                account.roles_id,
+                when(account.rolechangedate)
+            );
+            if let Some(pending) = account.pending_roles_id {
+                println!(
+                    "pending role: {pending} from {}",
+                    when(account.pending_role_start_date)
+                );
+            }
+            println!("host: {}", account.host.as_deref().unwrap_or("-"));
+            println!("notes: {}", account.notes.as_deref().unwrap_or(""));
+            println!("invites: {}", account.invites);
+            println!("grabs: {}", account.grabs);
+            println!("rate limit: {}", account.rate_limit);
+            println!("api requests today: {api}, downloads today: {downloads}");
+            println!(
+                "views: movie={} music={} game={} console={} book={}",
+                account.movieview,
+                account.musicview,
+                account.gameview,
+                account.consoleview,
+                account.bookview
+            );
+            println!("created: {}", when(account.created_at));
+            println!(
+                "last login: {}, api access: {}",
+                when(account.lastlogin),
+                when(account.apiaccess)
+            );
+            println!("passkeys: {}", passkeys.len());
+            if let Some(at) = account.deleted_at {
+                println!(
+                    "deleted: {at} by {}",
+                    account.deleted_by.as_deref().unwrap_or("-")
+                );
+            }
+        }
+        UserCommand::Add {
+            username,
+            email,
+            role,
+            notes,
+            invites,
+            verified,
+        } => {
+            let password = read_password()?;
+            let id = users::add(
+                db,
+                &users::NewUser {
+                    username,
+                    email,
+                    password,
+                    role,
+                    notes,
+                    invites,
+                    verified,
+                },
+            )
+            .await?;
+            println!("added user {id}");
+        }
+        UserCommand::Edit {
+            user,
+            username,
+            email,
+            notes,
+            invites,
+            movieview,
+            musicview,
+            gameview,
+            consoleview,
+            bookview,
+            password_stdin,
+        } => {
+            let account = users::require(db, &user).await?;
+            let password = if password_stdin {
+                Some(read_password()?)
+            } else {
+                None
+            };
+            users::update(
+                db,
+                &account,
+                &users::Changes {
+                    username,
+                    email,
+                    password,
+                    notes,
+                    invites,
+                    movieview,
+                    musicview,
+                    gameview,
+                    consoleview,
+                    bookview,
+                },
+            )
+            .await?;
+            println!("updated {}", account.username);
+        }
+        UserCommand::Delete {
+            users: names,
+            allow_admin,
+            yes,
+        } => {
+            let mut targets = Vec::new();
+            for name in &names {
+                let account = users::require(db, name).await?;
+                users::guard_admin(db, &account, allow_admin).await?;
+                targets.push(account);
+            }
+            for account in targets {
+                if !yes {
+                    println!(
+                        "would delete {} ({}); pass --yes to delete",
+                        account.username, account.id
+                    );
+                } else if users::delete(ctx, &account, now).await? {
+                    println!("deleted {}", account.username);
+                } else {
+                    println!("{} was already deleted", account.username);
+                }
+            }
+        }
+        UserCommand::Restore { users: names } => {
+            for name in &names {
+                let account = users::require(db, name).await?;
+                if users::restore(ctx, &account, now).await? {
+                    println!("restored {}", account.username);
+                } else {
+                    println!("{} isn't deleted", account.username);
+                }
+            }
+        }
+        UserCommand::Verify { users: names } => {
+            for name in &names {
+                let account = users::require(db, name).await?;
+                if users::verify(ctx, &account).await? {
+                    println!("verified {}", account.username);
+                } else {
+                    println!("{} was already verified", account.username);
+                }
+            }
+        }
+        UserCommand::ResendVerification { users: names } => {
+            for name in &names {
+                let account = users::require(db, name).await?;
+                users::resend_verification(ctx, &account).await?;
+                println!("sent a verification link to {}", account.username);
+            }
+        }
+        UserCommand::Role {
+            user,
+            role,
+            stack,
+            expires,
+            clear_expiry,
+            cancel_pending,
+        } => {
+            let account = users::require(db, &user).await?;
+            let request = user_role::Request {
+                role,
+                stack,
+                expires: if clear_expiry {
+                    Some(None)
+                } else {
+                    expires.map(Some)
+                },
+                cancel_pending,
+            };
+            match user_role::change(ctx, &account, &request, now).await? {
+                user_role::Outcome::Unchanged => {
+                    println!("{}'s role is unchanged", account.username)
+                }
+                user_role::Outcome::Stacked { starts, expires } => println!(
+                    "{}'s new role starts {starts} and runs until {expires}",
+                    account.username
+                ),
+                user_role::Outcome::Immediate { expires } => println!(
+                    "{}'s role changed, expiring {}",
+                    account.username,
+                    when(expires)
+                ),
+            }
+        }
+        UserCommand::Passkeys { user } => {
+            let account = users::require(db, &user).await?;
+            for passkey in users::passkeys(db, account.id).await? {
+                println!(
+                    "{:>6}  {}  created {}  last used {}",
+                    passkey.id,
+                    passkey.name,
+                    when(passkey.created_at),
+                    when(passkey.last_used_at)
+                );
+            }
+        }
+        UserCommand::DeletePasskey { id } => {
+            let passkey = users::passkey(db, id)
+                .await?
+                .with_context(|| format!("passkey {id} doesn't exist"))?;
+            users::delete_passkey(db, &passkey).await?;
+            println!("deleted passkey {id} ({})", passkey.name);
+        }
+        UserCommand::WipePasskeys { user, yes } => {
+            let account = users::require(db, &user).await?;
+            if !yes {
+                let count = users::passkeys(db, account.id).await?.len();
+                println!(
+                    "would remove {count} passkey(s) from {}; pass --yes to remove them",
+                    account.username
+                );
+            } else {
+                let wiped = users::wipe_passkeys(db, &account).await?;
+                println!(
+                    "{wiped} passkeys removed from {}. They can now sign in with their password or an admin-issued reset.",
+                    account.username
+                );
+            }
+        }
+    }
+    Ok(())
 }

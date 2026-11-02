@@ -19,6 +19,7 @@ nntmux-mail.workspace = true
 nntmux-nntp.workspace = true
 nntmux-ops.workspace = true
 nntmux-runtime.workspace = true
+nntmux-site.workspace = true
 nntmux-verify.workspace = true
 nntmux-webkit.workspace = true
 redis.workspace = true
@@ -29,6 +30,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+bcrypt.workspace = true
 nntmux-testkit.workspace = true
 
 [lints]

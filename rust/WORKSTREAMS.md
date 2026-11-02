@@ -32,14 +32,14 @@ The goal is zero PHP, with every entry point in Rust: all routes, commands, jobs
 | `ws-ingest` | `ingest` | M3 | `app/Services/Binaries`, `Backfill`, `NNTP` callers, `multiprocessing:update-per-group` and `:backfill` |
 | `ws-naming` | `categorize`, `namefix`, `predb` | M4 | `app/Services/Categorization`, `NameFixing`, `Predb`, IRC scraper |
 | `ws-releases` | `releases`, `fingerprint`, `verify` | M5 | `app/Services/Releases` (assembly, NZB, fingerprint, verification, remote publication), `rust/fingerprint-worker` |
-| `ws-postprocess` | `postprocess` | M6 | Additional processing, NFO, PAR2, archives, samples, media through ffmpeg |
+| `ws-postprocess` | `postprocess`, `mediaprobe` | M6 | Additional processing, NFO, PAR2, archives, samples, media through ffmpeg |
 | `ws-metadata` | `metadata` | M6 | TV, movie, music, game, book and anime providers, covers, rate limits per key |
 | `ws-search` | `search` | M7 | `app/Services/Search`, Manticore indexing, repair, reconcile, and the read API that `api` and `site` call |
 | `ws-api` | `api` | M9 | `/api`, `/rss`, `/getnzb`, API keys, rate limits, API usage jobs. XML and JSON must match byte for byte against recorded PHP responses |
 | `ws-site` | `webkit`, `site` | M10 | Public pages, auth (bcrypt hashes, TOTP, passkeys, sessions), accounts, profile, cart. Templates use askama and htmx. Everyone logs in again once at cutover, since sharing Laravel's session cookie isn't worth building |
 | `ws-admin` | `admin`, `mail` | M10 | `/admin`, mail, GDPR, invitations, roles, payments (BTCPay), account jobs. Build on `webkit` |
 | `ws-ops` | `supervisor`, `ops` | M8 | `routes/console.php`, tmux layout and monitor, status probes, log viewer, MCP, every artisan command nobody else owns |
-| `ws-deploy` | `Dockerfile`, `docker/`, `Justfile`, `deploy/`, `.github/`, docs | M2, M11 | Rust image and Compose services for each role and `nntmux-web`, the deploy guard and drain, Caddy routes, Grafana, `AGENTS.md` and `.ai/` rules rewritten for Rust, final removal of leftover PHP and `nzb-yenc-ffi` |
+| `ws-deploy` | `Dockerfile`, `docker/`, `Justfile`, `deploy/`, `.github/`, docs | M2, M11 | Rust image and Compose services for each role and `nntmux-web`, the deploy guard and drain, Caddy routes, Grafana, final removal of leftover PHP and `nzb-yenc-ffi` |
 
 Order: `ws-formats` first if threads must be staggered, since `ws-ingest`, `ws-releases` and `ws-postprocess` call it. They can start in parallel against the agreed API, which `ws-formats` should publish early as a first small PR. `ws-site` publishes `webkit` early for `ws-admin`. Everything else is independent, because it meets at the database.
 

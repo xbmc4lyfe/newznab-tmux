@@ -158,7 +158,8 @@ status = "todo"
 kind = "route"
 id = "DELETE /admin/user-passkey/{passkey}"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@destroyPasskey"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user passkeys` and `user delete-passkey`."
 
 [[entry]]
 kind = "route"
@@ -308,7 +309,8 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/deleted-users"
 source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@index"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user list --deleted`."
 
 [[entry]]
 kind = "route"
@@ -587,7 +589,7 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/settings/{domain}"
 source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@show"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "route"
@@ -617,7 +619,8 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/site-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@legacySite"
-status = "todo"
+status = "dropped"
+note = "Redirected an old admin URL to the settings page. `nntmux-ctl admin settings show site` and `show tmux` cover it."
 
 [[entry]]
 kind = "route"
@@ -647,19 +650,22 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/tmux-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@legacyTmux"
-status = "todo"
+status = "dropped"
+note = "Redirected an old admin URL to the settings page. `nntmux-ctl admin settings show site` and `show tmux` cover it."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/user-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@edit"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user show`; `user add` covers the add form."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/user-list"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@index"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user list` and `user show`."
 
 [[entry]]
 kind = "route"
@@ -671,7 +677,8 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/user-role-history/{userId}"
 source = "App\\Http\\Controllers\\Admin\\AdminUserRoleHistoryController@show"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin role history <user>`."
 
 [[entry]]
 kind = "route"
@@ -795,7 +802,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/deleted-users/restore/{id}"
 source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@restore"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user restore`."
 
 [[entry]]
 kind = "route"
@@ -979,7 +987,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/resendverification"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@resendVerification"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user resend-verification`."
 
 [[entry]]
 kind = "route"
@@ -1039,31 +1048,36 @@ status = "todo"
 kind = "route"
 id = "POST /admin/user-delete"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@destroy"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user delete`."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/user-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@edit"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user add`, `user edit` for the account fields and `user role` for the role, its expiry, stacking and a pending role."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/user-list/bulk"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@bulkAction"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user delete|verify|resend-verification` take several users; delete skips Admin accounts without `--allow-admin`, as the bulk action did."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/user-passkeys/wipe"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@wipePasskeys"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user wipe-passkeys --yes`."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/verify"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@verify"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user verify`."
 
 [[entry]]
 kind = "route"
@@ -1087,7 +1101,8 @@ status = "todo"
 kind = "route"
 id = "PUT /admin/settings/{domain}"
 source = "App\\Http\\Controllers\\Admin\\AdminSettingsController@update"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin settings set|cleanup-rules|color-exclusions`. The site logo was an image upload for the web pages and is left out."
 
 [[entry]]
 kind = "route"

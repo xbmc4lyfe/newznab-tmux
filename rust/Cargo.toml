@@ -20,6 +20,7 @@ nntmux-fingerprint = { path = "crates/fingerprint" }
 nntmux-formats = { path = "crates/formats" }
 nntmux-ingest = { path = "crates/ingest" }
 nntmux-mail = { path = "crates/mail" }
+nntmux-mediaprobe = { path = "crates/mediaprobe" }
 nntmux-metadata = { path = "crates/metadata" }
 nntmux-namefix = { path = "crates/namefix" }
 nntmux-nntp = { path = "crates/nntp" }
@@ -49,6 +50,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4", features = ["derive", "env"] }
 crc32fast = "1"
 deunicode = "1"
+# Dolby Vision RPU parsing (the library behind dovi_tool).
+dolby_vision = "3.4"
 encoding_rs = "0.8"
 fancy-regex = "0.17"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
