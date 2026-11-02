@@ -13,6 +13,7 @@ use nntmux_search::SearchClient;
 use redis::AsyncCommands;
 
 use crate::fixnames_chain;
+use crate::identity_suggestions;
 use crate::par2_check::{Par2Checker, Par2Settings, env_bool};
 use crate::par2_nntp::NntpArticles;
 use crate::par2_probe::{BatchProbe, fix_names_with_par2};
@@ -28,6 +29,18 @@ const LEFT_GUIDS: [&str; 16] = [
 /// `nntmux-ctl namefix ...`
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Reports constrained, read-only identity suggestions, and never renames or links a
+    /// release (`releases:identity-suggestions`).
+    IdentitySuggestions {
+        /// Filename or partial release title.
+        query: Option<String>,
+        /// Reads the current search name of this release.
+        #[arg(long)]
+        release_id: Option<String>,
+        /// Restricts to these known PreDB IDs (maximum 50).
+        #[arg(long)]
+        candidate_id: Vec<String>,
+    },
     /// Fixes names by one numbered method (`releases:fix-names`).
     FixNames {
         /// 3-20: odd methods look at the past 6 hours, even ones at everything.
@@ -204,8 +217,23 @@ async fn run_level(
 }
 
 pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
+    if let Command::IdentitySuggestions {
+        query,
+        release_id,
+        candidate_id,
+    } = command
+    {
+        let request = identity_suggestions::Request {
+            query,
+            release_id,
+            candidate_ids: candidate_id,
+        };
+        println!("{}", identity_suggestions::run(&ctx, request).await?);
+        return Ok(());
+    }
     let backends = backends(&ctx)?;
     match command {
+        Command::IdentitySuggestions { .. } => unreachable!("handled above"),
         Command::FixNames {
             method,
             update,
