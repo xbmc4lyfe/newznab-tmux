@@ -21,6 +21,7 @@ pub mod mysql;
 pub mod name;
 pub mod nzb;
 pub mod srrdb;
+pub mod stream_probe;
 
 pub use donor::DonorIndex;
 pub use ladder::{

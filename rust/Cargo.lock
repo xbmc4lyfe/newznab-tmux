@@ -2652,6 +2652,7 @@ dependencies = [
  "nntmux-categorize",
  "nntmux-core",
  "nntmux-formats",
+ "nntmux-mediaprobe",
  "nntmux-nntp",
  "nntmux-predb",
  "nntmux-runtime",

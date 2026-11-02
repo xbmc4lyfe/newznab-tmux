@@ -381,7 +381,7 @@ fn video_summary(track: &Track, findings: &VideoFindings) -> VideoSummary {
 }
 
 /// Labels by width first, so scope crops (1920x800) still read as 1080p.
-fn resolution(width: Option<u64>, height: Option<u64>) -> Option<&'static str> {
+pub(crate) fn resolution(width: Option<u64>, height: Option<u64>) -> Option<&'static str> {
     let (w, h) = (width.unwrap_or(0), height.unwrap_or(0));
     Some(if w >= 3200 || h >= 1800 {
         "2160p"

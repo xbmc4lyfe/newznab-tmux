@@ -1,6 +1,9 @@
 //! Reads just what identification needs from an NZB: each file's subject and size. A scan beats
 //! a full XML parse here because one run decodes hundreds of gigabytes of NZB.
 
+/// Enough of a file's start to reach a stream through its archive layers.
+const MAX_HEAD_IDS: usize = 8;
+
 /// One `<file>` of an NZB.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NzbFile {
@@ -9,6 +12,10 @@ pub struct NzbFile {
     pub group: Option<String>,
     /// The message ID of the file's first article, which holds any archive header.
     pub first_message_id: Option<String>,
+    /// The message IDs of the file's first articles, in order.
+    pub head_message_ids: Vec<String>,
+    /// The message IDs of the file's last articles, in order, where MP4 often keeps its index.
+    pub tail_message_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -32,7 +39,8 @@ pub fn summarize(xml: &str) -> NzbSummary {
         let subject = attribute(&element[..open_end], "subject")
             .map(unescape)
             .unwrap_or_default();
-        let (bytes, first_message_id) = segments(element);
+        let (bytes, head_message_ids, tail_message_ids) = segments(element);
+        let first_message_id = head_message_ids.first().cloned();
         let group = element
             .split_once("<group>")
             .and_then(|(_, rest)| rest.split_once("</group>"))
@@ -48,6 +56,8 @@ pub fn summarize(xml: &str) -> NzbSummary {
             bytes,
             group,
             first_message_id,
+            head_message_ids,
+            tail_message_ids,
         });
         rest = after.get(7..).unwrap_or("");
     }
@@ -68,10 +78,10 @@ fn attribute<'a>(open_tag: &'a str, name: &str) -> Option<&'a str> {
     None
 }
 
-/// The file's total bytes, and the message ID of its lowest-numbered segment.
-fn segments(element: &str) -> (u64, Option<String>) {
+/// The file's total bytes, and the message IDs of its first and last segments.
+fn segments(element: &str) -> (u64, Vec<String>, Vec<String>) {
     let mut total = 0u64;
-    let mut first: Option<(u64, String)> = None;
+    let mut ids: Vec<(u64, String)> = Vec::new();
     let mut rest = element;
     while let Some(start) = rest.find("<segment ") {
         rest = &rest[start + 9..];
@@ -83,14 +93,20 @@ fn segments(element: &str) -> (u64, Option<String>) {
         let number = attribute(tag, "number")
             .and_then(|n| n.parse().ok())
             .unwrap_or(u64::MAX);
-        if first.as_ref().is_none_or(|(lowest, _)| number < *lowest)
-            && let Some(body) = rest.get(open_end + 1..)
+        if let Some(body) = rest.get(open_end + 1..)
             && let Some((id, _)) = body.split_once("</segment>")
         {
-            first = Some((number, unescape(id.trim())));
+            ids.push((number, unescape(id.trim())));
         }
     }
-    (total, first.map(|(_, id)| id))
+    ids.sort_by_key(|(number, _)| *number);
+    let ids: Vec<String> = ids.into_iter().map(|(_, id)| id).collect();
+    let tail_start = ids.len().saturating_sub(MAX_HEAD_IDS);
+    (
+        total,
+        ids[..ids.len().min(MAX_HEAD_IDS)].to_vec(),
+        ids[tail_start..].to_vec(),
+    )
 }
 
 fn unescape(value: &str) -> String {
