@@ -184,8 +184,10 @@ pub async fn delete_releases(releases: &Releases, settings: &Settings) -> Result
     if settings.delete_passworded {
         sweep(releases, "passworded", |query| {
             query.push("passwordstatus = ").push_bind(PASSWD_RAR);
-            query.push(" OR id IN (SELECT releases_id FROM release_files WHERE passworded = ");
-            query.push_bind(PASSWD_RAR).push(")");
+            // Status 3 means keep but hide, whatever its files say.
+            query.push(" OR (passwordstatus <> 3 AND id IN (");
+            query.push("SELECT releases_id FROM release_files WHERE passworded = ");
+            query.push_bind(PASSWD_RAR).push("))");
         })
         .await?;
     }

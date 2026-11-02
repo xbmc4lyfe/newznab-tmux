@@ -11,7 +11,7 @@ use nntmux_namefix::identify::archive_probe::{ArchiveProbe, NntpFetch};
 use nntmux_namefix::identify::catalog::{
     Options, holdout, render_holdout, render_report, render_tsv, run_with_probe,
 };
-use nntmux_namefix::identify::{Hooks, SrrdbClient, SrrdbConfig, stream_probe};
+use nntmux_namefix::identify::{Hooks, SrrdbClient, SrrdbConfig, stream_probe, unidentifiable};
 
 #[derive(Parser)]
 #[command(about = "Identify releases from the evidence in a SQLite import")]
@@ -55,6 +55,16 @@ enum Command {
     },
     /// Measures the weak rungs on releases whose PreDB row is already known.
     Holdout,
+    /// Hides encrypted releases nothing can name, as passwordstatus 3. Reads DATABASE_URL, and
+    /// without --apply only reports what it would do.
+    HideUnidentifiable {
+        /// A file of release IDs, one a line.
+        #[arg(long)]
+        ids: PathBuf,
+        /// Writes to the database. Never run this without its owner's approval.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Reads the streams of a sample of releases with no other evidence, over NNTP. It takes the
     /// provider from the NNTP_* variables, and writes to no database.
     StreamSample {
@@ -76,7 +86,42 @@ fn write_out(dir: &Path, file: &str, content: &str) -> Result<()> {
     std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))
 }
 
+fn hide_unidentifiable(ids: &Path, apply: bool) -> Result<()> {
+    let text =
+        std::fs::read_to_string(ids).with_context(|| format!("reading {}", ids.display()))?;
+    let ids = unidentifiable::parse_ids(&text)?;
+    let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    tokio::runtime::Runtime::new()?.block_on(async {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .context("connecting to MariaDB")?;
+        let found = unidentifiable::plan(&pool, &ids).await?;
+        println!(
+            "{} IDs: would hide {}, already hidden {}, named since {}, held by a worker {}, missing {}.",
+            ids.len(),
+            found.eligible.len(),
+            found.already_hidden,
+            found.named,
+            found.claimed,
+            found.missing
+        );
+        if apply {
+            let changed = unidentifiable::apply(&pool, &found.eligible).await?;
+            println!("Hid {changed}, and queued their search updates.");
+        } else {
+            println!("Dry run: nothing written. Pass --apply to write.");
+        }
+        Ok(())
+    })
+}
+
 fn start(cli: &Cli) -> Result<()> {
+    // This one works on MariaDB, and needs nothing the SQLite commands do.
+    if let Command::HideUnidentifiable { ids, apply } = &cli.command {
+        return hide_unidentifiable(ids, *apply);
+    }
     let metrics = nntmux_telemetry::init("info", false)?;
     let mut options = Options {
         data_dir: cli.data_dir.clone().context("--data-dir is required")?,
@@ -149,6 +194,7 @@ fn start(cli: &Cli) -> Result<()> {
             write_out(&cli.out, "streams.tsv", &lines)?;
             print!("{report}");
         }
+        Command::HideUnidentifiable { .. } => unreachable!("handled above"),
         Command::Holdout => {
             let text = render_holdout(&holdout(&options)?);
             write_out(&cli.out, "holdout.md", &text)?;

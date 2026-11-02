@@ -276,6 +276,36 @@ async fn maintenance_removes_what_settings_no_longer_want() -> Result<()> {
 }
 
 #[tokio::test]
+async fn maintenance_keeps_a_hidden_release_whatever_its_files_say() -> Result<()> {
+    let Some(h) = Harness::start().await? else {
+        return Ok(());
+    };
+    let settings = Settings {
+        delete_passworded: true,
+        min_files: 0,
+        ..Settings::default()
+    };
+    add_release(&h, 1, "passwordstatus=3").await?;
+    add_release(&h, 2, "passwordstatus=0").await?;
+    for release in [1, 2] {
+        sqlx::query(
+            "INSERT INTO release_files (releases_id, name, size, passworded)
+             SELECT id, 'x.mkv', 1, 1 FROM releases WHERE guid LIKE ?",
+        )
+        .bind(format!("0000000{release}%"))
+        .execute(h.pool())
+        .await?;
+    }
+    maintenance::run(&h.releases, &settings).await?;
+    let left: Vec<String> = sqlx::query_scalar("SELECT guid FROM releases")
+        .fetch_all(h.pool())
+        .await?;
+    assert_eq!(left.len(), 1);
+    assert!(left[0].starts_with("00000001"));
+    h.db.drop_database().await
+}
+
+#[tokio::test]
 async fn categorizing_finishes_misc_releases_and_queues_their_search_update() -> Result<()> {
     let Some(h) = Harness::start().await? else {
         return Ok(());

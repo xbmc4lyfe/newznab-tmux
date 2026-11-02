@@ -437,3 +437,14 @@ async fn zip_download(
         .header("content-transfer-encoding", "binary")
         .header("x-accel-buffering", "no"))
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_flag_is_the_value_identification_sets() {
+        assert_eq!(
+            super::UNIDENTIFIABLE,
+            nntmux_namefix::identify::unidentifiable::PASSWD_UNIDENTIFIABLE
+        );
+    }
+}
