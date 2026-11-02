@@ -80,9 +80,9 @@ finish() {
     rc=$?
     # A data service recreated without a confirmed fresh barrier must not keep serving: its
     # remote verification workers would be unfenced.
-    if [ "${unfenced:-0}" = 1 ]; then
-        echo "Stopping the recreated data service(s) so nothing uses them unfenced: ${data_recreate[*]}." >&2
-        "$compose" stop "${data_recreate[@]}" || true
+    if [ "${unfenced:-0}" = 1 ] && [ ${#fence_stop[@]} -gt 0 ]; then
+        echo "Stopping data service(s) started without a confirmed barrier: ${fence_stop[*]}." >&2
+        "$compose" stop "${fence_stop[@]}" || true
     fi
     if [ "$started" = 1 ]; then
         printf '%s deploy result=finished rc=%s by=%s\n' "$(stamp)" "$rc" "$DEPLOY_BY" >> "$log"
@@ -177,6 +177,9 @@ done
 "$inspect" configs < "$work/model.json" > "$work/configs"
 recreate=()
 data_recreate=()
+# Data services this run started or recreated; while unfenced=1, any exit stops them again.
+fence_stop=()
+unfenced=0
 blocked=""
 while read -r svc hash; do
     has "$targets" "$svc" || continue
@@ -318,6 +321,11 @@ for svc in $("$inspect" services < "$work/model.json"); do
     [ -n "$("$compose" ps -q --status running "$svc")" ] || missing+=("$svc")
 done
 if [ ${#missing[@]} -gt 0 ]; then
+    # A stopped data service may be a replacement a failed attempt stopped because it couldn't
+    # be fenced, so it is stopped again on any exit until a barrier is confirmed (or none is
+    # needed).
+    fence_stop=("${missing[@]}")
+    unfenced=1
     pinned up -d --wait --wait-timeout "$timeout" --no-recreate "${missing[@]}"
 fi
 empty=0
@@ -373,10 +381,13 @@ if [ "$quiesce" = 1 ]; then
         exit 1
     fi
 fi
+# Fenced, empty, or nothing to fence (no migration pending and no leftover barrier).
+unfenced=0
 
 if [ ${#data_recreate[@]} -gt 0 ]; then
     echo "Recreating data services, as DEPLOY_RECREATE_DATA=1 allows: ${data_recreate[*]}."
     # From here until a fresh barrier is confirmed, any exit stops the recreated services (finish).
+    fence_stop=("${data_recreate[@]}")
     unfenced=1
     pinned up -d --wait --wait-timeout "$timeout" --no-deps --force-recreate "${data_recreate[@]}"
     # The barrier's session died with the old database (and its pause may live only in the old
