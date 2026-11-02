@@ -312,15 +312,27 @@ fn ffprobe_output_is_read_as_in_php() {
                 clip,
                 Some(VideoContainer::Matroska)
             )),
-            case["args"],
+            local_only(&case["args"], 2),
             "{name}"
         );
         assert_eq!(
             serde_json::json!(FfmpegFrameGrabber::probe_arguments(clip, None)),
-            case["unknown_args"],
+            local_only(&case["unknown_args"], 2),
             "{name}"
         );
     }
+}
+
+/// PHP's arguments with the port's local-files-only option inserted at `at`.
+fn local_only(php: &serde_json::Value, at: usize) -> serde_json::Value {
+    let mut arguments = php.as_array().expect("arguments").clone();
+    for (offset, argument) in nntmux_postprocess::media::frames::LOCAL_ONLY
+        .iter()
+        .enumerate()
+    {
+        arguments.insert(at + offset, serde_json::json!(argument));
+    }
+    serde_json::Value::Array(arguments)
 }
 
 fn ffmpeg() -> Option<PathBuf> {
@@ -361,7 +373,11 @@ async fn frame_grabs_run_ffmpeg_as_php_did() -> Result<()> {
             count,
             &format!("WORK/grab_{index}/frame_RANDOM_"),
         );
-        assert_eq!(serde_json::json!(arguments), case["args"], "grab {index}");
+        assert_eq!(
+            serde_json::json!(arguments),
+            local_only(&case["args"], 3),
+            "grab {index}"
+        );
 
         // The frames themselves need the real ffmpeg.
         let Some(ffmpeg) = &ffmpeg else { continue };

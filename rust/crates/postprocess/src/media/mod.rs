@@ -39,6 +39,15 @@ impl PreviewSettings {
     }
 }
 
+/// Removes a frame work directory when dropped.
+struct WorkDirectory(PathBuf);
+
+impl Drop for WorkDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// The preview steps for one worker.
 pub struct Previews<'a> {
     pub settings: PreviewSettings,
@@ -72,8 +81,9 @@ impl Previews<'_> {
             "frames_{}",
             hex::encode(rand::rng().random::<[u8; 6]>())
         ));
+        // Removed however the step ends, including when a stage timeout drops it.
+        let _cleanup = WorkDirectory(work.clone());
         let saved = self.save_frame(file, &work, guid, hints).await;
-        let _ = tokio::fs::remove_dir_all(&work).await;
         // PHP logged the failure only in debug mode.
         saved.unwrap_or(false)
     }

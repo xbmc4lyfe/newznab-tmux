@@ -53,6 +53,11 @@ pub struct FfmpegFrameGrabber {
     pub timeout: Duration,
 }
 
+/// Keeps ffmpeg and ffprobe to local files, including for anything the input refers to. PHP let
+/// them sniff the format freely, so a downloaded manifest (DASH, SDP and the like) could make
+/// them fetch from the network; the port only reads the file it was given.
+pub const LOCAL_ONLY: [&str; 2] = ["-protocol_whitelist", "file"];
+
 impl FfmpegFrameGrabber {
     /// The ffmpeg arguments for a grab into files starting with `prefix`.
     pub fn grab_arguments(
@@ -63,9 +68,9 @@ impl FfmpegFrameGrabber {
         count: i64,
         prefix: &str,
     ) -> Vec<String> {
-        let mut arguments: Vec<String> = ["-y", "-v", "error", "-skip_frame", "nokey"]
-            .map(String::from)
-            .to_vec();
+        let mut arguments: Vec<String> = ["-y", "-v", "error"].map(String::from).to_vec();
+        arguments.extend(LOCAL_ONLY.map(String::from));
+        arguments.extend(["-skip_frame", "nokey"].map(String::from));
         arguments.extend(input_format(container));
         arguments.extend([
             "-i".to_owned(),
@@ -94,6 +99,7 @@ impl FfmpegFrameGrabber {
 
     pub fn probe_arguments(video: &Path, container: Option<VideoContainer>) -> Vec<String> {
         let mut arguments = vec!["-v".to_owned(), "error".to_owned()];
+        arguments.extend(LOCAL_ONLY.map(String::from));
         arguments.extend(input_format(container));
         arguments
             .extend(["-show_format", "-show_streams", "-print_format", "json"].map(String::from));
