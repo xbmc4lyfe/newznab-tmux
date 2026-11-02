@@ -55,6 +55,15 @@ enum Command {
     },
     /// Measures the weak rungs on releases whose PreDB row is already known.
     Holdout,
+    /// Hides the names of already-named releases and measures how often their streams bring the
+    /// right ones back. It takes the provider from the NNTP_* variables, and writes to no database.
+    StreamHoldout {
+        #[arg(long, default_value_t = 500)]
+        sample: usize,
+        /// The most to download for one release, in MiB.
+        #[arg(long, default_value_t = 64)]
+        budget_mib: u64,
+    },
     /// Reads the streams of a sample of releases with no other evidence, over NNTP. It takes the
     /// provider from the NNTP_* variables, and writes to no database.
     StreamSample {
@@ -147,6 +156,20 @@ fn start(cli: &Cli) -> Result<()> {
             )?;
             write_out(&cli.out, "stream_sample.md", &report)?;
             write_out(&cli.out, "streams.tsv", &lines)?;
+            print!("{report}");
+        }
+        Command::StreamHoldout { sample, budget_mib } => {
+            let fetcher = NntpFetch::from_env()?;
+            let report = stream_probe::holdout(
+                &options,
+                &stream_probe::SampleOptions {
+                    sample,
+                    media: sample,
+                    byte_budget: budget_mib * 1024 * 1024,
+                },
+                &fetcher,
+            )?;
+            write_out(&cli.out, "stream_holdout.md", &report)?;
             print!("{report}");
         }
         Command::Holdout => {
