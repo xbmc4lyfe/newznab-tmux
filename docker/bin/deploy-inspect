@@ -5,6 +5,8 @@
   deploy-inspect services           every service, in any profile
   deploy-inspect image-users IMAGE  services that run IMAGE
   deploy-inspect image-of SERVICE   the image SERVICE runs
+  deploy-inspect app-deps IMAGE SVC...  "service dependency" for each listed service that needs
+                                    (directly or through others) a service running IMAGE
   deploy-inspect data BASE IMAGE    stateful services: not running IMAGE, and either listed in BASE
                                     (space-separated) or absent from the base roster read as names on
                                     fd 3, unless labelled nntmux.deploy.stateless: "true"
@@ -114,6 +116,24 @@ def main() -> None:
             if name in base or name not in roster:
                 data.append(name)
         print("\n".join(sorted(data)))
+    elif command == ["app-deps"]:
+        image = sys.argv[2]
+
+        def needs(name: str) -> list[str]:
+            deps = (services.get(name) or {}).get("depends_on") or {}
+            return list(deps) if isinstance(deps, (dict, list)) else []
+
+        for name in sys.argv[3:]:
+            seen, queue = set(), needs(name)
+            while queue:
+                dep = queue.pop()
+                if dep in seen:
+                    continue
+                seen.add(dep)
+                if (services.get(dep) or {}).get("image") == image:
+                    print(f"{name} {dep}")
+                    break
+                queue.extend(needs(dep))
     elif command == ["image-of"]:
         print((services.get(sys.argv[2]) or {}).get("image", ""))
     elif command == ["image-users"]:

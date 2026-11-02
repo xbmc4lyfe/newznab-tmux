@@ -146,6 +146,15 @@ known=" $("$inspect" services < "$work/all.json" | tr '\n' ' ') "
 # the app image, unless it is labelled nntmux.deploy.stateless: "true".
 COMPOSE_FILE="$stack/docker-compose.yml" "$compose" --profile '*' config --services > "$work/roster"
 data_services=" $("$inspect" data "$base_data" "$image" < "$work/all.json" 3< "$work/roster" | tr '\n' ' ') "
+# Starting a data service starts what it depends on. One that needs an app service would start
+# web and migrate before the writers stop and the barrier is held, so it is refused outright.
+bad_deps=$("$inspect" app-deps "$image" $data_services < "$work/all.json")
+if [ -n "$bad_deps" ]; then
+    echo "Data service(s) depend on an app service, which could migrate before writers stop:" >&2
+    echo "$bad_deps" | awk '{ print "  " $1 " needs " $2 }' >&2
+    echo "Remove that depends_on, or label the service nntmux.deploy.stateless: \"true\" if it holds no data." >&2
+    exit 1
+fi
 app_users=" $("$inspect" image-users "$image" < "$work/model.json" | tr '\n' ' ') "
 # Writers in every profile, so one started with an inactive profile (pending) is still quiesced.
 all_app_users=" $("$inspect" image-users "$image" < "$work/all.json" | tr '\n' ' ') "
@@ -362,7 +371,8 @@ if [ ${#missing[@]} -gt 0 ]; then
     # needed).
     fence_stop=("${missing[@]}")
     unfenced=1
-    pinned up -d --wait --wait-timeout "$timeout" --no-recreate "${missing[@]}"
+    # --no-deps: nothing but these data services starts before the writers stop.
+    pinned up -d --wait --wait-timeout "$timeout" --no-deps --no-recreate "${missing[@]}"
 fi
 empty=0
 if [ "$need_migrate" = 1 ]; then
