@@ -78,6 +78,12 @@ started=0
 work=$(mktemp -d)
 finish() {
     rc=$?
+    # A data service recreated without a confirmed fresh barrier must not keep serving: its
+    # remote verification workers would be unfenced.
+    if [ "${unfenced:-0}" = 1 ]; then
+        echo "Stopping the recreated data service(s) so nothing uses them unfenced: ${data_recreate[*]}." >&2
+        "$compose" stop "${data_recreate[@]}" || true
+    fi
     if [ "$started" = 1 ]; then
         printf '%s deploy result=finished rc=%s by=%s\n' "$(stamp)" "$rc" "$DEPLOY_BY" >> "$log"
     fi
@@ -260,8 +266,15 @@ fi
 database_identity() {
     # shellcheck disable=SC2016 # expanded inside the container
     pinned run --rm --no-deps -T --entrypoint sh migrate -c \
-        'printf "%s:%s/%s\n" "${DB_HOST:-127.0.0.1}" "${DB_PORT:-3306}" "${DB_DATABASE:-nntmux}"' \
-        | tail -n 1 | tr '[:upper:]' '[:lower:]' | tr -d '\r'
+        'printf "%s\n%s/%s\n" "${DB_HOST:-127.0.0.1}" "${DB_PORT:-3306}" "${DB_DATABASE:-nntmux}"' \
+        | tr -d '\r' | tail -n 2 | {
+        # Host names are case-insensitive; database names can be case-sensitive, so only the host
+        # is lowercased.
+        read -r host || true
+        read -r rest || true
+        [ -n "$host" ] && [ -n "$rest" ] || exit 0
+        printf '%s:%s\n' "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" "$rest"
+    }
 }
 
 # Waits until the barrier container reports that remote workers have drained. Returns non-zero,
@@ -363,6 +376,8 @@ fi
 
 if [ ${#data_recreate[@]} -gt 0 ]; then
     echo "Recreating data services, as DEPLOY_RECREATE_DATA=1 allows: ${data_recreate[*]}."
+    # From here until a fresh barrier is confirmed, any exit stops the recreated services (finish).
+    unfenced=1
     pinned up -d --wait --wait-timeout "$timeout" --no-deps --force-recreate "${data_recreate[@]}"
     # The barrier's session died with the old database (and its pause may live only in the old
     # storage), so the replacement is fenced by a fresh barrier before anything migrates it, and
@@ -373,11 +388,10 @@ if [ ${#data_recreate[@]} -gt 0 ]; then
         docker rm -f "$barrier" > /dev/null 2>&1 || true
         echo "The recreated database has no tables yet, so no verification worker can be using it."
     elif ! take_barrier; then
-        echo "Stopping the recreated data service(s) so nothing uses them unfenced: ${data_recreate[*]}." >&2
-        "$compose" stop "${data_recreate[@]}" || true
         echo "The writers stay stopped; rerun the deploy once remote workers can drain." >&2
         exit 1
     fi
+    unfenced=0
 fi
 if [ "$need_migrate" = 1 ]; then
     echo "Running migrations before recreating any service."
