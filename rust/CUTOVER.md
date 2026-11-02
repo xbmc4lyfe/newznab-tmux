@@ -7,7 +7,7 @@ without Allen's explicit go-ahead. The live MariaDB is the only copy of the data
 
 ## 1. Gates before anyone schedules the cutover
 
-Every gate is checked on the `rust-native` commit that will be merged.
+Every gate is checked on the `rust-native` commit that will be deployed. `just deploy` fast-forwards to the tip of `origin/rust-native`, so recheck the gates against the commit `just deploy-plan` reports.
 
 | Gate | How to check | Owner |
 | --- | --- | --- |
@@ -48,7 +48,7 @@ These steps are listed in order. Each one waits for Allen's go-ahead.
 ## 4. Rollback
 
 - **Before step 3:** the database and code are unchanged, but step 1 drained the fingerprint queue and stopped `horizon`, `scheduler` and `indexer`. Start them again with the current guarded tooling (`just deploy` on `master`); if `releases_rt` gained fields in step 1, the PHP app already expects them.
-- **After step 3, before step 5:** check the runtime out on `master` again (`git checkout master`, which must be the commit noted in step 3), set `DEPLOY_GIT_BRANCH=master` in `docker/.env`, and restart the PHP services with `just deploy` as above. The PHP deploy guard only deploys `origin/master`, and `master` doesn't move any more.
+- **After step 3, before step 5:** check the runtime out on `master` again (`git checkout master`, which must be the commit noted in step 3), set `DEPLOY_GIT_BRANCH=master` and restore any other `docker/.env` keys step 4 changed, and restart the PHP services with `just deploy` as above. The PHP deploy guard only deploys `origin/master`, and `master` doesn't move any more.
 - **After step 5:** stop the Rust services (`just docker down`) and any Rust verification workers on other hosts. Then check out `master` and redeploy PHP as above, restoring the `docker/.env` keys step 4 changed. The PHP app ignores `rust_migrations` and `ingestion_activity`, so the schema needs no rollback. Releases the Rust roles wrote meanwhile stay; they use the same tables. If step 6 rebuilt a Manticore table, run PHP's `manticore:create-indexes` and `nntmux:populate` for it, since PHP expects its own `releases_rt` shape.
 - **Restoring the backup** discards every write made since it was taken. Only do it if data is damaged, only with Allen's explicit go-ahead, and restore to a scratch instance first to check it.
 

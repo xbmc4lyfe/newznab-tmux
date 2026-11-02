@@ -56,4 +56,4 @@ Use this fallback when the GitHub Codex app reports that review credits have run
 
 ## Upstream synchronization
 
-Upstream is `NNTmux/newznab-tmux:master`. A separate request to synchronize upstream authorizes that workflow. Preserve upstream history with a merge commit. Feature work in this fork uses a squash merge, except the final `rust-native` into `master` cutover, which uses a merge commit (see [rust/CUTOVER.md](../../rust/CUTOVER.md)). Apply the same review and verification gates.
+Upstream is `NNTmux/newznab-tmux:master`. A separate request to synchronize upstream authorizes that workflow. Preserve upstream history with a merge commit. Feature work in this fork squash-merges into `rust-native`. Never merge anything into `master`: the PHP production runtime deploys from it until the cutover, which switches that runtime to `rust-native` rather than merging (see [rust/CUTOVER.md](../../rust/CUTOVER.md)). Apply the same review and verification gates.
