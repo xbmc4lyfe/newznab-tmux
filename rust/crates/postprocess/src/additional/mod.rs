@@ -12,5 +12,6 @@ pub mod nzb_contents;
 pub mod par2_mapping;
 pub mod planner;
 pub mod queue;
+pub mod release_files;
 pub mod search_sync;
 pub mod seven_zip_listing;
