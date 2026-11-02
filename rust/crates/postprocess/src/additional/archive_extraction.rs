@@ -149,6 +149,18 @@ pub struct Extractor {
     pub command_timeout: Duration,
 }
 
+/// Runs extractor work on a blocking thread, so a client running up to its timeout never holds
+/// an async worker.
+pub async fn blocking<T, F>(work: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|failure| anyhow::anyhow!("archive extraction task failed: {failure}"))
+}
+
 impl Extractor {
     pub fn from_config(config: &Config) -> Self {
         let seconds = config.settings.timeout_seconds;

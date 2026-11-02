@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use sqlx::MySqlPool;
 
 use super::archive_extraction::{
-    ArchiveFlags, Extractor, Inspection, has_archive_signature, is_nfo_file,
+    ArchiveFlags, Extractor, Inspection, blocking, has_archive_signature, is_nfo_file,
     needs_seven_zip_end_header, with_seven_zip_end_header,
 };
 use super::context::ReleaseContext;
@@ -1161,20 +1161,29 @@ impl<'a> ReleaseProcessor<'a> {
         let tail = self
             .download_seven_zip_tail(context, &data, tail_message_ids)
             .await;
-        let mut flags = ArchiveFlags::default();
-        let mut listing = if data.starts_with(MARKER_SIGNATURE) {
-            self.config.extractor.list_encoded_seven_zip(
-                &data,
-                tail.as_deref(),
-                context.release.size,
-                &mut flags,
-                &context.tmp_path,
-            )
-        } else {
-            None
-        };
-        context.absorb(&flags);
         let mut archive_data = Arc::new(data);
+        let (mut listing, tail) = if archive_data.starts_with(MARKER_SIGNATURE) {
+            let extractor = self.config.extractor.clone();
+            let head = Arc::clone(&archive_data);
+            let size = context.release.size;
+            let tmp = context.tmp_path.clone();
+            let (listing, flags, tail) = blocking(move || {
+                let mut flags = ArchiveFlags::default();
+                let listing = extractor.list_encoded_seven_zip(
+                    &head,
+                    tail.as_deref(),
+                    size,
+                    &mut flags,
+                    &tmp,
+                );
+                (listing, flags, tail)
+            })
+            .await?;
+            context.absorb(&flags);
+            (listing, tail)
+        } else {
+            (None, tail)
+        };
         if listing.is_none() {
             if let Some(joined) = tail
                 .as_deref()
@@ -1182,12 +1191,7 @@ impl<'a> ReleaseProcessor<'a> {
             {
                 archive_data = Arc::new(joined);
             }
-            let mut flags = ArchiveFlags::default();
-            let inspected = self.config.extractor.process_compressed_data(
-                &archive_data,
-                &mut flags,
-                &context.tmp_path,
-            );
+            let (inspected, flags) = self.inspect_blocking(&archive_data, context).await?;
             context.absorb(&flags);
             listing = Some(inspected?);
         }
@@ -1262,6 +1266,23 @@ impl<'a> ReleaseProcessor<'a> {
         download.data
     }
 
+    /// `Extractor::process_compressed_data` on a blocking thread, with the flags it set.
+    async fn inspect_blocking(
+        &self,
+        data: &Arc<Vec<u8>>,
+        context: &ReleaseContext,
+    ) -> Result<(Result<Inspection>, ArchiveFlags)> {
+        let extractor = self.config.extractor.clone();
+        let data = Arc::clone(data);
+        let tmp = context.tmp_path.clone();
+        blocking(move || {
+            let mut flags = ArchiveFlags::default();
+            let inspected = extractor.process_compressed_data(&data, &mut flags, &tmp);
+            (inspected, flags)
+        })
+        .await
+    }
+
     /// `processCompressedData`, for an archive unpacked from another.
     async fn process_compressed_data(
         &mut self,
@@ -1270,11 +1291,7 @@ impl<'a> ReleaseProcessor<'a> {
         title: &str,
     ) -> Result<bool> {
         let data = Arc::new(data);
-        let mut flags = ArchiveFlags::default();
-        let inspected =
-            self.config
-                .extractor
-                .process_compressed_data(&data, &mut flags, &context.tmp_path);
+        let (inspected, flags) = self.inspect_blocking(&data, context).await?;
         context.absorb(&flags);
         self.handle_archive_result(inspected?, data, context, false, title, None, false)
             .await

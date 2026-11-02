@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::archive_extraction::{complete_stored_entries, is_nfo_file};
+use super::archive_extraction::{blocking, complete_stored_entries, is_nfo_file};
 use super::context::ReleaseContext;
 use super::download::DownloadKind;
 use super::processor::{IMAGE_FILE, ReleaseProcessor, unique_id};
@@ -195,12 +195,9 @@ impl ReleaseProcessor<'_> {
                 continue;
             };
             let data = Arc::new(data);
-            let filenames: Vec<&[u8]> = wanted.iter().map(Vec::as_slice).collect();
-            let extracted = self.config.extractor.extract_specific_files(
-                &data,
-                &filenames,
-                &context.tmp_path,
-            )?;
+            let extracted = self
+                .extract_blocking(&data, wanted.clone(), context)
+                .await?;
             if self
                 .use_extracted(&wanted, &extracted, context, "release_file_", handler)
                 .await?
@@ -220,18 +217,32 @@ impl ReleaseProcessor<'_> {
         prefix: &str,
         handler: Handler,
     ) -> Result<()> {
-        let filenames: Vec<&[u8]> = names
+        let wanted = names
             .iter()
-            .map(Vec::as_slice)
             .filter(|name| !name.is_empty())
+            .cloned()
             .collect();
-        let extracted =
-            self.config
-                .extractor
-                .extract_specific_files(data, &filenames, &context.tmp_path)?;
+        let extracted = self.extract_blocking(data, wanted, context).await?;
         self.use_extracted(names, &extracted, context, prefix, handler)
             .await?;
         Ok(())
+    }
+
+    /// `Extractor::extract_specific_files` on a blocking thread.
+    async fn extract_blocking(
+        &self,
+        data: &Arc<Vec<u8>>,
+        names: Vec<Vec<u8>>,
+        context: &ReleaseContext,
+    ) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+        let extractor = self.config.extractor.clone();
+        let data = Arc::clone(data);
+        let tmp = context.tmp_path.clone();
+        blocking(move || {
+            let filenames: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
+            extractor.extract_specific_files(&data, &filenames, &tmp)
+        })
+        .await?
     }
 
     /// The first extracted file, in the order named, that the handler takes.
