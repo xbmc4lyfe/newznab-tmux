@@ -142,6 +142,27 @@ impl NfoService {
         }
     }
 
+    /// The GUID buckets with NFO work, at most 16, by the same predicates as
+    /// [`Self::process_nfo_files`]. `PostProcessRunner::processNfo` fans out over these.
+    pub async fn buckets(&self) -> Result<Vec<String>> {
+        let mut query = QueryBuilder::<MySql>::new(
+            "SELECT DISTINCT LEFT(leftguid, 1) FROM releases WHERE nfostatus BETWEEN ",
+        );
+        query
+            .push_bind(self.settings.lowest_status)
+            .push(" AND ")
+            .push_bind(NFO_UNPROC)
+            .push(" AND late_article_candidate_id IS NULL");
+        if self.settings.max_size > 0 {
+            query.push(" AND size < ").push_bind(self.settings.max_size);
+        }
+        if self.settings.min_size > 0 {
+            query.push(" AND size > ").push_bind(self.settings.min_size);
+        }
+        query.push(" LIMIT 16");
+        Ok(query.build_query_scalar().fetch_all(&self.pool).await?)
+    }
+
     /// `processNfoFiles`: one pass over the backlog, optionally for one group or GUID bucket,
     /// then the archive pass. Returns the NFOs stored.
     pub async fn process_nfo_files(

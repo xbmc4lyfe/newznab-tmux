@@ -9,6 +9,7 @@ pub mod config;
 pub mod media;
 pub mod mediainfo;
 pub mod nfo;
+pub mod runner;
 pub mod tv_pipeline;
 pub mod workspace;
 
@@ -18,8 +19,9 @@ use nntmux_runtime::{Ctx, RoleArgs, Shutdown};
 
 use crate::config::Config;
 
-pub async fn run(_ctx: Ctx, _args: RoleArgs, _stop: Shutdown) -> Result<()> {
-    bail!("the postprocess role isn't ported yet")
+/// The postprocess role: additional, NFO, movie and TV passes over every GUID bucket.
+pub async fn run(ctx: Ctx, args: RoleArgs, stop: Shutdown) -> Result<()> {
+    runner::run(ctx, args, stop).await
 }
 
 /// `nntmux-ctl postprocess ...`
@@ -97,6 +99,24 @@ pub enum Command {
         /// Show each release's outcome.
         #[arg(long)]
         show_output: bool,
+    },
+    /// `multiprocessing:postprocess`: one kind of post-processing over every GUID bucket with
+    /// work, in parallel.
+    Multiprocess {
+        /// ama, add, ani, mov, nfo, tv, boo, mus, con or gam.
+        #[arg(value_name = "TYPE")]
+        kind: String,
+        /// For mov and tv: true to process renamed releases only.
+        #[arg(default_value = "false")]
+        renamed: String,
+    },
+    /// `update:postprocess`: one kind of post-processing in a single pass.
+    Update {
+        /// all, nfo, movies, tv, music, console, games, book, anime, additional or amazon.
+        #[arg(value_name = "TYPE")]
+        kind: String,
+        /// Accepted for compatibility; output follows ECHOCLI.
+        echo: Option<String>,
     },
     /// `update:postprocess nfo`: one pass of NFO processing, then the archive pass for releases
     /// out of retries.
@@ -198,6 +218,23 @@ pub async fn ctl(ctx: Ctx, command: Command) -> Result<()> {
                 },
             )
             .await
+        }
+        Command::Multiprocess { kind, renamed } => {
+            let Some(kind) = runner::Kind::from_short(&kind) else {
+                eprintln!("{}", runner::MULTIPROCESS_HELP);
+                bail!("invalid type: {kind}");
+            };
+            runner::multiprocess(&ctx, kind, renamed == "true").await
+        }
+        Command::Update { kind, echo: _ } => {
+            if kind == "all" {
+                return runner::update_all(&ctx).await;
+            }
+            let Some(kind) = runner::Kind::from_long(&kind) else {
+                eprintln!("Invalid type: {kind}\n\n{}", runner::UPDATE_HELP);
+                bail!("invalid type: {kind}");
+            };
+            runner::update(&ctx, kind).await
         }
         Command::Nfo { guid, group } => {
             if !guid.is_empty() {

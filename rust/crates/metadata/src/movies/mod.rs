@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::Result;
+use futures_util::StreamExt;
 use md5::{Digest, Md5};
 use nntmux_core::pcre::Pcre;
 use nntmux_predb::selector::similar_text_percent;
@@ -1236,6 +1237,71 @@ impl MovieLookup {
         self.services.sync_releases(&ids).await;
         Ok(())
     }
+}
+
+/// `PostProcessRunner::processMovies`: every GUID bucket with movies to look up, up to
+/// `post_threads_non` at a time. `renamed_only` narrows the work to renamed releases on top of
+/// the configured mode, as the runner's flag did.
+pub async fn dispatch_buckets(
+    services: Arc<Services>,
+    settings: &MetadataSettings,
+    renamed_only: bool,
+) -> Result<()> {
+    if !settings.movie_lookup.enabled() {
+        return Ok(());
+    }
+    let configured = if settings.movie_lookup == LookupMode::RenamedOnly {
+        " AND isrenamed = 1"
+    } else {
+        ""
+    };
+    let renamed = if renamed_only {
+        " AND isrenamed = 1"
+    } else {
+        ""
+    };
+    let statement = format!(
+        "SELECT DISTINCT LEFT(leftguid, 1) AS bucket FROM releases \
+         WHERE categories_id BETWEEN {MOVIE_ROOT} AND {MOVIE_OTHER} AND {} AND {SETTLED}\
+         {configured}{renamed} LIMIT 16",
+        imdb_needs_lookup_sql("imdbid"),
+    );
+    let buckets: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+        .fetch_all(&services.db)
+        .await?;
+    let threads: Option<i64> = sqlx::query_scalar(
+        "SELECT CAST(post_threads_non AS SIGNED) FROM post_processing_configurations WHERE id = 1",
+    )
+    .fetch_optional(&services.db)
+    .await?;
+    let threads = usize::try_from(threads.unwrap_or(1).max(1))?;
+    // The runner passed 2 (renamed only) or 1 (every release) to each bucket worker.
+    let mode = if renamed_only {
+        LookupMode::RenamedOnly
+    } else {
+        LookupMode::All
+    };
+    let results: Vec<Result<()>> = futures_util::stream::iter(buckets)
+        .map(|bucket| {
+            let services = services.clone();
+            let settings = settings.clone();
+            async move {
+                MovieLookup::new(services, settings)
+                    .process(0, &bucket, mode)
+                    .await
+            }
+        })
+        .buffer_unordered(threads)
+        .collect()
+        .await;
+    let failures: Vec<String> = results
+        .into_iter()
+        .filter_map(|result| result.err().map(|failure| format!("{failure:#}")))
+        .collect();
+    if !failures.is_empty() {
+        anyhow::bail!("movie bucket workers failed: {}", failures.join("; "));
+    }
+    Ok(())
 }
 
 /// [`crate::process_movies`] starts here.

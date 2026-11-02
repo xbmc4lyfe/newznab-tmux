@@ -34,7 +34,7 @@ fn search(ctx: &Ctx) -> Result<Arc<dyn ReleaseSearch>> {
     }))
 }
 
-async fn services(ctx: &Ctx) -> Result<Services> {
+pub(crate) async fn services(ctx: &Ctx) -> Result<Services> {
     let config = Config::load(&ctx.db).await?;
     Services::build(ctx.db.clone(), config, search(ctx)?).await
 }
@@ -163,12 +163,10 @@ pub async fn guid(ctx: &Ctx, options: GuidOptions) -> Result<()> {
     match options.kind.as_str() {
         "additional" => additional_bucket(ctx, &options).await,
         "nfo" => {
-            let config = Config::load(&ctx.db).await?;
-            let nntp = nntmux_nntp::NntpConfig::from_env();
-            let settings = nfo::Settings::from_config(&config, nntp.alternate_article_fallback);
-            let client = nntmux_nntp::NntpClient::new(Arc::new(nntp));
-            let mut service = nfo::NfoService::new(ctx.db.clone(), settings, client);
-            service.process_nfo_files(None, guid).await?;
+            nfo_service(ctx)
+                .await?
+                .process_nfo_files(None, guid)
+                .await?;
             Ok(())
         }
         "movie" => match renamed() {
@@ -202,9 +200,18 @@ pub async fn guid(ctx: &Ctx, options: GuidOptions) -> Result<()> {
     }
 }
 
+/// An NFO service on the configured news server.
+pub(crate) async fn nfo_service(ctx: &Ctx) -> Result<nfo::NfoService> {
+    let config = Config::load(&ctx.db).await?;
+    let nntp = nntmux_nntp::NntpConfig::from_env();
+    let settings = nfo::Settings::from_config(&config, nntp.alternate_article_fallback);
+    let client = nntmux_nntp::NntpClient::new(Arc::new(nntp));
+    Ok(nfo::NfoService::new(ctx.db.clone(), settings, client))
+}
+
 /// `processAdditional`: claim batches of the bucket until none is left, the batch limit or the
 /// child time limit.
-async fn additional_bucket(ctx: &Ctx, options: &GuidOptions) -> Result<()> {
+pub(crate) async fn additional_bucket(ctx: &Ctx, options: &GuidOptions) -> Result<()> {
     let mut services = services(ctx).await?;
     let max_batches = if options.worker {
         options.max_batches.max(1)

@@ -335,3 +335,51 @@ async fn reverify_resets_mismatches_unless_dry() {
     );
     h.db.drop_database().await.unwrap();
 }
+
+#[tokio::test]
+async fn every_movie_bucket_is_dispatched() {
+    let Some(h) = harness(Keys::default()).await else {
+        return;
+    };
+    let first = insert_release_in(&h.db.pool, "Nothing.Known.2011.BluRay", GUID, 2040).await;
+    let second = insert_release_in(
+        &h.db.pool,
+        "Also.Unknown.2012.BluRay",
+        "b0000000000000000000000000000002",
+        2040,
+    )
+    .await;
+    let renamed = insert_release_in(
+        &h.db.pool,
+        "Renamed.Only.2013.BluRay",
+        "c0000000000000000000000000000003",
+        2040,
+    )
+    .await;
+    sqlx::query("UPDATE post_processing_configurations SET post_threads_non = 2 WHERE id = 1")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+
+    // Renamed only: nothing is renamed yet, so nothing is looked up.
+    nntmux_metadata::movies::dispatch_buckets(
+        h.services.clone(),
+        &MetadataSettings::default(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(release_imdb(&h.db.pool, first).await.0, None);
+
+    nntmux_metadata::movies::dispatch_buckets(
+        h.services.clone(),
+        &MetadataSettings::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    for id in [first, second, renamed] {
+        assert_eq!(release_imdb(&h.db.pool, id).await.0.as_deref(), Some(""));
+    }
+    h.db.drop_database().await.unwrap();
+}

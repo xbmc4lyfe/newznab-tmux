@@ -113,6 +113,13 @@ pub async fn process_movies(
     movies::run(ctx, group_id, guid_char, renamed).await
 }
 
+/// `multiprocessing:postprocess mov`: every movie bucket, in parallel.
+pub async fn process_movie_buckets(ctx: &Ctx, renamed_only: bool) -> Result<()> {
+    let services = services::Services::shared(ctx)?;
+    let settings = MetadataSettings::load(&services.db).await?;
+    movies::dispatch_buckets(services, &settings, renamed_only).await
+}
+
 /// PHP's `processTv`: with no bucket it dispatches over the buckets, otherwise it runs
 /// [`process_tv_pipeline`] on that bucket.
 pub async fn process_tv(ctx: &Ctx, group_id: i64, guid_char: &str, renamed: Renamed) -> Result<()> {
