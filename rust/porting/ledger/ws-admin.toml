@@ -10,13 +10,14 @@ status = "todo"
 kind = "command"
 id = "captcha:status"
 source = "app/Console/Commands/CaptchaStatus.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "command"
 id = "cloudflare:reload"
 source = "app/Console/Commands/CloudflareReload.php"
-status = "todo"
+status = "dropped"
+note = "Refreshed Cloudflare's ranges for Laravel's trusted proxy middleware. nntmux_webkit::client_ip carries the published ranges, and TRUSTED_PROXIES adds any others."
 
 [[entry]]
 kind = "command"
@@ -53,7 +54,7 @@ status = "ported"
 kind = "command"
 id = "role:manage"
 source = "app/Console/Commands/ManageRoleStacking.php"
-status = "todo"
+status = "ported"
 
 [[entry]]
 kind = "job"
@@ -163,13 +164,15 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/anidb-edit/{id}"
 source = "App\\Http\\Controllers\\Admin\\AdminAnidbController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no anime catalog to edit."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/anidb-list"
 source = "App\\Http\\Controllers\\Admin\\AdminAnidbController@index"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no anime catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -217,13 +220,15 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/book-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminBookController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no book catalog to edit."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/book-list"
 source = "App\\Http\\Controllers\\Admin\\AdminBookController@index"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no book catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -277,13 +282,15 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/console-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminConsoleController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no console catalog to edit."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/console-list"
 source = "App\\Http\\Controllers\\Admin\\AdminConsoleController@index"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no console catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -313,13 +320,15 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/game-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminGameController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no game catalog to edit."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/game-list"
 source = "App\\Http\\Controllers\\Admin\\AdminGameController@index"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no game catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -463,13 +472,15 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/music-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminMusicController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no music catalog to edit."
 
 [[entry]]
 kind = "route"
 id = "GET|HEAD /admin/music-list"
 source = "App\\Http\\Controllers\\Admin\\AdminMusicController@index"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no music catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -679,13 +690,15 @@ status = "todo"
 kind = "route"
 id = "POST /admin/anidb-delete/{id}"
 source = "App\\Http\\Controllers\\Admin\\AdminAnidbController@destroy"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no anime catalog to edit."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/anidb-edit/{id}"
 source = "App\\Http\\Controllers\\Admin\\AdminAnidbController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no anime catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -697,7 +710,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/book-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminBookController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no book catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -733,7 +747,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/console-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminConsoleController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no console catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -781,7 +796,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/game-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminGameController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no game catalog to edit."
 
 [[entry]]
 kind = "route"
@@ -859,7 +875,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/music-edit"
 source = "App\\Http\\Controllers\\Admin\\AdminMusicController@edit"
-status = "todo"
+status = "dropped"
+note = "Only TV and movies are in scope, so the Rust stack has no music catalog to edit."
 
 [[entry]]
 kind = "route"
