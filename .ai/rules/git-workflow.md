@@ -5,7 +5,7 @@ paths:
 
 # Git workflow and review gates
 
-A human prompt or goal authorizes agents to commit task changes, push feature branches, open pull requests, and squash-merge reviewed feature pull requests into `rust-native` in `xbmc4lyfe/newznab-tmux`. Stay within the task. Deployment, production changes, dependency changes, force pushes, and changes to repository protections need separate authorization.
+A human prompt or goal authorizes agents to commit task changes, push feature branches, open pull requests, and squash-merge reviewed feature pull requests into `rust-native` in `xbmc4lyfe/newznab-tmux`. Stay within the task. Deployment, production changes, force pushes, and changes to repository protections need separate authorization. Dependency changes don't.
 
 ## Prepare the branch
 

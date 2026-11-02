@@ -5,12 +5,12 @@ description: Validate NNTmux ingestion/storage concurrency and performance claim
 
 # NNTmux performance validation
 
-These procedures supplement `AGENTS.md`. They do not authorize dependency installation, production tuning, deployment, or containerized commands.
+These procedures supplement `AGENTS.md`. They do not authorize production tuning, deployment, or containerized commands.
 
 ## Choose the experiment
 
 - Start with existing PHPUnit tests, real storage handlers, MariaDB `EXPLAIN` and lock-wait metadata, and OS/container resource counters.
-- Treat temporary benchmark harnesses as experimental until committed, reviewed, and documented. Use Sysbench for a reproduced SQL transaction or PHPBench for pure PHP only when existing tools cannot answer the question; follow dependency approval rules.
+- Treat temporary benchmark harnesses as experimental until committed, reviewed, and documented. Use Sysbench for a reproduced SQL transaction or PHPBench for pure PHP only when existing tools cannot answer the question.
 - Use one executor and a uniquely named disposable database/runtime per experiment. Run concurrency/capacity benchmarks on a separate host; production-host resource limits do not eliminate shared-resource interference.
 - Keep production endpoints, credentials, bind mounts, `.env` files, and cached application configuration out of validation runtimes.
 - Before a MariaDB fixture, clear Laravel connection `url` and `unix_socket`, explicitly set private host and port, and pass that endpoint to every child connection. Use random fixture database names. Roll back transactions, reap children, and drop only owned fixtures in `finally`.

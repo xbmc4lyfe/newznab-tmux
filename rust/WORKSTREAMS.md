@@ -32,7 +32,7 @@ The goal is zero PHP, with every entry point in Rust: all routes, commands, jobs
 | `ws-ingest` | `ingest` | M3 | `app/Services/Binaries`, `Backfill`, `NNTP` callers, `multiprocessing:update-per-group` and `:backfill` |
 | `ws-naming` | `categorize`, `namefix`, `predb` | M4 | `app/Services/Categorization`, `NameFixing`, `Predb`, IRC scraper |
 | `ws-releases` | `releases`, `fingerprint`, `verify` | M5 | `app/Services/Releases` (assembly, NZB, fingerprint, verification, remote publication), `rust/fingerprint-worker` |
-| `ws-postprocess` | `postprocess` | M6 | Additional processing, NFO, PAR2, archives, samples, media through ffmpeg |
+| `ws-postprocess` | `postprocess`, `mediaprobe` | M6 | Additional processing, NFO, PAR2, archives, samples, media through ffmpeg |
 | `ws-metadata` | `metadata` | M6 | TV, movie, music, game, book and anime providers, covers, rate limits per key |
 | `ws-search` | `search` | M7 | `app/Services/Search`, Manticore indexing, repair, reconcile, and the read API that `api` and `site` call |
 | `ws-api` | `api` | M9 | `/api`, `/rss`, `/getnzb`, API keys, rate limits, API usage jobs. XML and JSON must match byte for byte against recorded PHP responses |

@@ -21,7 +21,7 @@ These model rules apply to Codex subagents only; Claude uses `CLAUDE.md`. Keep t
 
 # Git workflow and code review
 
-A human prompt or goal authorizes agents to commit task changes, push a feature branch, open a PR, and squash-merge it into `rust-native` in `xbmc4lyfe/newznab-tmux` after all review gates pass. Follow [.ai/rules/git-workflow.md](.ai/rules/git-workflow.md). This permission doesn't authorize deployment, production changes, or dependency changes.
+A human prompt or goal authorizes agents to commit task changes, push a feature branch, open a PR, and squash-merge it into `rust-native` in `xbmc4lyfe/newznab-tmux` after all review gates pass. Follow [.ai/rules/git-workflow.md](.ai/rules/git-workflow.md). This permission doesn't authorize deployment or production changes. Adding or upgrading dependencies needs no separate approval.
 
 - Before opening a PR, obtain an independent local review with no P0 or P1 findings using Antigravity (via an independent subagent) or Codex (via a Codex subagent or separate command-line process); if local Codex does not work, you can substitute a subagent within whatever harness you are using to do a local review. Only fix P0 and P1 findings; P2, P3, P4, and lower-priority findings can be ignored.
 - After opening the PR, obtain a PR review from Antigravity or request `@codex review`. Only fix P0 and P1 findings; P2, P3, P4, and lower-priority findings can be ignored. For P0 and P1 findings, address and reply to each finding, resolve its review thread, and obtain another review after fixes or an explanation that a finding doesn't apply.
@@ -47,7 +47,7 @@ Laravel 13 Usenet indexer. Use this file for repo-wide defaults; load a project 
 - Fetch and integrate any newer commits from `xbmc4lyfe/newznab-tmux/rust-native` again immediately before the first local review and again before creating the PR. Resolve conflicts, retain the intended behavior, and rerun affected checks before review/submission; do not review or submit a stale base just because the branch was current when work began. If `rust-native` has not advanced, no additional merge is needed.
 - Read [.ai/rules/index.md](.ai/rules/index.md), every rule matching the target paths, and search `.ai/rules` for task keywords.
 - Record durable shared rules with Boost's `record-rule`; don't substitute personal memory.
-- Follow existing sibling conventions and reuse existing components. Keep dependencies and new base directories subject to user approval.
+- Follow existing sibling conventions and reuse existing components. Agents may add dependencies without asking; keep new base directories subject to user approval.
 - Create documentation only when requested. Keep replies concise.
 
 ## Command execution precedence
@@ -61,7 +61,7 @@ Try Rust first for new app logic. When fixing or upgrading code in another langu
 
 ## Changes and verification
 
-- Follow Laravel/package versions in the lockfiles and existing sibling conventions. Never change dependencies without approval.
+- Follow package versions in the lockfiles and existing sibling conventions. Adding or upgrading a dependency doesn't need approval; say why in the PR.
 - Add every new or renamed `env()` key to `.env.example` with a default and short comment; use `config()` outside config files.
 - After code changes, run Pint, PHPStan, and PHP syntax lint on changed PHP files. Run focused PHPUnit tests for behavior changes; PHPUnit only, no Pest.
 - Run `npm run build` after frontend changes. Refresh route cache after route changes when needed.
