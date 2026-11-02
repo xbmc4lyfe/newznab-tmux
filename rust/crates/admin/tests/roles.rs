@@ -156,3 +156,66 @@ async fn cancelling_clears_a_pending_role() -> Result<()> {
     assert!(list_pending(&db.pool).await?.is_empty());
     db.drop_database().await
 }
+
+#[tokio::test]
+async fn activation_sets_the_new_expiry_and_keeps_a_missing_role_pending() -> Result<()> {
+    let Some(db) = TestDb::create().await? else {
+        return Ok(());
+    };
+    let Some(ctx) = context(&db).await? else {
+        return Ok(());
+    };
+    let now = at("2026-11-01 12:00:00");
+    sqlx::query(
+        "INSERT INTO roles (id, name, guard_name, apirequests, rate_limit, downloadrequests, \
+         defaultinvites, isdefault, donation, addyears) VALUES (9, 'Gold', 'web', 100, 60, 100, \
+         0, 0, 10, 1)",
+    )
+    .execute(&db.pool)
+    .await?;
+    for (days, roles, active) in [(10, "[]", 1), (5, "[9]", 1), (100, "[4]", 1), (50, "[]", 0)] {
+        sqlx::query(
+            "INSERT INTO role_promotions (name, applicable_roles, additional_days, is_active) \
+             VALUES ('promo', ?, ?, ?)",
+        )
+        .bind(roles)
+        .bind(days)
+        .bind(active)
+        .execute(&db.pool)
+        .await?;
+    }
+    let gold = user(&db, "gold", 1, Some((9, "2026-11-01 00:00:00"))).await?;
+    sqlx::query("UPDATE users SET rolechangedate = '2026-10-01 00:00:00' WHERE id = ?")
+        .bind(gold)
+        .execute(&db.pool)
+        .await?;
+    let orphan = user(&db, "orphan", 1, Some((77, "2026-11-01 00:00:00"))).await?;
+
+    let (activated, failed) = activate_pending(&ctx, now).await?;
+    assert_eq!(activated.len(), 1);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, "orphan");
+
+    // A year of 365 days plus the 10- and 5-day promotions that apply to Gold.
+    let expiry: Option<NaiveDateTime> =
+        sqlx::query_scalar("SELECT rolechangedate FROM users WHERE id = ?")
+            .bind(gold)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(expiry, Some(at("2027-11-16 12:00:00")));
+    let (old, new): (Option<NaiveDateTime>, Option<NaiveDateTime>) = sqlx::query_as(
+        "SELECT old_expiry_date, new_expiry_date FROM user_role_history WHERE user_id = ?",
+    )
+    .bind(gold)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!((old, new), (Some(at("2026-10-01 00:00:00")), expiry));
+
+    let (role, pending): (i32, Option<i32>) =
+        sqlx::query_as("SELECT roles_id, pending_roles_id FROM users WHERE id = ?")
+            .bind(orphan)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!((role, pending), (1, Some(77)));
+    db.drop_database().await
+}

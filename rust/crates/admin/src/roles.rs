@@ -329,34 +329,42 @@ async fn activate_one(ctx: &Ctx, id: u64, now: NaiveDateTime) -> Result<Option<A
     };
     let target = i64::from(target);
     let linked = linked_role(&ctx.db, id).await?;
-    let pending_name = role_name(&ctx.db, target).await?;
+    // A pending role deleted since it was queued stays pending, as the scheduled activation
+    // left it, rather than pointing the user at a role that doesn't exist.
+    let Some(pending_name) = role_name(&ctx.db, target).await? else {
+        bail!("pending role {target} no longer exists");
+    };
+    let old_expiry: Option<NaiveDateTime> =
+        sqlx::query_scalar("SELECT rolechangedate FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    // `User::activatePendingRole`'s expiry. Laravel's manual command kept the old date, so the
+    // next expiry run took away the role it had just granted.
+    let new_expiry = new_expiry(&ctx.db, target, now).await?;
     sqlx::query(
-        "UPDATE users SET roles_id = ?, pending_roles_id = NULL, pending_role_start_date = NULL, \
-         updated_at = ? WHERE id = ?",
+        "UPDATE users SET roles_id = ?, rolechangedate = ?, pending_roles_id = NULL, \
+         pending_role_start_date = NULL, updated_at = ? WHERE id = ?",
     )
     .bind(target)
+    .bind(new_expiry)
     .bind(now)
     .bind(id)
     .execute(&mut *tx)
     .await?;
-    if pending_name.is_some() {
-        sync_role(&mut tx, id, target).await?;
-    }
+    sync_role(&mut tx, id, target).await?;
     let previous = i64::from(account.roles_id);
     let role_changed = previous != target;
     if role_changed {
         let old_name = role_name(&ctx.db, previous)
             .await?
             .unwrap_or_else(|| format!("Role #{previous}"));
-        let new_name = pending_name
-            .clone()
-            .unwrap_or_else(|| format!("Role #{target}"));
         log_role_updated(
             &mut tx,
             id,
             &account.username,
             (previous, &old_name),
-            (target, &new_name),
+            (target, &pending_name),
             "System",
         )
         .await?;
@@ -367,8 +375,8 @@ async fn activate_one(ctx: &Ctx, id: u64, now: NaiveDateTime) -> Result<Option<A
             user: id,
             old_role: linked.as_ref().map(|(role, _)| *role),
             new_role: target,
-            old_expiry: None,
-            new_expiry: None,
+            old_expiry,
+            new_expiry,
             effective: now,
             stacked: true,
             reason: Some("manual_activation"),
@@ -380,12 +388,11 @@ async fn activate_one(ctx: &Ctx, id: u64, now: NaiveDateTime) -> Result<Option<A
 
     if role_changed {
         forget_api_caches(ctx, id, &account.api_token).await;
-        let role = pending_name.clone().unwrap_or_else(|| "User".to_owned());
         if let Err(failure) = nntmux_mail::account::send_account_changed(
             ctx,
             &account.email,
             &account.username,
-            &role,
+            &pending_name,
         )
         .await
         {
@@ -399,8 +406,34 @@ async fn activate_one(ctx: &Ctx, id: u64, now: NaiveDateTime) -> Result<Option<A
     Ok(Some(Activation {
         username: account.username,
         from: linked.map_or_else(|| "None".to_owned(), |(_, name)| name),
-        to: pending_name.unwrap_or_else(|| "Unknown".to_owned()),
+        to: pending_name,
     }))
+}
+
+/// A role's length, `addyears` years of 365 days plus every running promotion for it
+/// (`RolePromotion::calculateAdditionalDays`), from `now`. None when the role doesn't expire.
+pub async fn new_expiry(
+    db: &MySqlPool,
+    role: i64,
+    now: NaiveDateTime,
+) -> Result<Option<NaiveDateTime>> {
+    let years: i64 = sqlx::query_scalar("SELECT CAST(addyears AS SIGNED) FROM roles WHERE id = ?")
+        .bind(role)
+        .fetch_one(db)
+        .await?;
+    let promotion: i64 = sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(additional_days), 0) AS SIGNED) FROM role_promotions \
+         WHERE is_active = 1 AND (start_date IS NULL OR start_date <= ?) \
+         AND (end_date IS NULL OR end_date >= ?) \
+         AND (JSON_LENGTH(applicable_roles) = 0 OR JSON_CONTAINS(applicable_roles, ?))",
+    )
+    .bind(now)
+    .bind(now)
+    .bind(role.to_string())
+    .fetch_one(db)
+    .await?;
+    let days = years * 365 + promotion;
+    Ok((days > 0).then(|| now + chrono::Duration::days(days)))
 }
 
 /// Fails with `role:manage`'s message when a user is missing.
