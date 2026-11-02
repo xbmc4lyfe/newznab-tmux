@@ -1,0 +1,365 @@
+{
+    "nfo_filenames": [
+        {
+            "name": "Movie.2160p.nfo",
+            "nfo": true
+        },
+        {
+            "name": "MOVIE.NFO",
+            "nfo": true
+        },
+        {
+            "name": "movie.diz",
+            "nfo": true
+        },
+        {
+            "name": "movie.info",
+            "nfo": true
+        },
+        {
+            "name": "movie.inf",
+            "nfo": true
+        },
+        {
+            "name": "movie.nfo.bak",
+            "nfo": false
+        },
+        {
+            "name": "file_id.diz",
+            "nfo": true
+        },
+        {
+            "name": "FILE-ID.DIZ",
+            "nfo": true
+        },
+        {
+            "name": "readme.txt",
+            "nfo": true
+        },
+        {
+            "name": "release.txt",
+            "nfo": true
+        },
+        {
+            "name": "information.txt",
+            "nfo": true
+        },
+        {
+            "name": "notes.diz",
+            "nfo": true
+        },
+        {
+            "name": "note.txt",
+            "nfo": true
+        },
+        {
+            "name": "about.txt",
+            "nfo": true
+        },
+        {
+            "name": "00-group.nfo",
+            "nfo": true
+        },
+        {
+            "name": "000-group.nfo",
+            "nfo": true
+        },
+        {
+            "name": "grp-movie.2160p.nfo",
+            "nfo": true
+        },
+        {
+            "name": "info.txt",
+            "nfo": true
+        },
+        {
+            "name": "movie.info.txt",
+            "nfo": true
+        },
+        {
+            "name": "dir/sub/00-group.nfo",
+            "nfo": true
+        },
+        {
+            "name": "dir/readme.txt",
+            "nfo": true
+        },
+        {
+            "name": "readme.md",
+            "nfo": false
+        },
+        {
+            "name": "movie.mkv",
+            "nfo": false
+        },
+        {
+            "name": "movie.txt",
+            "nfo": false
+        },
+        {
+            "name": "group release.nfo",
+            "nfo": true
+        },
+        {
+            "name": "readme.txt\n",
+            "nfo": true
+        },
+        {
+            "name": "movie.nfo\n",
+            "nfo": true
+        },
+        {
+            "name": "a.b/info.txt",
+            "nfo": true
+        },
+        {
+            "name": "",
+            "nfo": false
+        }
+    ],
+    "encodings": [
+        {
+            "name": "ascii",
+            "data": "202052656c656173652044617465202e2e2e2e3a20323032312d30352d30310d0a2020536f75726365202e2e2e2e2e2e2e2e2e2e3a2055484420426c755261790d0a",
+            "normalized": "202052656c656173652044617465202e2e2e2e3a20323032312d30352d30310d0a2020536f75726365202e2e2e2e2e2e2e2e2e2e3a2055484420426c755261790d0a"
+        },
+        {
+            "name": "utf8",
+            "data": "4672616ec3a761697320202052656c656173652044617465202e2e2e2e3a20323032312d30352d30310d0a2020536f75726365202e2e2e2e2e2e2e2e2e2e3a2055484420426c755261790d0a",
+            "normalized": "4672616ec3a761697320202052656c656173652044617465202e2e2e2e3a20323032312d30352d30310d0a2020536f75726365202e2e2e2e2e2e2e2e2e2e3a2055484420426c755261790d0a"
+        },
+        {
+            "name": "utf8 bom",
+            "data": "efbbbf202052656c656173652044617465202e2e2e2e3a20323032312d30352d30310d0a2020536f75726365202e2e2e2e2e2e2e2e2e2e3a2055484420426c755261790d0a",
+            "normalized": "202052656c656173652044617465202e2e2e2e3a20323032312d30352d30310d0a2020536f75726365202e2e2e2e2e2e2e2e2e2e3a2055484420426c755261790d0a"
+        },
+        {
+            "name": "utf16le bom",
+            "data": "fffe20002000520065006c0065006100730065002000440061007400650020002e002e002e002e003a00200032003000320031002d00300035002d00300031000d000a002000200053006f00750072006300650020002e002e002e002e002e002e002e002e002e002e003a002000550048004400200042006c0075005200610079000d000a00",
+            "normalized": "202052656c656173652044617465202e2e2e2e3a20323032312d30352d30310d0a2020536f75726365202e2e2e2e2e2e2e2e2e2e3a2055484420426c755261790d0a"
+        },
+        {
+            "name": "utf16be bom",
+            "data": "feff004600720061006e00e700610069007300200020002000520065006c0065006100730065002000440061007400650020002e002e002e002e003a00200032003000320031002d00300035002d00300031000d000a002000200053006f00750072006300650020002e002e002e002e002e002e002e002e002e002e003a002000550048004400200042006c0075005200610079000d000a",
+            "normalized": "4672616ec3a761697320202052656c656173652044617465202e2e2e2e3a20323032312d30352d30310d0a2020536f75726365202e2e2e2e2e2e2e2e2e2e3a2055484420426c755261790d0a"
+        },
+        {
+            "name": "utf16le odd",
+            "data": "fffe410042",
+            "normalized": "413f"
+        },
+        {
+            "name": "utf16le lone surrogate",
+            "data": "fffe410000d84200",
+            "normalized": "413f42"
+        },
+        {
+            "name": "utf16le pair",
+            "data": "fffe3dd800de4100",
+            "normalized": "f09f988041"
+        },
+        {
+            "name": "utf16 bom only",
+            "data": "fffe",
+            "normalized": ""
+        },
+        {
+            "name": "utf8 bom then utf16",
+            "data": "efbbbffffe4100",
+            "normalized": "41"
+        },
+        {
+            "name": "cp437 art",
+            "data": "dbdbb2b1b02047524f555020b0b1b2dbdb0d0ac9cdcdbb0d0aba207820ba0d0ac8cdcdbc",
+            "normalized": "e29688e29688e29693e29692e296912047524f555020e29691e29692e29693e29688e296880d0ae29594e29590e29590e295970d0ae29591207820e295910d0ae2959ae29590e29590e2959d"
+        },
+        {
+            "name": "cp437 all high",
+            "data": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+            "normalized": "c387c3bcc3a9c3a2c3a4c3a0c3a5c3a7c3aac3abc3a8c3afc3aec3acc384c385c389c3a6c386c3b4c3b6c3b2c3bbc3b9c3bfc396c39cc2a2c2a3c2a5e282a7c692c3a1c3adc3b3c3bac3b1c391c2aac2bac2bfe28c90c2acc2bdc2bcc2a1c2abc2bbe29691e29692e29693e29482e294a4e295a1e295a2e29596e29595e295a3e29591e29597e2959de2959ce2959be29490e29494e294b4e294ace2949ce29480e294bce2959ee2959fe2959ae29594e295a9e295a6e295a0e29590e295ace295a7e295a8e295a4e295a5e29599e29598e29592e29593e295abe295aae29498e2948ce29688e29684e2968ce29690e29680ceb1c39fce93cf80cea3cf83c2b5cf84cea6ce98cea9ceb4e2889ecf86ceb5e288a9e289a1c2b1e289a5e289a4e28ca0e28ca1c3b7e28988c2b0e28899c2b7e2889ae281bfc2b2e296a0c2a0"
+        },
+        {
+            "name": "cp437 low controls",
+            "data": "01021a7f808182838485868788898a8b8c",
+            "normalized": "01021a7fc387c3bcc3a9c3a2c3a4c3a0c3a5c3a7c3aac3abc3a8c3afc3ae"
+        },
+        {
+            "name": "latin1",
+            "data": "4672616ee7616973",
+            "normalized": "4672616ecf84616973"
+        },
+        {
+            "name": "overlong",
+            "data": "c0af78",
+            "normalized": "e29494c2bb78"
+        },
+        {
+            "name": "surrogate utf8",
+            "data": "eda08078",
+            "normalized": "cf86c3a1c38778"
+        },
+        {
+            "name": "empty",
+            "data": "",
+            "normalized": ""
+        }
+    ],
+    "extractions": [
+        {
+            "name": "Some.Movie.2021.2160p.UHD.BluRay.x265-GROUP.mkv",
+            "extracted": "Some.Movie.2021.2160p.UHD.BluRay.X265-GROUP",
+            "candidate": "Some.Movie.2021.2160p.UHD.BluRay.X265-GROUP",
+            "plausible": true
+        },
+        {
+            "name": "some.movie.2021.2160p.uhd.bluray.x265-group.mkv",
+            "extracted": "Some.Movie.2021.2160p.Uhd.Bluray.X265-Group",
+            "candidate": "Some.Movie.2021.2160p.Uhd.Bluray.X265-Group",
+            "plausible": true
+        },
+        {
+            "name": "dir/Show.Name.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP.mkv",
+            "extracted": "Show.Name.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP",
+            "candidate": "Show.Name.S01E01.1080p.WEB-DL.DDP5.1.H.264-GRP",
+            "plausible": true
+        },
+        {
+            "name": "Show_Name_S01E01_1080p_WEB-DL-GRP.mp4",
+            "extracted": "Show_Name_S01E01_1080p_WEB-DL-GRP",
+            "candidate": "Show Name S01E01 1080p WEB-DL-GRP",
+            "plausible": true
+        },
+        {
+            "name": "the show name s01e01 1080p web-dl-grp.mkv",
+            "extracted": "The Show Name S01e01 1080p Web-Dl-Grp",
+            "candidate": "The Show Name S01e01 1080p Web-Dl-Grp",
+            "plausible": true
+        },
+        {
+            "name": "NBA__NZBSPLIT__bdab31d6f79989608009e7e8eadcbe66__NZBSPLIT__NBA_20260419_PHI_BOS_1080p60_ABC.7z.073",
+            "extracted": "NBA.20260419.PHI.BOS.1080p60.ABC",
+            "candidate": "NBA.20260419.PHI.BOS.1080p60.ABC",
+            "plausible": true
+        },
+        {
+            "name": "TEST__NZBSPLIT__1234567890abcdef__NZBSPLIT__setup.7z.001",
+            "extracted": "setup",
+            "candidate": "setup",
+            "plausible": false
+        },
+        {
+            "name": "abcdef0123456789.mkv",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        },
+        {
+            "name": "movie.mkv",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        },
+        {
+            "name": "movie",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        },
+        {
+            "name": "a.b",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        },
+        {
+            "name": "Movie.2021.mkv.mkv",
+            "extracted": "Movie.2021.Mkv",
+            "candidate": "Movie.2021",
+            "plausible": false
+        },
+        {
+            "name": "Movie.2021.2160p.part01.rar",
+            "extracted": "Movie.2021.2160p.Part01",
+            "candidate": "Movie.2021.2160p",
+            "plausible": true
+        },
+        {
+            "name": "Movie.2021.2160p.r00",
+            "extracted": "Movie.2021.2160p",
+            "candidate": "Movie.2021.2160p",
+            "plausible": true
+        },
+        {
+            "name": "Movie (2021) [2160p].mkv",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        },
+        {
+            "name": "Movie.2021.2160p-GRP",
+            "extracted": "Movie.2021.2160p-GRP",
+            "candidate": "Movie.2021.2160p-GRP",
+            "plausible": true
+        },
+        {
+            "name": "Movie.2021.2160p-GRP\n",
+            "extracted": "Movie.2021.2160p-GRP",
+            "candidate": "Movie.2021.2160p-GRP",
+            "plausible": true
+        },
+        {
+            "name": "Movie.2021.2160p-GRP.mkv\n",
+            "extracted": "Movie.2021.2160p-GRP",
+            "candidate": "Movie.2021.2160p-GRP",
+            "plausible": true
+        },
+        {
+            "name": "über.film.2021.2160p-grp.mkv",
+            "extracted": "über.Film.2021.2160p-Grp",
+            "candidate": "über.Film.2021.2160p-Grp",
+            "plausible": true
+        },
+        {
+            "name": "Movie 2021 2160p x",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        },
+        {
+            "name": "Movie - 2021 - x",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        },
+        {
+            "name": "00001.m2ts",
+            "extracted": "00001.M2ts",
+            "candidate": "00001.M2ts",
+            "plausible": false
+        },
+        {
+            "name": "BDMV/STREAM/00001.m2ts",
+            "extracted": "00001.M2ts",
+            "candidate": "00001.M2ts",
+            "plausible": false
+        },
+        {
+            "name": "VIDEO_TS/VTS_01_1.VOB",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        },
+        {
+            "name": "Movie.2021.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.7.1.Atmos-FGT.iso",
+            "extracted": "Movie.2021.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.7.1.Atmos-FGT",
+            "candidate": "Movie.2021.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.7.1.Atmos-FGT",
+            "plausible": true
+        },
+        {
+            "name": "",
+            "extracted": null,
+            "candidate": null,
+            "plausible": null
+        }
+    ]
+}
