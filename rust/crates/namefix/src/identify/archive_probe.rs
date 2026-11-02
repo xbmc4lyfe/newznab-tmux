@@ -5,11 +5,12 @@
 //! compressed, so those are only counted. Encrypted headers can't be read at all.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
 use nntmux_formats::archive::FormatHeader;
 use nntmux_nntp::{NntpConfig, NntpPool};
+use regex::Regex;
 use tokio::runtime::Runtime;
 
 use super::donor::{DonorKey, MIN_DONOR_HASHED_SIZE};
@@ -148,34 +149,68 @@ pub fn read_headers(bytes: &[u8]) -> HeaderReading {
     reading
 }
 
-/// Files to try, first volumes first. The order needs no real names: when none look like a first
-/// volume, the biggest file is the best bet.
-pub(super) fn volumes_to_try(nzb: &NzbSummary) -> Vec<&NzbFile> {
-    let first_volume = |file: &NzbFile| {
-        let name = name::name_from_subject(&file.subject)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if name.contains(".par2") {
-            return None;
-        }
-        let part = name
-            .rsplit_once(".part")
-            .and_then(|(_, rest)| rest.strip_suffix(".rar"))
-            .and_then(|digits| digits.parse::<u32>().ok());
-        Some(match part {
-            Some(1) => 0,
-            Some(_) => 3,
-            None if name.ends_with(".rar") || name.ends_with(".001") => 1,
-            None => 2,
-        })
+/// How likely a file is to start its post: 0 is certainly a first volume, 3 certainly isn't.
+fn volume_rank(name: &str) -> u8 {
+    static VOLUME: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\.(?:part(?P<part>\d+)\.rar|(?P<rar>rar)|r\d{2,3}|z(?P<zip_part>\d{2})|(?P<zip>zip)|(?P<sevenz>7z)|(?:7z\.|zip\.)?(?P<split>\d{3}))$")
+            .expect("static pattern")
+    });
+    let Some(found) = VOLUME.captures(name) else {
+        return 2;
     };
-    // `files` is biggest first, and a stable sort keeps that within each rank.
-    let mut ranked: Vec<(u8, &NzbFile)> = nzb
+    let number = |group: &str| {
+        found
+            .name(group)
+            .and_then(|digits| digits.as_str().parse::<u32>().ok())
+    };
+    if let Some(part) = number("part") {
+        return if part == 1 { 0 } else { 3 };
+    }
+    if let Some(part) = number("zip_part") {
+        return if part == 1 { 0 } else { 3 };
+    }
+    if let Some(part) = number("split") {
+        return if part <= 1 { 0 } else { 3 };
+    }
+    if found.name("rar").is_some() || found.name("zip").is_some() || found.name("sevenz").is_some()
+    {
+        return 1;
+    }
+    // `.r00` and up follow a `.rar`.
+    3
+}
+
+/// The file's place in its post, from a `[3/10]` before the yEnc trailer.
+fn post_position(subject: &str) -> Option<u32> {
+    static POSITION: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[\[\(]\s*(\d+)\s*/\s*\d+\s*[\]\)]").expect("static pattern"));
+    let before = subject.split("yEnc").next().unwrap_or(subject);
+    POSITION.captures(before)?.get(1)?.as_str().parse().ok()
+}
+
+/// Files to try, first volumes first. Among files of about the top size, which is what a split
+/// set looks like, the post's own numbering decides. A small file such as an NFO never comes
+/// ahead of them, whatever its number.
+pub(super) fn volumes_to_try(nzb: &NzbSummary) -> Vec<&NzbFile> {
+    let largest = nzb.files.iter().map(|file| file.bytes).max().unwrap_or(0);
+    let mut ranked: Vec<_> = nzb
         .files
         .iter()
-        .filter_map(|file| first_volume(file).map(|rank| (rank, file)))
+        .filter_map(|file| {
+            let name = name::name_from_subject(&file.subject)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if name.contains(".par2") {
+                return None;
+            }
+            let rank = volume_rank(&name);
+            let small = file.bytes.saturating_mul(10) < largest.saturating_mul(9);
+            let position = post_position(&file.subject).unwrap_or(u32::MAX);
+            // `files` is biggest first, and a stable sort keeps that for the rest.
+            Some(((rank, small, position), file))
+        })
         .collect();
-    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.sort_by_key(|(key, _)| *key);
     ranked
         .into_iter()
         .map(|(_, file)| file)
@@ -435,8 +470,12 @@ pub(crate) mod tests {
     }
 
     fn file(name: &str, bytes: u64, id: &str) -> NzbFile {
+        file_with_subject(&format!(r#""{name}" yEnc (1/90)"#), bytes, id)
+    }
+
+    fn file_with_subject(subject: &str, bytes: u64, id: &str) -> NzbFile {
         NzbFile {
-            subject: format!(r#""{name}" yEnc (1/90)"#),
+            subject: subject.to_owned(),
             bytes,
             group: Some("alt.binaries.misc".to_owned()),
             first_message_id: Some(id.to_owned()),
@@ -550,6 +589,54 @@ pub(crate) mod tests {
             read_headers(b"\x1a\x45\xdf\xa3 matroska"),
             HeaderReading::default()
         );
+    }
+
+    #[test]
+    fn volume_names_rank_as_they_should() {
+        for (name, rank) in [
+            ("a.part01.rar", 0),
+            ("a.part1.rar", 0),
+            ("a.part36.rar", 3),
+            ("a.rar", 1),
+            ("a.r00", 3),
+            ("a.r15", 3),
+            ("a.7z", 1),
+            ("a.7z.001", 0),
+            ("a.7z.002", 3),
+            ("a.zip", 1),
+            ("a.z01", 0),
+            ("a.z02", 3),
+            ("a.001", 0),
+            ("a.232", 3),
+            ("a.mkv", 2),
+            ("a.75s9l5", 2),
+        ] {
+            assert_eq!(volume_rank(name), rank, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_split_set_with_no_telling_names_goes_by_its_numbering() {
+        let nzb = NzbSummary {
+            files: vec![
+                file_with_subject(r#"abc [36/100] "abc" yEnc (1/70)"#, 100, "later"),
+                file_with_subject(r#"abc [02/100] "abc" yEnc (1/70)"#, 100, "first"),
+                file_with_subject(r#"abc [01/100] "abc.nfo" yEnc (1/1)"#, 5, "nfo"),
+                file_with_subject(r#"abc [07/100] "abc" yEnc (1/70)"#, 99, "middle"),
+            ],
+            ..NzbSummary::default()
+        };
+        let ids: Vec<_> = volumes_to_try(&nzb)
+            .iter()
+            .map(|file| file.first_message_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, ["first", "middle"]);
+    }
+
+    #[test]
+    fn the_segment_counter_is_not_a_place_in_the_post() {
+        assert_eq!(post_position(r#""abc.mkv" yEnc (1/500)"#), None);
+        assert_eq!(post_position(r#"[3/10] - "abc.mkv" yEnc (1/500)"#), Some(3));
     }
 
     #[test]

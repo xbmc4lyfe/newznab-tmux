@@ -29,6 +29,12 @@ const MAX_LAYERS: usize = 6;
 /// Articles to read per file, about 6 MB at the usual size.
 const MAX_ARTICLES: usize = 8;
 const RAR4_STORED: u8 = 0x30;
+const RANDOMNESS_SAMPLE: usize = 64 * 1024;
+/// Bits per byte, where 8 is perfectly random.
+const MIN_RANDOM_ENTROPY: f64 = 7.9;
+const ASF_MAGIC: &[u8] = &[
+    0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11, 0xa6, 0xd9, 0x00, 0xaa, 0x00, 0x62, 0xce, 0x6c,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum End {
@@ -36,7 +42,14 @@ pub enum End {
     Mp4,
     MpegTs,
     Avi,
+    Asf,
     Encrypted,
+    /// A whole file encrypted by a tool we can name, such as rclone or OpenSSL.
+    EncryptedWrapper,
+    /// An NZB posted as a file, which names other posts.
+    InnerNzb,
+    /// No signature, and every byte value about as common as the rest.
+    LooksRandom,
     Compressed,
     SevenZip,
     Zip,
@@ -53,7 +66,11 @@ impl End {
             Self::Mp4 => "MP4",
             Self::MpegTs => "MPEG-TS",
             Self::Avi => "AVI",
+            Self::Asf => "WMV/ASF",
             Self::Encrypted => "password protected",
+            Self::EncryptedWrapper => "encrypted wrapper (rclone, OpenSSL)",
+            Self::InnerNzb => "NZB inside the post",
+            Self::LooksRandom => "no signature, looks random",
             Self::Compressed => "compressed archive",
             Self::SevenZip => "7z",
             Self::Zip => "ZIP",
@@ -64,7 +81,10 @@ impl End {
     }
 
     const fn is_video(self) -> bool {
-        matches!(self, Self::Matroska | Self::Mp4 | Self::MpegTs | Self::Avi)
+        matches!(
+            self,
+            Self::Matroska | Self::Mp4 | Self::MpegTs | Self::Avi | Self::Asf
+        )
     }
 }
 
@@ -78,10 +98,40 @@ pub struct Peeled<'a> {
     pub names: Vec<String>,
     /// The bytes after the last layer.
     pub stream: &'a [u8],
+    /// The layers as `rar5(stored)`, outermost first.
+    pub chain: Vec<&'static str>,
 }
 
 const RAR4_MAGIC: &[u8] = b"Rar!\x1a\x07\x00";
 const RAR5_MAGIC: &[u8] = b"Rar!\x1a\x07\x01\x00";
+
+fn is_nzb(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+    head.trim_start().starts_with('<') && head.contains("<nzb")
+}
+
+/// Whether a stretch of bytes has the even spread of encrypted data, which compression headers
+/// and every media format here break straight away.
+fn looks_random(bytes: &[u8]) -> bool {
+    let sample = &bytes[..bytes.len().min(RANDOMNESS_SAMPLE)];
+    if sample.len() < RANDOMNESS_SAMPLE / 8 {
+        return false;
+    }
+    let mut counts = [0usize; 256];
+    for byte in sample {
+        counts[usize::from(*byte)] += 1;
+    }
+    let total = sample.len() as f64;
+    let entropy: f64 = counts
+        .iter()
+        .filter(|count| **count > 0)
+        .map(|count| {
+            let share = *count as f64 / total;
+            -share * share.log2()
+        })
+        .sum();
+    entropy >= MIN_RANDOM_ENTROPY
+}
 
 fn kind_of(bytes: &[u8]) -> Option<End> {
     if bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
@@ -92,6 +142,12 @@ fn kind_of(bytes: &[u8]) -> Option<End> {
         Some(End::MpegTs)
     } else if bytes.starts_with(b"RIFF") && bytes.get(8..11) == Some(b"AVI") {
         Some(End::Avi)
+    } else if bytes.starts_with(ASF_MAGIC) {
+        Some(End::Asf)
+    } else if bytes.starts_with(b"RCLONE\0\0") || bytes.starts_with(b"Salted__") {
+        Some(End::EncryptedWrapper)
+    } else if is_nzb(bytes) {
+        Some(End::InnerNzb)
     } else if bytes.starts_with(b"7z\xbc\xaf\x27\x1c") {
         Some(End::SevenZip)
     } else if bytes.starts_with(b"PK\x03\x04") {
@@ -104,7 +160,11 @@ fn kind_of(bytes: &[u8]) -> Option<End> {
 }
 
 /// The next layer down from a RAR header, or how the walk ends here.
-fn step_into_rar<'a>(bytes: &'a [u8], names: &mut Vec<String>) -> Result<&'a [u8], End> {
+fn step_into_rar<'a>(
+    bytes: &'a [u8],
+    names: &mut Vec<String>,
+    chain: &mut Vec<&'static str>,
+) -> Result<&'a [u8], End> {
     let metadata = nntmux_formats::archive_metadata(bytes).ok_or(End::Other)?;
     for header in &metadata.headers {
         match header {
@@ -130,8 +190,10 @@ fn step_into_rar<'a>(bytes: &'a [u8], names: &mut Vec<String>) -> Result<&'a [u8
                     return Err(End::Encrypted);
                 }
                 if file.method != RAR4_STORED {
+                    chain.push("rar4(compressed)");
                     return Err(End::Compressed);
                 }
+                chain.push("rar4(stored)");
                 return bytes.get(file.data_offset..).ok_or(End::NeedMore);
             }
             FormatHeader::Rar5 {
@@ -156,8 +218,10 @@ fn step_into_rar<'a>(bytes: &'a [u8], names: &mut Vec<String>) -> Result<&'a [u8
                     return Err(End::Encrypted);
                 }
                 if file.compression_method != Some(0) {
+                    chain.push("rar5(compressed)");
                     return Err(End::Compressed);
                 }
+                chain.push("rar5(stored)");
                 let start = block.data_start_offset.ok_or(End::NeedMore)?;
                 return bytes.get(start..).ok_or(End::NeedMore);
             }
@@ -171,6 +235,7 @@ fn step_into_rar<'a>(bytes: &'a [u8], names: &mut Vec<String>) -> Result<&'a [u8
 pub fn peel(bytes: &[u8]) -> Peeled<'_> {
     let mut stream = bytes;
     let mut names = Vec::new();
+    let mut chain = Vec::new();
     let mut layers = 0;
     loop {
         if let Some(end) = kind_of(stream) {
@@ -179,6 +244,7 @@ pub fn peel(bytes: &[u8]) -> Peeled<'_> {
                 layers,
                 names,
                 stream,
+                chain,
             };
         }
         let is_rar = stream.starts_with(RAR4_MAGIC) || stream.starts_with(RAR5_MAGIC);
@@ -186,6 +252,8 @@ pub fn peel(bytes: &[u8]) -> Peeled<'_> {
         let end = if !is_rar {
             Some(if stream.len() < 16 {
                 End::NeedMore
+            } else if looks_random(stream) {
+                End::LooksRandom
             } else {
                 End::Other
             })
@@ -200,9 +268,10 @@ pub fn peel(bytes: &[u8]) -> Peeled<'_> {
                 layers,
                 names,
                 stream,
+                chain,
             };
         }
-        match step_into_rar(stream, &mut names) {
+        match step_into_rar(stream, &mut names, &mut chain) {
             Ok(next) => {
                 stream = next;
                 layers += 1;
@@ -213,6 +282,7 @@ pub fn peel(bytes: &[u8]) -> Peeled<'_> {
                     layers,
                     names,
                     stream,
+                    chain,
                 };
             }
         }
@@ -420,6 +490,8 @@ struct Row {
     end: Option<End>,
     layers: usize,
     missing: bool,
+    /// How the walk went, as `rar5(stored)>mkv`.
+    chain: String,
     /// Sampled for a read of its stream.
     read: bool,
     header_read: bool,
@@ -429,6 +501,8 @@ struct Row {
     fingerprint_names: HashSet<String>,
     predb_candidates: usize,
     line: String,
+    /// For a post nothing recognized: its first bytes, its name and its size.
+    unknown: Option<String>,
 }
 
 struct Sampler<'a> {
@@ -463,6 +537,16 @@ impl Sampler<'_> {
                 index += 1;
                 let peeled = peel(&buffer);
                 end = Some(peeled.end);
+                row.chain = peeled
+                    .chain
+                    .iter()
+                    .copied()
+                    .chain([peeled.end.as_str()])
+                    .collect::<Vec<_>>()
+                    .join(">");
+                if matches!(peeled.end, End::Other | End::LooksRandom) {
+                    row.unknown = Some(unknown_line(evidence.id, file, peeled.stream));
+                }
                 if let Some(found) = peeled
                     .names
                     .iter()
@@ -615,6 +699,33 @@ impl Sampler<'_> {
     }
 }
 
+/// What's known of a post nothing recognized, so its format can be worked out and added.
+fn unknown_line(release_id: i64, file: &NzbFile, stream: &[u8]) -> String {
+    let head = &stream[..stream.len().min(16)];
+    let hex: String = head.iter().map(|byte| format!("{byte:02x}")).collect();
+    let ascii: String = head
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() {
+                *byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    let printable = stream
+        .iter()
+        .take(4096)
+        .filter(|byte| byte.is_ascii_graphic() || byte.is_ascii_whitespace())
+        .count();
+    let share = printable * 100 / stream.len().clamp(1, 4096);
+    format!(
+        "{release_id}\t{hex}\t{ascii}\t{share}\t{}\t{}",
+        file.bytes,
+        file.subject.replace(['\t', '\n'], " ")
+    )
+}
+
 pub struct SampleOptions {
     /// Releases with no other evidence to classify.
     pub sample: usize,
@@ -688,6 +799,10 @@ fn render(rows: &[Row]) -> (String, String) {
             *layers.entry(row.layers).or_default() += 1;
         }
     }
+    let mut chains: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in rows.iter().filter(|row| !row.chain.is_empty()) {
+        *chains.entry(row.chain.as_str()).or_default() += 1;
+    }
     let read: Vec<&Row> = rows.iter().filter(|row| row.read).collect();
     let count = |test: &dyn Fn(&Row) -> bool| read.iter().filter(|row| test(row)).count();
     let mut out = format!(
@@ -696,6 +811,12 @@ fn render(rows: &[Row]) -> (String, String) {
     );
     for (label, total) in &ends {
         let _ = writeln!(out, "| {label} | {total} |");
+    }
+    let _ = writeln!(out, "\n## Layer chains\n\n| Chain | Releases |\n|---|---|");
+    let mut by_count: Vec<_> = chains.iter().collect();
+    by_count.sort_by_key(|(_, total)| std::cmp::Reverse(**total));
+    for (chain, total) in by_count {
+        let _ = writeln!(out, "| `{chain}` | {total} |");
     }
     let _ = writeln!(
         out,
@@ -763,6 +884,18 @@ fn render(rows: &[Row]) -> (String, String) {
     for row in read.iter().filter(|row| !row.line.is_empty()) {
         lines.push_str(&row.line);
         lines.push('\n');
+    }
+    lines.push_str(
+        "\n# unknown: release_id, first 16 bytes, ascii, percent printable, bytes, subject\n",
+    );
+    for row in rows
+        .iter()
+        .filter(|row| matches!(row.end, Some(End::Other | End::LooksRandom)))
+    {
+        if let Some(unknown) = &row.unknown {
+            lines.push_str(unknown);
+            lines.push('\n');
+        }
     }
     (out, lines)
 }
@@ -862,6 +995,47 @@ mod tests {
             End::SevenZip
         );
         assert_eq!(peel(&[0x9c; 64]).end, End::Other);
+        assert_eq!(peel(ASF_MAGIC).end, End::Asf);
+        assert_eq!(
+            peel(b"RCLONE\0\0 and then the rest").end,
+            End::EncryptedWrapper
+        );
+        assert_eq!(
+            peel(b"Salted__ and then the rest").end,
+            End::EncryptedWrapper
+        );
+        assert_eq!(
+            peel(b"<?xml version=\"1.0\"?><!DOCTYPE nzb><nzb xmlns=\"x\"></nzb>").end,
+            End::InnerNzb
+        );
+    }
+
+    #[test]
+    fn even_bytes_read_as_random_and_a_pattern_does_not() {
+        // A simple generator, so the test doesn't need a random crate.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let noise: Vec<u8> = (0..RANDOMNESS_SAMPLE)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect();
+        assert_eq!(peel(&noise).end, End::LooksRandom);
+        let pattern: Vec<u8> = (0..RANDOMNESS_SAMPLE).map(|i| (i % 32) as u8).collect();
+        assert_eq!(peel(&pattern).end, End::Other);
+        // Too little to tell.
+        assert_eq!(peel(&noise[..64]).end, End::Other);
+    }
+
+    #[test]
+    fn the_chain_records_each_layer() {
+        let bytes = wrap(&wrap(&mkv(), "abc.mkv"), "abc.rar");
+        assert_eq!(peel(&bytes).chain, ["rar4(stored)", "rar4(stored)"]);
+        let mut packed = rar4_method("packed.mkv", 100, 1, 0, 0x33);
+        packed.extend_from_slice(&mkv());
+        assert_eq!(peel(&packed).chain, ["rar4(compressed)"]);
     }
 
     #[test]
