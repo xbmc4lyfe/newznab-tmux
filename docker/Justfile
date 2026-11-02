@@ -54,6 +54,11 @@ build *args:
     #!/usr/bin/env bash
     set -euo pipefail
     {{LOAD_ENV}}
+    # A deploy checks that the tag still names the image it built; don't retag it mid-rollout.
+    if [ -d "${DEPLOY_LOCK_DIR:-{{CURDIR}}/.deploy.lock}" ]; then
+        echo "A deploy holds ${DEPLOY_LOCK_DIR:-{{CURDIR}}/.deploy.lock}; build after it finishes." >&2
+        exit 75
+    fi
     rev=$("{{CURDIR}}/bin/source-revision")
     docker build --label "org.opencontainers.image.revision=$rev" -t "${APP_IMAGE:-nntmux/rust:local}" "{{CURDIR}}/.."
 
