@@ -197,6 +197,7 @@ if [ -f "$app_env" ]; then
     fi
 fi
 
+active=" $("$inspect" services < "$work/model.json" | tr '\n' ' ') "
 # Targets: the services named on the command line, else every service in the active profiles.
 if [ ${#services[@]} -gt 0 ]; then
     targets=" ${services[*]} "
@@ -208,6 +209,13 @@ for svc in $targets; do
     has "$known" "$svc" || { echo "Unknown service: $svc" >&2; exit 1; }
     # An explicit target runs whatever its profile, so a role in an inactive profile counts too.
     has "$all_app_users" "$svc" && need_migrate=1
+    # Every other check reads the active-profile model, so a data or infrastructure service in an
+    # inactive profile would skip them all; its profile has to be activated instead.
+    if ! has "$all_app_users" "$svc" && ! has "$active" "$svc"; then
+        echo "$svc is in a profile that isn't active, so its checks would be skipped." >&2
+        echo "Activate the profile (COMPOSE_PROFILES) and rerun." >&2
+        exit 1
+    fi
 done
 
 # Mounted config: compare with the last healthy deploy's stamp. Without a stamp (first deploy)
