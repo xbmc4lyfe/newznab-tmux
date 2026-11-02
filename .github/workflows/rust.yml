@@ -2,13 +2,13 @@ name: Rust
 
 on:
   pull_request:
-    branches: [rust-native]
+    branches: [main]
     paths:
       - 'rust/**'
       - '!rust/indexer/**'
       - '.github/workflows/rust.yml'
   push:
-    branches: [rust-native]
+    branches: [main]
     paths:
       - 'rust/**'
       - '!rust/indexer/**'

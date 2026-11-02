@@ -2247,7 +2247,7 @@ def sync_remote_if_configured(repo: Path, docker_dir: Path) -> None:
         )
         remote_head_ref = ref_proc.stdout.strip() if ref_proc.returncode == 0 else ""
         prefix = f"{remote}/"
-        branch = remote_head_ref[len(prefix):] if remote_head_ref.startswith(prefix) and remote_head_ref[len(prefix):] else "rust-native"
+        branch = remote_head_ref[len(prefix):] if remote_head_ref.startswith(prefix) and remote_head_ref[len(prefix):] else "main"
     cur_proc = subprocess.run(
         ["git", "-C", str(repo), "symbolic-ref", "-q", "--short", "HEAD"],
         capture_output=True,
