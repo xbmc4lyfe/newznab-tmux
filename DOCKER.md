@@ -65,7 +65,7 @@ Pass `KEY=VALUE` after a recipe to set an option for one run, for example `just 
 `just deploy` runs [`docker/bin/deploy`](docker/bin/deploy). Only the deployment owner runs it. It needs `DEPLOY_BY`.
 
 1. Takes a lock directory (`DEPLOY_LOCK_DIR`, default `docker/.deploy.lock`). If another deploy holds it, it exits with status 75.
-2. Requires the checkout to be on `DEPLOY_GIT_BRANCH` (default `master`) with no commits missing from `DEPLOY_GIT_REMOTE` (default `origin`), and fast-forwards it. `DEPLOY_SYNC_REMOTE=0` skips this, for offline testing only.
+2. Requires the checkout to be on `DEPLOY_GIT_BRANCH` (default `rust-native`) with no commits missing from `DEPLOY_GIT_REMOTE` (default `origin`), and fast-forwards it. `DEPLOY_SYNC_REMOTE=0` skips this, for offline testing only.
 3. Preflight, before anything changes. It refuses to run while containers of services the Compose file no longer defines are running (the PHP `horizon`, `scheduler` and `indexer` after the cutover), while `docker/config/app.env` has a `$` Compose would interpolate (single-quote such values), or when a data service's (`DEPLOY_DATA_SERVICES`, default `mariadb redis manticore`) Compose definition, image or mounted config changed. `DEPLOY_RECREATE_DATA=1` allows that, and recreates those data services as a separate step before `migrate`, in a window you planned.
 4. Builds the image while the old stack keeps running.
 5. Runs `migrate` on its own. If it fails, nothing has been recreated and the old stack keeps serving.
@@ -77,7 +77,7 @@ Remote verification workers (`docker/worker`) aren't part of the stack. Stop the
 
 Workers get SIGTERM, stop claiming work, and finish in-flight units within their `stop_grace_period` (30 s `web`, 120 s default, 1920 s `fingerprint`, `verify` and `postprocess`). A long job can delay a rollout.
 
-`just deploy-plan` (or `DRY_RUN=1 just deploy`) prints what would happen without building. `just deploy <service>` rolls out only the named services. Until the cutover, a rust-native checkout needs `DEPLOY_GIT_BRANCH=rust-native`.
+`just deploy-plan` (or `DRY_RUN=1 just deploy`) prints what would happen without building. `just deploy <service>` rolls out only the named services.
 
 ## Configuration
 

@@ -2,7 +2,7 @@
 
 A Usenet indexer that turns article headers into searchable releases and NZBs, with a web interface and a Newznab-compatible API.
 
-This fork builds on [NNTmux/newznab-tmux](https://github.com/NNTmux/newznab-tmux). It is a complete Rust rewrite: no PHP, no Laravel, no tmux. The old PHP is kept at the `php-final` tag for reference. The rewrite lives on the `rust-native` branch; merging it into `master` is the cutover. See [rust/WORKSTREAMS.md](rust/WORKSTREAMS.md) for how the rewrite is organised and [rust/CUTOVER.md](rust/CUTOVER.md) for the gates and steps to cut production over.
+This fork builds on [NNTmux/newznab-tmux](https://github.com/NNTmux/newznab-tmux). It is a complete Rust rewrite: no PHP, no Laravel, no tmux. The old PHP is kept at the `php-final` tag for reference. `rust-native` is the default branch; `master` holds only the PHP history, and production moves to `rust-native` at the cutover. See [rust/WORKSTREAMS.md](rust/WORKSTREAMS.md) for how the rewrite is organised and [rust/CUTOVER.md](rust/CUTOVER.md) for the gates and steps to cut production over.
 
 Full credit to the NNTmux team and its contributors for the project this fork is based on (see the end of this file).
 
