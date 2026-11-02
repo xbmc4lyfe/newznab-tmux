@@ -473,6 +473,70 @@ async fn zip_download_contains_each_nzb() -> Result<()> {
     db.drop_database().await
 }
 
+/// A release the identify ladder marked unidentifiable (status 3) isn't served by any download
+/// route.
+#[tokio::test]
+async fn unidentifiable_releases_are_not_served() -> Result<()> {
+    let (Some(db), Ok(redis_url)) = (TestDb::create().await?, std::env::var("TEST_REDIS_URL"))
+    else {
+        return Ok(());
+    };
+    let redis = ConnectionManager::new(redis::Client::open(redis_url)?).await?;
+    let ctx = Ctx {
+        config: Arc::new(test_config()),
+        db: db.pool.clone(),
+        redis,
+    };
+    run_sql(&db.pool, &fs::read_to_string(fixtures().join("seed.sql"))?).await?;
+    let cases: Vec<Value> =
+        serde_json::from_str(&fs::read_to_string(fixtures().join("golden_getnzb.json"))?)?;
+    let case = |name: &str| {
+        cases
+            .iter()
+            .find(|case| case["name"] == name)
+            .context("case")
+            .cloned()
+    };
+    for statement in case("getnzb_ok")?["setup"].as_array().into_iter().flatten() {
+        run_sql(&db.pool, statement.as_str().context("setup")?).await?;
+    }
+    run_sql(
+        &db.pool,
+        "UPDATE releases SET passwordstatus = 3 WHERE id = 1;",
+    )
+    .await?;
+    let fetch = |path: String| {
+        let ctx = ctx.clone();
+        async move {
+            let request = Request::builder()
+                .uri(path)
+                .header("host", "x.test")
+                .body(Body::empty())?;
+            anyhow::Ok(app(&ctx).oneshot(request).await?)
+        }
+    };
+    for name in ["getnzb_ok", "v1_get_ok", "v2_get_ok_suffix"] {
+        let path = case(name)?["path"].as_str().context("path")?.to_owned();
+        let response = fetch(path).await?;
+        assert_eq!(response.status(), 404, "{name}");
+    }
+    let path = case("getnzb_zip_ok")?["path"]
+        .as_str()
+        .context("path")?
+        .to_owned();
+    let response = fetch(path).await?;
+    assert_eq!(response.status(), 200);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec()))?;
+    assert_eq!(archive.len(), 0);
+    let downloads: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_downloads WHERE releases_id = 1")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(downloads, 0);
+    db.drop_database().await
+}
+
 /// `limit` is left out: PHP passes the raw string to an `int` parameter under strict types, so any
 /// numeric `limit` answers 500 there. Rust honors it, which `rss_limit_is_honored` covers.
 #[tokio::test]

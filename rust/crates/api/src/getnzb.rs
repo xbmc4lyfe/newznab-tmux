@@ -60,11 +60,19 @@ pub fn scalar_id(input: &Input) -> String {
     }
 }
 
+/// `passwordstatus` for a release the identify ladder couldn't name. Searches already hide it
+/// (they only show status 0, or 1 when passworded releases are shown), and its NZB isn't served.
+pub const UNIDENTIFIABLE: i32 = 3;
+
+/// Whether a release with this GUID can be fetched.
 pub async fn guid_exists(ctx: &Ctx, guid: &str) -> Result<bool> {
-    let found: Option<u32> = sqlx::query_scalar("SELECT id FROM releases WHERE guid = ? LIMIT 1")
-        .bind(guid)
-        .fetch_optional(&ctx.db)
-        .await?;
+    let found: Option<u32> = sqlx::query_scalar(
+        "SELECT id FROM releases WHERE guid = ? AND passwordstatus <> ? LIMIT 1",
+    )
+    .bind(guid)
+    .bind(UNIDENTIFIABLE)
+    .fetch_optional(&ctx.db)
+    .await?;
     Ok(found.is_some())
 }
 
@@ -189,9 +197,10 @@ async fn release_info(ctx: &Ctx, guid: &str) -> Result<Option<ReleaseInfo>> {
          LEFT JOIN videos v ON v.id = r.videos_id
          LEFT JOIN categories c ON c.id = r.categories_id
          LEFT JOIN root_categories cp ON cp.id = c.root_categories_id
-         WHERE r.guid = ? LIMIT 1",
+         WHERE r.guid = ? AND r.passwordstatus <> ? LIMIT 1",
     )
     .bind(guid)
+    .bind(UNIDENTIFIABLE)
     .fetch_optional(&ctx.db)
     .await?)
 }
@@ -346,12 +355,19 @@ async fn zip_download(
         if xml.is_empty() {
             continue;
         }
-        let stored: Option<String> =
-            sqlx::query_scalar("SELECT searchname FROM releases WHERE guid = ? LIMIT 1")
-                .bind(guid)
-                .fetch_optional(&ctx.db)
-                .await?;
-        let name = stored.unwrap_or_else(|| (*guid).to_owned());
+        let stored: Option<(String, i32)> = sqlx::query_as(
+            "SELECT searchname, CAST(passwordstatus AS SIGNED) FROM releases WHERE guid = ? LIMIT 1",
+        )
+        .bind(guid)
+        .fetch_optional(&ctx.db)
+        .await?;
+        if stored
+            .as_ref()
+            .is_some_and(|(_, status)| *status == UNIDENTIFIABLE)
+        {
+            continue;
+        }
+        let name = stored.map_or_else(|| (*guid).to_owned(), |(name, _)| name);
         let entry = format!("{name}{SUFFIX}");
         if !names.insert(entry.to_lowercase()) {
             continue;
@@ -376,7 +392,8 @@ async fn zip_download(
     for guid in &guids {
         list.push_bind(*guid);
     }
-    lookup.push(")");
+    lookup.push(") AND passwordstatus <> ");
+    lookup.push_bind(UNIDENTIFIABLE);
     let release_ids: Vec<u32> = lookup.build_query_scalar().fetch_all(&ctx.db).await?;
     if !release_ids.is_empty() {
         let joined = release_ids
