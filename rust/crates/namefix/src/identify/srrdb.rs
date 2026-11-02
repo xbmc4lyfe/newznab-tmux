@@ -148,7 +148,10 @@ impl SrrdbClient {
         for attempt in 0..=MAX_RETRIES {
             self.wait_for_turn();
             self.stats.requests.fetch_add(1, Ordering::Relaxed);
-            let response = self.runtime.block_on(self.http.get(url.clone()).send())?;
+            // Inside the runtime, because building the request starts its timeout.
+            let response = self
+                .runtime
+                .block_on(async { self.http.get(url.clone()).send().await })?;
             let status = response.status();
             if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                 if attempt < MAX_RETRIES {
@@ -158,14 +161,15 @@ impl SrrdbClient {
                 }
                 bail!("srrDB answered {status}");
             }
-            // An unknown release is a 404 from `details`, and that's an answer worth caching.
-            if status == StatusCode::NOT_FOUND {
+            // An unknown release is a 404 from `details`, and a name srrDB can't parse is a 400 from
+            // `search`. Both are answers worth caching, and the release's other evidence still counts.
+            if status == StatusCode::NOT_FOUND || status == StatusCode::BAD_REQUEST {
                 return Ok(Value::Null);
             }
             if !status.is_success() {
                 bail!("srrDB answered {status}");
             }
-            return Ok(self.runtime.block_on(response.json())?);
+            return Ok(self.runtime.block_on(async { response.json().await })?);
         }
         bail!("srrDB retries ran out")
     }
@@ -199,7 +203,11 @@ impl SrrdbClient {
         let crcs: Vec<String> = query
             .crc32s
             .iter()
-            .map(|fact| fact.split(':').next().unwrap_or(fact).to_ascii_lowercase())
+            .map(|fact| {
+                // The old system stored CRC32s as numbers, so leading zeros are gone.
+                let crc = fact.split(':').next().unwrap_or(fact);
+                format!("{:0>8}", crc.to_ascii_lowercase())
+            })
             .collect();
 
         if !crcs.is_empty() {
@@ -394,12 +402,17 @@ mod tests {
         json!({"results": rows, "resultsCount": names.len().to_string()})
     }
 
-    /// The client blocks, so it can't run on the test's own async thread.
+    /// On a plain thread with no runtime around it, as the binary's workers are. Under
+    /// `spawn_blocking` the test's runtime would stand in for one the client failed to enter.
     async fn ask(config: SrrdbConfig, query: SrrdbQuery) -> (Result<Option<String>>, SrrdbClient) {
         tokio::task::spawn_blocking(move || {
-            let client = SrrdbClient::new(config).expect("client");
-            let answer = client.lookup(&query);
-            (answer, client)
+            std::thread::spawn(move || {
+                let client = SrrdbClient::new(config).expect("client");
+                let answer = client.lookup(&query);
+                (answer, client)
+            })
+            .join()
+            .expect("the client's thread")
         })
         .await
         .expect("join")
@@ -691,6 +704,56 @@ mod tests {
             assert_eq!(client.stats.cached.load(Ordering::Relaxed), expected_cached);
             finish(client).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_crc_gets_back_its_leading_zeros() {
+        let setup = setup().await;
+        serve(
+            &setup.server,
+            "/v1/search/archive-crc:07b2069a",
+            results(&[RELEASE]),
+        )
+        .await;
+        let query = SrrdbQuery {
+            crc32s: vec!["7b2069a:1".to_owned()],
+            ..SrrdbQuery::default()
+        };
+        let (answer, client) = ask(setup.config.clone(), query).await;
+        assert_eq!(answer.expect("answer").as_deref(), Some(RELEASE));
+        finish(client).await;
+    }
+
+    #[tokio::test]
+    async fn a_rejected_name_does_not_lose_the_other_evidence() {
+        let setup = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/Odd.Name.2021.1080p.WEB-DL.H264-GRP"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&setup.server)
+            .await;
+        serve(
+            &setup.server,
+            "/v1/search/archive-crc:00000041",
+            results(&[]),
+        )
+        .await;
+        serve(
+            &setup.server,
+            &format!("/v1/details/{RELEASE}"),
+            json!({"archived-files": [{"crc": "00000041"}]}),
+        )
+        .await;
+        let query = SrrdbQuery {
+            crc32s: vec!["00000041:1".to_owned()],
+            file_names: vec!["Odd.Name.2021.1080p.WEB-DL.H264-GRP".to_owned()],
+            size_candidates: vec![RELEASE.to_owned()],
+            ..SrrdbQuery::default()
+        };
+        let (answer, client) = ask(setup.config.clone(), query).await;
+        assert_eq!(answer.expect("answer").as_deref(), Some(RELEASE));
+        assert_eq!(client.stats.errors.load(Ordering::Relaxed), 0);
+        finish(client).await;
     }
 
     #[tokio::test]
