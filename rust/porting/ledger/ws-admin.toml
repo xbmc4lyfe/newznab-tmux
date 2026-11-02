@@ -158,7 +158,8 @@ status = "todo"
 kind = "route"
 id = "DELETE /admin/user-passkey/{passkey}"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@destroyPasskey"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user passkeys` and `user delete-passkey`."
 
 [[entry]]
 kind = "route"
@@ -308,7 +309,8 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/deleted-users"
 source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@index"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user list --deleted`."
 
 [[entry]]
 kind = "route"
@@ -661,7 +663,8 @@ status = "todo"
 kind = "route"
 id = "GET|HEAD /admin/user-list"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@index"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user list` and `user show`."
 
 [[entry]]
 kind = "route"
@@ -797,7 +800,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/deleted-users/restore/{id}"
 source = "App\\Http\\Controllers\\Admin\\DeletedUsersController@restore"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user restore`."
 
 [[entry]]
 kind = "route"
@@ -981,7 +985,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/resendverification"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@resendVerification"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user resend-verification`."
 
 [[entry]]
 kind = "route"
@@ -1041,7 +1046,8 @@ status = "todo"
 kind = "route"
 id = "POST /admin/user-delete"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@destroy"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user delete`."
 
 [[entry]]
 kind = "route"
@@ -1053,19 +1059,22 @@ status = "todo"
 kind = "route"
 id = "POST /admin/user-list/bulk"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@bulkAction"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user delete|verify|resend-verification` take several users; delete skips Admin accounts without `--allow-admin`, as the bulk action did."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/user-passkeys/wipe"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@wipePasskeys"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user wipe-passkeys --yes`."
 
 [[entry]]
 kind = "route"
 id = "POST /admin/verify"
 source = "App\\Http\\Controllers\\Admin\\AdminUserController@verify"
-status = "todo"
+status = "ported"
+note = "`nntmux-ctl admin user verify`."
 
 [[entry]]
 kind = "route"
